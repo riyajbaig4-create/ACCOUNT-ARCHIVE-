@@ -1,22 +1,19 @@
-"""
-========================================================
-  🛠️ MODDER HUB APK PATCHER v4.0 (Premium Single File)
-  ------------------------------------------------------
-  Features:
-  - Self-contained (Downloads apktool, baksmali at runtime)
-  - Premium Glassmorphism Dark UI
-  - Drag & Drop File Upload
-  - Live Progress Bar with Status Updates
-  - Smart Expiry Neutralizer (20+ Patterns)
-  - Online/Dialog Expiry Auto-Detect
-  - Raw DEX Injection (classes7.dex)
-  - Background Threading (No Browser Timeout)
-  - Auto Cleanup Temp Files
-  - Optimized for Render (uses $PORT)
-========================================================
-"""
+# ================================================================
+#  🛠️ MODDER HUB APK PATCHER v6.0 (Flask + Gunicorn Ready)
+#  ------------------------------------------------------------
+#  ✅ Single file – app.py
+#  ✅ Works with: gunicorn app:app
+#  ✅ Premium Glassmorphism UI
+#  ✅ Drag & Drop Upload
+#  ✅ Live Progress Bar (AJAX polling)
+#  ✅ Smart Expiry Neutralizer (30+ patterns)
+#  ✅ Raw DEX Injection (classesX.dex)
+#  ✅ Background threading with task tracking
+#  ✅ Admin Dashboard
+#  ✅ Auto-download tools (apktool, baksmali)
+#  ✅ 2GB APK support
+# ================================================================
 
-# ======================= IMPORTS =============================
 import os
 import sys
 import io
@@ -31,11 +28,11 @@ import threading
 import traceback
 import urllib.request
 import json
+import atexit
+import signal
 from datetime import datetime
-from typing import Optional, Dict, Tuple, List
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-import uvicorn
+from typing import Optional, Dict, Tuple, List, Any
+from flask import Flask, request, jsonify, send_file, render_template_string, url_for, Response
 import xml.etree.ElementTree as ET
 
 # ======================= CONFIGURATION ======================
@@ -43,9 +40,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 KEYSTORE_DIR = os.path.join(BASE_DIR, "keystore")
 TOOLS_DIR = os.path.join(BASE_DIR, "tools")
-
-# Render uses PORT env variable
-PORT = int(os.getenv("PORT", 8000))
 
 # Limits
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
@@ -56,7 +50,7 @@ KEYSTORE_PATH = os.path.join(KEYSTORE_DIR, "debug.keystore")
 KEYSTORE_PASS = "android"
 KEY_ALIAS = "androiddebugkey"
 
-# Tools Paths (will be downloaded)
+# Tools Paths
 APKTOOL_JAR = os.path.join(TOOLS_DIR, "apktool.jar")
 BAKSMALI_JAR = os.path.join(TOOLS_DIR, "baksmali.jar")
 
@@ -64,25 +58,33 @@ BAKSMALI_JAR = os.path.join(TOOLS_DIR, "baksmali.jar")
 for d in [UPLOAD_DIR, KEYSTORE_DIR, TOOLS_DIR]:
     os.makedirs(d, exist_ok=True)
 
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE  # 2GB
+
 # ======================= TASK MANAGER ======================
 TASK_STORE: Dict[str, Dict] = {}
+TASK_LOCK = threading.Lock()
 
 def create_task() -> str:
     task_id = str(uuid.uuid4())[:8]
-    TASK_STORE[task_id] = {
-        "status": "pending",
-        "progress": 0,
-        "message": "Initializing...",
-        "filename": None,
-        "error": None,
-        "result_path": None,
-        "created_at": datetime.now().isoformat()
-    }
+    with TASK_LOCK:
+        TASK_STORE[task_id] = {
+            "status": "pending",
+            "progress": 0,
+            "message": "Initializing...",
+            "filename": None,
+            "error": None,
+            "result_path": None,
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat()
+        }
     return task_id
 
-def update_task(task_id: str, progress: int = None, message: str = None, 
+def update_task(task_id: str, progress: int = None, message: str = None,
                 status: str = None, error: str = None, result_path: str = None):
-    if task_id in TASK_STORE:
+    with TASK_LOCK:
+        if task_id not in TASK_STORE:
+            return
         if progress is not None:
             TASK_STORE[task_id]["progress"] = min(progress, 100)
         if message:
@@ -93,14 +95,38 @@ def update_task(task_id: str, progress: int = None, message: str = None,
             TASK_STORE[task_id]["error"] = error
         if result_path:
             TASK_STORE[task_id]["result_path"] = result_path
+        TASK_STORE[task_id]["updated_at"] = datetime.now().isoformat()
+
+def get_task(task_id: str) -> Optional[Dict]:
+    with TASK_LOCK:
+        return TASK_STORE.get(task_id)
+
+def cleanup_old_tasks():
+    """Remove tasks older than 24 hours."""
+    with TASK_LOCK:
+        now = datetime.now()
+        to_remove = []
+        for tid, task in TASK_STORE.items():
+            try:
+                created = datetime.fromisoformat(task["created_at"])
+                if (now - created).total_seconds() > 86400:
+                    to_remove.append(tid)
+            except:
+                pass
+        for tid in to_remove:
+            if TASK_STORE[tid].get("result_path") and os.path.exists(TASK_STORE[tid]["result_path"]):
+                try:
+                    os.remove(TASK_STORE[tid]["result_path"])
+                except:
+                    pass
+            del TASK_STORE[tid]
 
 # ======================= TOOLS DOWNLOADER ===================
-def download_file(url: str, dest: str):
-    """Download a file with progress."""
+def download_file(url: str, dest: str) -> bool:
     if os.path.exists(dest):
         return True
     try:
-        print(f"⬇️ Downloading {os.path.basename(dest)}...")
+        print(f"⬇️ Downloading {os.path.basename(dest)} from {url}...")
         urllib.request.urlretrieve(url, dest)
         print(f"✅ Downloaded {os.path.basename(dest)}")
         return True
@@ -108,15 +134,12 @@ def download_file(url: str, dest: str):
         print(f"❌ Failed to download {url}: {e}")
         return False
 
-def download_tools():
-    """Ensure all necessary tools are downloaded."""
-    # APKTool
+def download_tools() -> bool:
     if not os.path.exists(APKTOOL_JAR):
         download_file(
             "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar",
             APKTOOL_JAR
         )
-    # Baksmali
     if not os.path.exists(BAKSMALI_JAR):
         download_file(
             "https://bitbucket.org/JesusFreke/smali/downloads/baksmali-2.5.2.jar",
@@ -125,51 +148,41 @@ def download_tools():
     return os.path.exists(APKTOOL_JAR) and os.path.exists(BAKSMALI_JAR)
 
 # ======================= KEYSTORE GENERATOR ================
-def generate_keystore():
-    if not os.path.exists(KEYSTORE_PATH):
-        try:
-            subprocess.run([
-                "keytool", "-genkey", "-v", "-keystore", KEYSTORE_PATH,
-                "-alias", KEY_ALIAS, "-keyalg", "RSA", "-keysize", "2048",
-                "-validity", "10000", "-storepass", KEYSTORE_PASS,
-                "-keypass", KEYSTORE_PASS,
-                "-dname", "CN=Android Debug, O=Android, C=US"
-            ], check=True, capture_output=True)
-            return True
-        except:
-            return False
-    return True
+def generate_keystore() -> bool:
+    if os.path.exists(KEYSTORE_PATH):
+        return True
+    try:
+        subprocess.run([
+            "keytool", "-genkey", "-v", "-keystore", KEYSTORE_PATH,
+            "-alias", KEY_ALIAS, "-keyalg", "RSA", "-keysize", "2048",
+            "-validity", "10000", "-storepass", KEYSTORE_PASS,
+            "-keypass", KEYSTORE_PASS,
+            "-dname", "CN=Android Debug, O=Android, C=US"
+        ], check=True, capture_output=True, timeout=60)
+        return True
+    except Exception as e:
+        print(f"❌ Keystore generation failed: {e}")
+        return False
 
 # ======================= APK UTILITIES ======================
 def decompile_apk(apk_path: str, output_dir: str):
-    """Decompile APK using apktool.jar."""
     cmd = ["java", "-jar", APKTOOL_JAR, "d", apk_path, "-o", output_dir, "-f"]
     subprocess.run(cmd, check=True, timeout=600, capture_output=True)
 
 def rebuild_apk(decompile_dir: str, output_apk: str):
-    """Rebuild APK using apktool.jar."""
     cmd = ["java", "-jar", APKTOOL_JAR, "b", decompile_dir, "-o", output_apk, "-c"]
     subprocess.run(cmd, check=True, timeout=600, capture_output=True)
 
 def sign_apk(input_apk: str, output_apk: str):
-    """Sign APK using jarsigner (available in OpenJDK)."""
-    # First, verify jarsigner exists
-    try:
-        subprocess.run(["jarsigner", "-verbose"], check=False, capture_output=True)
-    except:
-        # Fallback to apksigner if available, but jarsigner is standard in JDK
-        pass
-    
     cmd = [
         "jarsigner", "-verbose", "-sigalg", "SHA1withRSA", "-digestalg", "SHA1",
-        "-keystore", KEYSTORE_PATH, "-storepass", KEYSTORE_PASS, "-keypass", KEYSTORE_PASS,
+        "-keystore", KEYSTORE_PATH, "-storepass", KEYSTORE_PASS,
+        "-keypass", KEYSTORE_PASS,
         "-signedjar", output_apk, input_apk, KEY_ALIAS
     ]
     subprocess.run(cmd, check=True, timeout=120, capture_output=True)
-    return output_apk
 
 def remove_meta_inf(apk_path: str):
-    """Remove META-INF folder to avoid signature conflicts."""
     temp_path = apk_path + ".tmp"
     with zipfile.ZipFile(apk_path, 'r') as zf_in:
         with zipfile.ZipFile(temp_path, 'w') as zf_out:
@@ -187,10 +200,10 @@ def get_package_and_launcher(manifest_path: str) -> Tuple[str, str]:
         intent_filter = activity.find("intent-filter")
         if intent_filter is not None:
             for action in intent_filter.findall("action"):
-                if action.get("{http://schemas.android.com/apk/res/android}name") == "android.intent.action.MAIN":
+                if action.get("android:name") == "android.intent.action.MAIN":
                     for category in intent_filter.findall("category"):
-                        if category.get("{http://schemas.android.com/apk/res/android}name") == "android.intent.category.LAUNCHER":
-                            act_name = activity.get("{http://schemas.android.com/apk/res/android}name", "")
+                        if category.get("android:name") == "android.intent.category.LAUNCHER":
+                            act_name = activity.get("android:name", "")
                             if act_name.startswith("."):
                                 main_act = pkg + act_name
                             else:
@@ -220,7 +233,7 @@ def find_main_activity_smali(decompile_dir: str, main_activity: str) -> Optional
             for f in files:
                 if f == os.path.basename(smali_path):
                     return os.path.join(root, f)
-    # Fallback: Search all smali for onCreate
+    # Fallback: search all smali for onCreate
     smali_root = os.path.join(decompile_dir, "smali")
     if os.path.exists(smali_root):
         for root, _, files in os.walk(smali_root):
@@ -245,7 +258,10 @@ EXPIRY_PATTERNS = [
     'toDate', 'TimeUnit', 'MILLISECONDS', 'SECONDS', 'MINUTES',
     'HOURS', 'DAYS', 'WEEKS', 'MONTHS', 'YEARS',
     'Calendar;->getInstance', 'Date;-><init>', 'SimpleDateFormat;-><init>',
-    'format', 'parse'
+    'format', 'parse', 'getTimeInMillis', 'setTimeInMillis',
+    'getTimeInSeconds', 'getTimestamp', 'validate', 'isTimeValid',
+    'checkLicense', 'verifyExpiry', 'getExpirationDate',
+    'expired', 'expiration', 'validUntil', 'validTill'
 ]
 
 def neutralize_old_expiry(filepath: str) -> bool:
@@ -264,6 +280,7 @@ def neutralize_old_expiry(filepath: str) -> bool:
     our_module = 'mt/modder/hub'
 
     for line in lines:
+        stripped = line.strip()
         if '.method public onCreate(Landroid/os/Bundle;)V' in line:
             inside_oncreate = True
             new_lines.append(line)
@@ -272,30 +289,26 @@ def neutralize_old_expiry(filepath: str) -> bool:
             inside_oncreate = False
             new_lines.append(line)
             continue
-        
         if inside_oncreate and our_module in line:
             new_lines.append(line)
             continue
-
         if inside_oncreate:
             is_suspicious = any(p in line for p in EXPIRY_PATTERNS)
             if is_suspicious and ('invoke-' in line or 'if-' in line or 'goto' in line or 'const-string' in line):
-                new_lines.append('    # ' + line.strip() + '  <!-- NEUTRALIZED -->\n')
-                modified = True
-                continue
-            
+                if not line.strip().startswith(':'):
+                    new_lines.append('    # ' + stripped + '  <!-- NEUTRALIZED -->\n')
+                    modified = True
+                    continue
             if skip_next > 0:
                 if 'if-' in line or 'goto' in line or ':' in line:
-                    new_lines.append('    # ' + line.strip() + '  <!-- NEUTRALIZED (Flow) -->\n')
+                    new_lines.append('    # ' + stripped + '  <!-- NEUTRALIZED (Flow) -->\n')
                     skip_next -= 1
                     modified = True
                     continue
                 else:
                     skip_next = 0
-            
             if 'if-' in line and is_suspicious:
                 skip_next = 2
-        
         new_lines.append(line)
 
     if modified:
@@ -320,7 +333,6 @@ def inject_invoke_line(smali_file: str) -> bool:
     inside_oncreate = False
     inserted = False
     our_line = 'invoke-static/range {p0}, Lmt/modder/hub/c;->aa(Landroid/app/Activity;)V\n'
-
     for line in lines:
         if our_line.strip() in line:
             return True
@@ -367,7 +379,6 @@ def inject_dex_raw(apk_path: str, dex_file_path: str, new_dex_name: str) -> bool
 def run_patch_task(task_id: str, apk_data: bytes, patch_zip_data: bytes, original_filename: str):
     temp_dir = tempfile.mkdtemp(prefix=f"patch_{task_id}_")
     update_task(task_id, progress=5, message="Temp directory created.", status="processing")
-    
     try:
         apk_path = os.path.join(temp_dir, "original.apk")
         with open(apk_path, "wb") as f:
@@ -393,13 +404,15 @@ def run_patch_task(task_id: str, apk_data: bytes, patch_zip_data: bytes, origina
             update_task(task_id, progress=40, message="No assets found (Online Expiry Mode).")
 
         manifest_path = os.path.join(decompile_dir, "AndroidManifest.xml")
+        if not os.path.exists(manifest_path):
+            raise Exception("AndroidManifest.xml not found after decompile!")
+
         pkg, main_act = get_package_and_launcher(manifest_path)
         update_task(task_id, progress=45, message=f"MainActivity: {main_act}")
 
         smali_file = None
         if main_act:
             smali_file = find_main_activity_smali(decompile_dir, main_act)
-        
         if smali_file:
             update_task(task_id, progress=50, message="Neutralizing old expiry codes...")
             neutralize_old_expiry(smali_file)
@@ -420,14 +433,13 @@ def run_patch_task(task_id: str, apk_data: bytes, patch_zip_data: bytes, origina
         next_idx = max_idx + 1
         new_dex_name = f"classes{next_idx}.dex"
         update_task(task_id, progress=75, message=f"Rebuilding APK (Current DEX count: {max_idx})...")
-        
         rebuilt_apk = os.path.join(temp_dir, "rebuilt.apk")
         rebuild_apk(decompile_dir, rebuilt_apk)
         update_task(task_id, progress=80, message="Rebuild complete.")
 
         update_task(task_id, progress=82, message="Cleaning old signatures...")
         remove_meta_inf(rebuilt_apk)
-        
+
         update_task(task_id, progress=85, message=f"Injecting {new_dex_name} raw...")
         temp_dex_renamed = os.path.join(temp_dir, new_dex_name)
         shutil.copy(provided_dex, temp_dex_renamed)
@@ -445,17 +457,24 @@ def run_patch_task(task_id: str, apk_data: bytes, patch_zip_data: bytes, origina
         shutil.copy(signed_apk, final_storage)
         update_task(task_id, progress=100, message="Success! Ready to download.", status="completed", result_path=final_storage)
 
+    except subprocess.CalledProcessError as e:
+        error_msg = f"Subprocess error: {e.stderr.decode() if e.stderr else str(e)}\n{traceback.format_exc()}"
+        update_task(task_id, progress=0, message="Failed!", status="failed", error=error_msg)
     except Exception as e:
         error_msg = f"{str(e)}\n{traceback.format_exc()}"
         update_task(task_id, progress=0, message="Failed!", status="failed", error=error_msg)
     finally:
-        # Cleanup temp dir after a delay (handled by download endpoint)
-        pass
+        def cleanup():
+            time.sleep(300)
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except:
+                pass
+        threading.Thread(target=cleanup, daemon=True).start()
 
-# ======================= FASTAPI APP ========================
-app = FastAPI(title="Modder Hub APK Patcher v4", version="4.0")
+# ======================= FLASK ROUTES ======================
 
-# ----------------------- PREMIUM HTML TEMPLATE --------------
+# ---------- PREMIUM HTML TEMPLATE (300+ lines of CSS/JS) ----------
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="hi">
@@ -463,123 +482,131 @@ HTML_PAGE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🛠️ Modder Hub Injector</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
     <style>
+        /* ---- RESET ---- */
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-            background: #080b11; 
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #080b11;
             min-height: 100vh;
             display: flex;
             justify-content: center;
             align-items: center;
             padding: 20px;
-            background-image: radial-gradient(ellipse at 10% 20%, rgba(88, 166, 255, 0.05) 0%, transparent 50%),
-                              radial-gradient(ellipse at 90% 80%, rgba(46, 160, 67, 0.05) 0%, transparent 50%);
+            background-image: radial-gradient(ellipse at 10% 20%, rgba(88,166,255,0.06) 0%, transparent 50%),
+                              radial-gradient(ellipse at 90% 80%, rgba(46,160,67,0.06) 0%, transparent 50%);
         }
         .container {
-            max-width: 800px;
+            max-width: 840px;
             width: 100%;
-            background: rgba(22, 27, 34, 0.8);
-            backdrop-filter: blur(24px);
-            -webkit-backdrop-filter: blur(24px);
-            border-radius: 48px;
-            padding: 48px;
-            border: 1px solid rgba(48, 54, 61, 0.6);
-            box-shadow: 0 24px 80px rgba(0, 0, 0, 0.8), inset 0 1px 0 rgba(255, 255, 255, 0.04);
-            transition: all 0.3s ease;
+            background: rgba(22,27,34,0.75);
+            backdrop-filter: blur(32px) saturate(1.2);
+            -webkit-backdrop-filter: blur(32px) saturate(1.2);
+            border-radius: 56px;
+            padding: 52px 48px;
+            border: 1px solid rgba(48,54,61,0.5);
+            box-shadow: 0 32px 96px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.05);
         }
-        .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
-        .header-left { display: flex; align-items: center; gap: 16px; }
-        .logo-icon { 
-            width: 52px; height: 52px; background: linear-gradient(135deg, #238636, #58a6ff); 
-            border-radius: 16px; display: flex; align-items: center; justify-content: center; font-size: 28px;
-            box-shadow: 0 4px 16px rgba(35, 134, 54, 0.3);
+        @media (max-width:640px) {
+            .container { padding: 28px 20px; border-radius: 32px; }
         }
-        h1 { color: #f0f6fc; font-size: 28px; font-weight: 800; letter-spacing: -0.5px; }
-        h1 span { color: #58a6ff; }
-        .subtitle { color: #8b949e; font-size: 15px; font-weight: 400; margin-top: 4px; border-left: 3px solid #238636; padding-left: 14px; }
-        .badge-group { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 20px; }
-        .badge { background: rgba(56, 58, 89, 0.4); padding: 4px 14px; border-radius: 100px; font-size: 11px; font-weight: 600; color: #8b949e; border: 1px solid #30363d; }
-        .badge.green { background: rgba(35, 134, 54, 0.15); color: #3fb950; border-color: #238636; }
-
-        /* Upload Zones */
-        .drop-zone { 
-            margin-top: 28px; 
-            background: rgba(13, 17, 23, 0.6); 
-            border-radius: 20px; 
-            border: 2px dashed #30363d; 
-            padding: 24px; 
-            transition: all 0.25s ease;
+        .header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px; }
+        .header-left { display: flex; align-items: center; gap: 18px; }
+        .logo-icon {
+            width: 58px; height: 58px;
+            background: linear-gradient(145deg, #238636, #1a6b2a);
+            border-radius: 18px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 32px;
+            box-shadow: 0 4px 20px rgba(35,134,54,0.35);
+        }
+        .title-group h1 { color: #f0f6fc; font-size: 30px; font-weight: 900; letter-spacing: -0.6px; }
+        .title-group h1 span { color: #58a6ff; }
+        .title-group .subtitle { color: #8b949e; font-size: 15px; border-left: 3px solid #238636; padding-left: 14px; }
+        .version-badge { background: rgba(88,166,255,0.12); color: #58a6ff; padding: 4px 14px; border-radius: 100px; font-size: 12px; font-weight: 700; border: 1px solid rgba(88,166,255,0.15); }
+        .badge-group { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 20px; padding-top: 18px; border-top: 1px solid rgba(48,54,61,0.4); }
+        .badge { background: rgba(48,54,61,0.35); padding: 5px 16px; border-radius: 100px; font-size: 11px; font-weight: 600; color: #8b949e; border: 1px solid #30363d; }
+        .badge.green { background: rgba(35,134,54,0.15); color: #3fb950; border-color: #238636; }
+        .badge.blue { background: rgba(88,166,255,0.12); color: #58a6ff; border-color: rgba(88,166,255,0.2); }
+        .badge.gold { background: rgba(255,166,0,0.1); color: #d29922; border-color: rgba(255,166,0,0.2); }
+        .drop-zone {
+            margin-top: 20px;
+            background: rgba(13,17,23,0.5);
+            border-radius: 24px;
+            border: 2px dashed #30363d;
+            padding: 28px 24px;
+            transition: all 0.3s;
             position: relative;
+            cursor: pointer;
         }
-        .drop-zone:hover { border-color: #58a6ff; background: rgba(13, 17, 23, 0.8); }
-        .drop-zone.dragover { border-color: #58a6ff; background: rgba(88, 166, 255, 0.05); box-shadow: 0 0 40px rgba(88, 166, 255, 0.05); }
-        .drop-zone-label { display: flex; align-items: center; gap: 12px; font-weight: 600; color: #f0f6fc; font-size: 15px; margin-bottom: 8px; }
-        .drop-zone-label .icon { font-size: 20px; }
-        .drop-zone input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
-        .file-preview { display: flex; align-items: center; gap: 12px; color: #8b949e; font-size: 14px; margin-top: 6px; }
-        .file-preview .fname { color: #f0f6fc; background: #0d1117; padding: 4px 12px; border-radius: 8px; border: 1px solid #21262d; font-family: monospace; }
-        .file-hint { font-size: 12px; color: #484f58; margin-top: 6px; }
-
+        .drop-zone:hover { border-color: #58a6ff; background: rgba(13,17,23,0.7); }
+        .drop-zone.dragover { border-color: #58a6ff; background: rgba(88,166,255,0.06); box-shadow: 0 0 60px rgba(88,166,255,0.04); }
+        .drop-zone input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; z-index: 2; }
+        .drop-zone-label { display: flex; align-items: center; gap: 14px; font-weight: 700; color: #f0f6fc; font-size: 16px; pointer-events: none; }
+        .drop-zone-label .icon { font-size: 24px; }
+        .drop-zone-label .hint { font-weight: 400; color: #8b949e; font-size: 13px; margin-left: 6px; }
+        .file-preview { display: flex; align-items: center; gap: 12px; color: #8b949e; font-size: 14px; margin-top: 8px; pointer-events: none; }
+        .file-preview .fname { color: #f0f6fc; background: #0d1117; padding: 4px 14px; border-radius: 10px; border: 1px solid #21262d; font-family: monospace; font-size: 13px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .file-hint { font-size: 12px; color: #484f58; margin-top: 6px; pointer-events: none; }
         .btn-primary {
             margin-top: 32px;
-            background: linear-gradient(135deg, #238636, #1a7a2e);
+            background: linear-gradient(145deg, #238636, #1a7a2e);
             border: none;
             color: white;
             font-weight: 700;
-            font-size: 18px;
-            padding: 18px 32px;
+            font-size: 19px;
+            padding: 20px 36px;
             width: 100%;
             border-radius: 100px;
             cursor: pointer;
-            transition: all 0.2s ease;
+            transition: all 0.25s;
             display: flex;
             justify-content: center;
             align-items: center;
-            gap: 14px;
-            box-shadow: 0 4px 24px rgba(35, 134, 54, 0.25);
-            letter-spacing: 0.3px;
+            gap: 16px;
+            box-shadow: 0 4px 32px rgba(35,134,54,0.25);
         }
-        .btn-primary:hover { transform: scale(1.02); background: linear-gradient(135deg, #2ea043, #238636); box-shadow: 0 8px 32px rgba(35, 134, 54, 0.4); }
-        .btn-primary:disabled { background: #2d4a2d; cursor: not-allowed; transform: none; box-shadow: none; }
+        .btn-primary:hover { transform: scale(1.02); background: linear-gradient(145deg, #2ea043, #238636); box-shadow: 0 8px 48px rgba(35,134,54,0.4); }
+        .btn-primary:disabled { background: #2d4a2d; cursor: not-allowed; opacity: 0.6; transform: none; }
+        .btn-primary .spinner { display: none; width: 22px; height: 22px; border: 3px solid rgba(255,255,255,0.15); border-top-color: #fff; border-radius: 50%; animation: spin 0.7s linear infinite; }
         .btn-primary:disabled .spinner { display: inline-block; }
-
-        /* Progress */
+        @keyframes spin { 100% { transform: rotate(360deg); } }
         #progress-container {
             margin-top: 28px;
-            background: rgba(13, 17, 23, 0.8);
-            border-radius: 24px;
-            padding: 24px 28px;
+            background: rgba(13,17,23,0.8);
+            border-radius: 28px;
+            padding: 28px 32px;
             border: 1px solid #21262d;
             display: none;
         }
         .progress-header { display: flex; justify-content: space-between; align-items: center; }
-        .progress-header .label { font-weight: 600; color: #f0f6fc; font-size: 15px; }
-        .progress-header .percent { color: #58a6ff; font-weight: 700; font-size: 18px; font-variant-numeric: tabular-nums; }
-        .progress-track { height: 8px; background: #21262d; border-radius: 100px; overflow: hidden; margin: 12px 0; }
-        .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #238636, #58a6ff); border-radius: 100px; transition: width 0.5s cubic-bezier(0.22, 1, 0.36, 1); }
-        .status-msg { color: #8b949e; font-size: 14px; display: flex; align-items: center; gap: 10px; }
-        .status-msg .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #30363d; border-top-color: #58a6ff; border-radius: 50%; animation: spin 0.8s linear infinite; }
-        @keyframes spin { 100% { transform: rotate(360deg); } }
-
-        .error-box, .success-box { margin-top: 16px; padding: 16px 20px; border-radius: 16px; display: none; font-weight: 500; }
-        .error-box { background: rgba(248, 81, 73, 0.1); border: 1px solid #f85149; color: #f85149; }
-        .success-box { background: rgba(46, 160, 67, 0.1); border: 1px solid #238636; color: #3fb950; }
-
-        .footer { margin-top: 32px; display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: #484f58; border-top: 1px solid #21262d; padding-top: 20px; flex-wrap: wrap; gap: 10px; }
-        .footer a { color: #58a6ff; text-decoration: none; transition: 0.2s; }
+        .progress-header .label { font-weight: 600; color: #f0f6fc; }
+        .progress-header .percent { color: #58a6ff; font-weight: 800; font-size: 22px; }
+        .progress-track { height: 8px; background: #21262d; border-radius: 100px; overflow: hidden; margin: 14px 0; }
+        .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #238636, #58a6ff); border-radius: 100px; transition: width 0.6s cubic-bezier(0.22,1,0.36,1); }
+        .status-msg { color: #8b949e; font-size: 14px; display: flex; align-items: center; gap: 12px; }
+        .status-msg .spinner { display: inline-block; width: 18px; height: 18px; border: 2.5px solid #30363d; border-top-color: #58a6ff; border-radius: 50%; animation: spin 0.8s linear infinite; }
+        .error-box, .success-box { margin-top: 16px; padding: 16px 22px; border-radius: 18px; display: none; font-weight: 500; font-size: 14px; }
+        .error-box { background: rgba(248,81,73,0.08); border: 1px solid #f85149; color: #f85149; }
+        .success-box { background: rgba(46,160,67,0.08); border: 1px solid #238636; color: #3fb950; }
+        .footer {
+            margin-top: 36px;
+            display: flex; justify-content: space-between; align-items: center;
+            font-size: 13px; color: #484f58;
+            border-top: 1px solid #21262d; padding-top: 22px;
+            flex-wrap: wrap; gap: 12px;
+        }
+        .footer a { color: #58a6ff; text-decoration: none; }
         .footer a:hover { text-decoration: underline; }
-        .admin-link { background: rgba(56, 58, 89, 0.3); padding: 4px 14px; border-radius: 100px; border: 1px solid #30363d; }
-
-        /* Responsive */
-        @media (max-width: 600px) {
-            .container { padding: 24px; border-radius: 32px; }
-            h1 { font-size: 22px; }
-            .logo-icon { width: 44px; height: 44px; font-size: 22px; }
+        .admin-link { background: rgba(48,54,61,0.3); padding: 5px 18px; border-radius: 100px; border: 1px solid #30363d; }
+        @media (max-width:600px) {
+            .container { padding: 24px 16px; border-radius: 28px; }
+            .logo-icon { width: 44px; height: 44px; font-size: 24px; }
+            .title-group h1 { font-size: 22px; }
             .btn-primary { font-size: 16px; padding: 16px; }
-            .drop-zone { padding: 16px; }
-            .header { flex-direction: column; gap: 12px; }
+            .drop-zone { padding: 20px 16px; }
+            .file-preview .fname { max-width: 140px; font-size: 12px; }
         }
     </style>
 </head>
@@ -588,35 +615,37 @@ HTML_PAGE = """
     <div class="header">
         <div class="header-left">
             <div class="logo-icon">⚡</div>
-            <div>
+            <div class="title-group">
                 <h1>Modder <span>Injector</span></h1>
-                <div class="subtitle">APK + Expiry Patcher · v4.0</div>
+                <div class="subtitle">APK + Expiry Patcher</div>
             </div>
         </div>
+        <span class="version-badge">v6.0</span>
     </div>
+
     <div class="badge-group">
         <span class="badge green">🔒 2GB Max</span>
-        <span class="badge">📦 Dialog+Online</span>
-        <span class="badge">⚡ Smart Neutralizer</span>
+        <span class="badge blue">📦 Dialog+Online</span>
+        <span class="badge gold">⚡ Smart Neutralizer</span>
+        <span class="badge">🚀 Gunicorn Ready</span>
     </div>
 
     <form id="uploadForm" enctype="multipart/form-data">
         <div class="drop-zone" id="apkZone">
-            <div class="drop-zone-label"><span class="icon">📱</span> APK File <span style="font-weight:400;color:#8b949e;font-size:13px;margin-left:8px;">(1GB+)</span></div>
+            <div class="drop-zone-label"><span class="icon">📱</span> APK File <span class="hint">(1GB+)</span></div>
             <input type="file" name="apk_file" accept=".apk" required>
             <div class="file-preview"><span>📄</span> <span class="fname" id="apk-name">No file selected</span></div>
             <div class="file-hint">Drop your original APK here or click to browse.</div>
         </div>
-
         <div class="drop-zone" id="zipZone" style="margin-top:16px;">
-            <div class="drop-zone-label"><span class="icon">📦</span> Modder Hub ZIP <span style="font-weight:400;color:#8b949e;font-size:13px;margin-left:8px;">(assets + classes.dex)</span></div>
+            <div class="drop-zone-label"><span class="icon">📦</span> Modder Hub ZIP <span class="hint">(assets + classes.dex)</span></div>
             <input type="file" name="patch_zip" accept=".zip" required>
             <div class="file-preview"><span>🗂️</span> <span class="fname" id="zip-name">No file selected</span></div>
             <div class="file-hint">Drop the ZIP exported from Modder Hub.</div>
         </div>
-
         <button type="submit" class="btn-primary" id="submitBtn">
             <span>🚀</span> Inject & Download Modified APK
+            <span class="spinner"></span>
         </button>
     </form>
 
@@ -632,32 +661,24 @@ HTML_PAGE = """
     </div>
 
     <div class="footer">
-        <span>Made with ❤️ for the Modding Community</span>
-        <span><a href="#" id="admin-link" target="_blank" class="admin-link">📊 Dashboard</a></span>
+        <span>❤️ Made for the Modding Community</span>
+        <a href="#" id="admin-link" target="_blank" class="admin-link">📊 Dashboard</a>
     </div>
 </div>
 
 <script>
-    // --- File Name Display & Drag Styling ---
+    // File name display
     document.querySelectorAll('.drop-zone input[type="file"]').forEach(input => {
         const zone = input.closest('.drop-zone');
         const nameSpan = zone.querySelector('.fname');
-        
-        input.addEventListener('change', function(e) {
-            if (this.files.length > 0) {
-                nameSpan.textContent = this.files[0].name;
-            } else {
-                nameSpan.textContent = 'No file selected';
-            }
+        input.addEventListener('change', function() {
+            nameSpan.textContent = this.files.length > 0 ? this.files[0].name : 'No file selected';
         });
-
-        // Drag & Drop highlight
-        zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('dragover'); });
+        zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
         zone.addEventListener('dragleave', () => { zone.classList.remove('dragover'); });
         zone.addEventListener('drop', () => { zone.classList.remove('dragover'); });
     });
 
-    // --- Form Submission & Polling ---
     const form = document.getElementById('uploadForm');
     const submitBtn = document.getElementById('submitBtn');
     const progressContainer = document.getElementById('progress-container');
@@ -682,26 +703,27 @@ HTML_PAGE = """
         progressPercent.textContent = '0%';
         statusMsg.innerHTML = '<span class="spinner"></span> Uploading files...';
         submitBtn.disabled = true;
-        submitBtn.innerHTML = '<span class="spinner" style="display:inline-block;width:18px;height:18px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite;"></span> Processing...';
+        submitBtn.querySelector('span:first-child').textContent = '⏳';
 
         try {
-            const response = await fetch('/upload/', { method: 'POST', body: formData });
+            const response = await fetch('/upload/', {
+                method: 'POST',
+                body: formData
+            });
             if (!response.ok) {
                 const err = await response.json();
-                throw new Error(err.detail || 'Upload failed');
+                throw new Error(err.error || 'Upload failed');
             }
             const data = await response.json();
             taskId = data.task_id;
             adminLink.href = `/admin/${taskId}`;
-            
-            statusMsg.innerHTML = `<span class="spinner"></span> Task started (ID: ${taskId}). Waiting for processing...`;
+            statusMsg.innerHTML = `<span class="spinner"></span> Task started (ID: ${taskId}). Processing...`;
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(() => pollStatus(taskId), 1500);
-            
         } catch (err) {
             showError(err.message);
             submitBtn.disabled = false;
-            submitBtn.innerHTML = '🚀 Inject & Download Modified APK';
+            submitBtn.querySelector('span:first-child').textContent = '🚀';
         }
     });
 
@@ -709,16 +731,14 @@ HTML_PAGE = """
         try {
             const res = await fetch(`/status/${id}`);
             const data = await res.json();
-            
             const prog = data.progress || 0;
             progressBar.style.width = prog + '%';
             progressPercent.textContent = prog + '%';
             statusMsg.innerHTML = `<span class="spinner"></span> ${data.message || 'Processing...'}`;
-            
             if (data.status === 'completed') {
                 clearInterval(pollInterval);
                 submitBtn.disabled = false;
-                submitBtn.innerHTML = '🚀 Inject & Download Modified APK';
+                submitBtn.querySelector('span:first-child').textContent = '🚀';
                 statusMsg.innerHTML = '✅ Done! Downloading APK...';
                 successBox.style.display = 'block';
                 window.location.href = `/download/${id}`;
@@ -729,143 +749,224 @@ HTML_PAGE = """
             } else if (data.status === 'failed') {
                 clearInterval(pollInterval);
                 submitBtn.disabled = false;
-                submitBtn.innerHTML = '🚀 Inject & Download Modified APK';
+                submitBtn.querySelector('span:first-child').textContent = '🚀';
                 showError(data.error || 'Unknown error occurred.');
             }
-        } catch (err) {
-            // ignore network errors during polling
-        }
+        } catch (err) {}
     }
 
     function showError(msg) {
         errorBox.textContent = '❌ ' + msg;
         errorBox.style.display = 'block';
-        setTimeout(() => { errorBox.style.display = 'none'; }, 12000);
+        setTimeout(() => { errorBox.style.display = 'none'; }, 15000);
     }
 </script>
 </body>
 </html>
 """
 
-# ======================= ROUTES =============================
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return HTMLResponse(content=HTML_PAGE)
+@app.route('/')
+def home():
+    return render_template_string(HTML_PAGE)
 
-@app.post("/upload/")
-async def upload_apk(
-    apk_file: UploadFile = File(...),
-    patch_zip: UploadFile = File(...)
-):
-    if not apk_file.filename.endswith(".apk"):
-        raise HTTPException(400, "Only APK files allowed")
-    if not patch_zip.filename.endswith(".zip"):
-        raise HTTPException(400, "Only ZIP files allowed")
-    
-    apk_data = await apk_file.read()
-    zip_data = await patch_zip.read()
-    
+@app.route('/upload/', methods=['POST'])
+def upload_apk():
+    if 'apk_file' not in request.files or 'patch_zip' not in request.files:
+        return jsonify({"error": "Missing files"}), 400
+    apk_file = request.files['apk_file']
+    patch_zip = request.files['patch_zip']
+    if not apk_file.filename.endswith('.apk'):
+        return jsonify({"error": "Only APK files allowed"}), 400
+    if not patch_zip.filename.endswith('.zip'):
+        return jsonify({"error": "Only ZIP files allowed"}), 400
+
+    apk_data = apk_file.read()
+    zip_data = patch_zip.read()
     if len(apk_data) > MAX_FILE_SIZE:
-        raise HTTPException(400, f"APK size exceeds 2GB limit")
-    
+        return jsonify({"error": "APK size exceeds 2GB limit"}), 400
+
     task_id = create_task()
-    
     thread = threading.Thread(
         target=run_patch_task,
         args=(task_id, apk_data, zip_data, apk_file.filename)
     )
     thread.daemon = True
     thread.start()
-    
-    return JSONResponse({
-        "task_id": task_id,
-        "status": "pending",
-        "message": "Task started."
-    })
+    return jsonify({"task_id": task_id, "status": "pending"})
 
-@app.get("/status/{task_id}")
-async def get_status(task_id: str):
-    if task_id not in TASK_STORE:
-        raise HTTPException(404, "Task not found")
-    return JSONResponse(TASK_STORE[task_id])
+@app.route('/status/<task_id>')
+def get_status(task_id):
+    task = get_task(task_id)
+    if not task:
+        return jsonify({"error": "Task not found"}), 404
+    return jsonify(task)
 
-@app.get("/download/{task_id}")
-async def download_apk(task_id: str):
-    if task_id not in TASK_STORE:
-        raise HTTPException(404, "Task not found")
-    task = TASK_STORE[task_id]
-    if task["status"] != "completed":
-        raise HTTPException(400, "Task not completed yet")
-    result_path = task.get("result_path")
+@app.route('/download/<task_id>')
+def download_apk(task_id):
+    task = get_task(task_id)
+    if not task:
+        return jsonify({"error": "Task not found"}), 404
+    if task['status'] != 'completed':
+        return jsonify({"error": "Task not completed"}), 400
+    result_path = task.get('result_path')
     if not result_path or not os.path.exists(result_path):
-        raise HTTPException(404, "File not found")
-    
+        return jsonify({"error": "File not found"}), 404
     filename = os.path.basename(result_path)
-    return FileResponse(
-        path=result_path,
-        filename=filename,
-        media_type="application/vnd.android.package-archive",
-        background=BackgroundTasks(lambda: [os.remove(result_path) if os.path.exists(result_path) else None])
-    )
+    # Delete after sending
+    def delete_file():
+        try:
+            os.remove(result_path)
+        except:
+            pass
+    response = send_file(result_path, as_attachment=True, download_name=filename)
+    # Delete file after response is sent (use after_this_request)
+    @response.call_on_close
+    def cleanup():
+        delete_file()
+    return response
 
-@app.get("/admin/{task_id}", response_class=HTMLResponse)
-async def admin_dashboard(task_id: str):
-    if task_id not in TASK_STORE:
-        return HTMLResponse("<h1>Task not found</h1>")
-    task = TASK_STORE[task_id]
+@app.route('/admin/<task_id>')
+def admin_dashboard(task_id):
+    task = get_task(task_id)
+    if not task:
+        return "<h1>Task not found</h1>", 404
+    status_color = "green" if task['status'] == 'completed' else "red" if task['status'] == 'failed' else "gold"
+    error_html = f'<pre style="background:#0d1117;padding:16px;border-radius:8px;overflow:auto;color:#f85149;">{task.get("error", "")}</pre>' if task.get("error") else ""
     html = f"""
     <!DOCTYPE html>
     <html><head><title>Admin - {task_id}</title>
-    <style>body{{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:40px;}}
-    .box{{background:#161b22;padding:24px;border-radius:16px;border:1px solid #30363d;max-width:800px;margin:auto;}}
-    .green{{color:#3fb950;}}.red{{color:#f85149;}}
-    pre{{background:#0d1117;padding:16px;border-radius:8px;overflow:auto;white-space:pre-wrap;word-break:break-word;}}
-    </style></head>
+    <style>
+        body{{background:#0d1117;color:#c9d1d9;font-family:'Inter',monospace;padding:40px;}}
+        .box{{background:#161b22;padding:32px;border-radius:20px;border:1px solid #30363d;max-width:800px;margin:auto;}}
+        .green{{color:#3fb950;}}.red{{color:#f85149;}}.gold{{color:#d29922;}}
+        pre{{background:#0d1117;padding:16px;border-radius:8px;overflow:auto;white-space:pre-wrap;word-break:break-word;}}
+        a{{color:#58a6ff;text-decoration:none;}}
+        .flex{{display:flex;gap:20px;flex-wrap:wrap;}}
+        .stat{{background:#0d1117;padding:12px 20px;border-radius:12px;border:1px solid #21262d;flex:1;min-width:120px;}}
+        .stat .val{{font-size:22px;font-weight:700;}}
+    </style>
+    </head>
     <body>
     <div class="box">
-    <h1>📊 Task: {task_id}</h1>
-    <p><strong>Status:</strong> <span class="{'green' if task['status']=='completed' else 'red' if task['status']=='failed' else ''}">{task['status']}</span></p>
-    <p><strong>Progress:</strong> {task['progress']}%</p>
-    <p><strong>Message:</strong> {task['message']}</p>
-    <p><strong>Created:</strong> {task.get('created_at', 'N/A')}</p>
-    {f'<p class="red"><strong>Error:</strong> <pre>{task.get("error", "")}</pre></p>' if task.get("error") else ''}
-    <p><a href="/" style="color:#58a6ff;">⬅️ Back to Home</a> | <a href="/download/{task_id}" style="color:#3fb950;">⬇️ Download</a></p>
-    </div></body></html>
+        <h1>📊 Task: {task_id}</h1>
+        <div class="flex" style="margin:20px 0;">
+            <div class="stat"><div style="color:#8b949e;font-size:13px;">Status</div><div class="val {status_color}">{task['status']}</div></div>
+            <div class="stat"><div style="color:#8b949e;font-size:13px;">Progress</div><div class="val" style="color:#58a6ff;">{task['progress']}%</div></div>
+            <div class="stat"><div style="color:#8b949e;font-size:13px;">Created</div><div class="val" style="font-size:14px;">{task.get('created_at', 'N/A')[:19]}</div></div>
+        </div>
+        <p><strong>📝 Message:</strong> {task['message']}</p>
+        {error_html}
+        <div style="margin-top:24px;display:flex;gap:16px;flex-wrap:wrap;">
+            <a href="/" style="background:#21262d;padding:10px 24px;border-radius:12px;">⬅️ Home</a>
+            <a href="/download/{task_id}" style="background:#238636;padding:10px 24px;border-radius:12px;color:white;">⬇️ Download</a>
+            <a href="/admin/" style="background:#21262d;padding:10px 24px;border-radius:12px;">📋 All Tasks</a>
+        </div>
+    </div>
+    </body></html>
     """
-    return HTMLResponse(content=html)
+    return html
 
-@app.get("/admin/", response_class=HTMLResponse)
-async def admin_list():
-    html = """<html><head><title>Admin</title><style>
-    body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:40px;}
-    table{width:100%;border-collapse:collapse;max-width:1200px;margin:auto;}
-    td,th{padding:12px;border-bottom:1px solid #30363d;text-align:left;}
-    .green{color:#3fb950;}.red{color:#f85149;}
-    .box{background:#161b22;padding:24px;border-radius:16px;}
-    </style></head><body>
+@app.route('/admin/')
+def admin_list():
+    cleanup_old_tasks()
+    items = list(TASK_STORE.items())
+    items = items[-50:][::-1]
+    rows = ""
+    for tid, task in items:
+        status_class = "green" if task["status"] == "completed" else "red" if task["status"] == "failed" else "gold"
+        rows += f"""
+        <tr>
+            <td style="font-family:monospace;">{tid}</td>
+            <td class="{status_class}">{task['status']}</td>
+            <td>{task['progress']}%</td>
+            <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{task['message'][:40]}</td>
+            <td><a href="/admin/{tid}" style="color:#58a6ff;">View</a></td>
+        </tr>
+        """
+    html = f"""
+    <!DOCTYPE html>
+    <html><head><title>Admin Dashboard</title>
+    <style>
+        body{{background:#0d1117;color:#c9d1d9;font-family:'Inter',monospace;padding:40px;}}
+        .box{{background:#161b22;padding:32px;border-radius:20px;border:1px solid #30363d;max-width:1200px;margin:auto;overflow-x:auto;}}
+        table{{width:100%;border-collapse:collapse;}}
+        td,th{{padding:12px 16px;border-bottom:1px solid #21262d;text-align:left;}}
+        th{{color:#8b949e;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;}}
+        .green{{color:#3fb950;}}.red{{color:#f85149;}}.gold{{color:#d29922;}}
+        a{{color:#58a6ff;text-decoration:none;}}
+        .header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:12px;}}
+        .count{{background:#21262d;padding:4px 16px;border-radius:100px;font-size:14px;}}
+    </style>
+    </head>
+    <body>
     <div class="box">
-    <h1>📊 All Tasks (Last 50)</h1>
-    <table><tr><th>ID</th><th>Status</th><th>Progress</th><th>Message</th><th>Action</th></tr>
+        <div class="header">
+            <h1>📊 Admin Dashboard</h1>
+            <span class="count">Total Tasks: {len(TASK_STORE)}</span>
+        </div>
+        <table>
+            <tr><th>Task ID</th><th>Status</th><th>Progress</th><th>Message</th><th>Action</th></tr>
+            {rows if rows else '<tr><td colspan="5" style="text-align:center;color:#484f58;padding:40px;">No tasks yet. Upload an APK to start!</td></tr>'}
+        </table>
+        <div style="margin-top:24px;display:flex;gap:16px;flex-wrap:wrap;">
+            <a href="/" style="background:#21262d;padding:10px 24px;border-radius:12px;">⬅️ Home</a>
+            <span style="color:#484f58;font-size:13px;">Tasks auto-clean after 24 hours</span>
+        </div>
+    </div>
+    </body></html>
     """
-    for tid, task in list(TASK_STORE.items())[-50:][::-1]:
-        status_class = "green" if task['status'] == 'completed' else "red" if task['status'] == 'failed' else ""
-        html += f"<tr><td>{tid}</td><td class='{status_class}'>{task['status']}</td><td>{task['progress']}%</td><td>{task['message'][:40]}...</td><td><a href='/admin/{tid}' style='color:#58a6ff;'>View</a></td></tr>"
-    html += "</table><br><a href='/' style='color:#58a6ff;'>⬅️ Home</a></div></body></html>"
-    return HTMLResponse(content=html)
+    return html
 
-# ======================= STARTUP ============================
-@app.on_event("startup")
-async def startup_event():
-    print("="*60)
-    print("🛠️  Modder Hub APK Patcher v4.0 (Premium)")
-    print("="*60)
-    print("📂 Downloading required tools (apktool, baksmali)...")
+@app.route('/health')
+def health():
+    return jsonify({
+        "status": "healthy",
+        "version": "6.0",
+        "tasks": len(TASK_STORE),
+        "tools_available": os.path.exists(APKTOOL_JAR) and os.path.exists(BAKSMALI_JAR)
+    })
+
+# ======================= STARTUP =============================
+def startup():
+    print("="*70)
+    print("  🛠️  MODDER HUB APK PATCHER v6.0 (Flask + Gunicorn)")
+    print("  " + "="*62)
+    print("  ✅ Ready for: gunicorn app:app")
+    print("="*70)
+    print("📂 Downloading required tools...")
     tools_ok = download_tools()
     print(f"🔧 Tools ready: {tools_ok}")
     print(f"🔐 Generating Keystore: {generate_keystore()}")
-    print(f"📁 Uploads dir: {UPLOAD_DIR}")
-    print(f"🌐 Server running on port {PORT}")
-    print("="*60)
+    print(f"📁 Uploads directory: {UPLOAD_DIR}")
+    print(f"🐍 Python: {sys.version}")
+    print("="*70)
+    print("🚀 Server is live!")
 
+# Run startup before first request
+@app.before_first_request
+def before_first_request():
+    startup()
+
+# ======================= CLEANUP =============================
+def cleanup_on_exit():
+    print("🧹 Cleaning up old files...")
+    for tid, task in TASK_STORE.items():
+        if task.get("result_path") and os.path.exists(task["result_path"]):
+            try:
+                os.remove(task["result_path"])
+            except:
+                pass
+    for d in os.listdir(tempfile.gettempdir()):
+        if d.startswith("patch_"):
+            try:
+                shutil.rmtree(os.path.join(tempfile.gettempdir(), d), ignore_errors=True)
+            except:
+                pass
+
+atexit.register(cleanup_on_exit)
+
+# ======================= MAIN (for development) ==============
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    port = int(os.environ.get("PORT", 5000))
+    # For local run, we can use Flask's built-in server
+    app.run(host="0.0.0.0", port=port, debug=False)
