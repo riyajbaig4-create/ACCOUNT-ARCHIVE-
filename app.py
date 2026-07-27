@@ -235,45 +235,41 @@ def find_startup_file(folder):
             return filename
     return None
 
-def detect_framework(folder):
-    if os.path.exists(os.path.join(folder, 'manage.py')):
-        return {'framework': 'django', 'cmd': [sys.executable, 'manage.py', 'runserver', '0.0.0.0:$PORT']}
-    elif os.path.exists(os.path.join(folder, 'app.py')):
-        return {'framework': 'flask', 'cmd': [sys.executable, 'app.py']}
-    elif os.path.exists(os.path.join(folder, 'main.py')):
-        return {'framework': 'flask', 'cmd': [sys.executable, 'main.py']}
-    elif os.path.exists(os.path.join(folder, 'server.py')):
-        return {'framework': 'flask', 'cmd': [sys.executable, 'server.py']}
-    elif os.path.exists(os.path.join(folder, 'run.py')):
-        return {'framework': 'flask', 'cmd': [sys.executable, 'run.py']}
-    elif os.path.exists(os.path.join(folder, 'start.py')):
-        return {'framework': 'flask', 'cmd': [sys.executable, 'start.py']}
-    elif os.path.exists(os.path.join(folder, 'wsgi.py')):
-        return {'framework': 'flask', 'cmd': ['gunicorn', 'wsgi:application']}
-    elif os.path.exists(os.path.join(folder, 'asgi.py')):
-        return {'framework': 'fastapi', 'cmd': ['uvicorn', 'asgi:application']}
-    elif os.path.exists(os.path.join(folder, 'index.html')):
-        return {'framework': 'static', 'cmd': None}
-    else:
-        return None
-
-def install_requirements(folder, website_id):
+def install_requirements(folder, website_id, log_callback=None):
     req_file = os.path.join(folder, 'requirements.txt')
     if not os.path.exists(req_file):
+        if log_callback:
+            log_callback("SYSTEM", "No requirements.txt found – skipping")
         return True, "No requirements.txt"
     
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
     try:
         cmd = [sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt']
+        if log_callback:
+            log_callback("PIP", f"Running: {' '.join(cmd)}")
         with open(log_file, 'w') as f:
             proc = subprocess.Popen(cmd, cwd=folder, stdout=f, stderr=subprocess.STDOUT)
+            # Also capture and log via callback
+            while True:
+                line = proc.stdout.readline() if proc.stdout else None
+                if line:
+                    if log_callback:
+                        log_callback("PIP", line.strip())
+                if proc.poll() is not None:
+                    break
             proc.wait()
         if proc.returncode != 0:
             with open(log_file, 'r') as f:
                 error = f.read()[-500:]
+            if log_callback:
+                log_callback("ERROR", f"Installation failed: {error}")
             return False, f"Installation failed: {error}"
+        if log_callback:
+            log_callback("SUCCESS", "Requirements installed successfully")
         return True, "Installation successful"
     except Exception as e:
+        if log_callback:
+            log_callback("ERROR", f"Installation error: {str(e)}")
         return False, f"Installation error: {str(e)}"
 
 def health_check(port, timeout=5):
@@ -291,7 +287,7 @@ def health_check(port, timeout=5):
         return False, str(e)
 
 # ---------- Process Management ----------
-def start_website_process(website_id):
+def start_website_process(website_id, log_callback=None):
     website = get_website_by_id(website_id)
     if not website:
         return False, "Website not found"
@@ -314,7 +310,7 @@ def start_website_process(website_id):
             return False, "No startup file detected. Please upload a valid Python project or static site with index.html."
     
     if not is_static and startup:
-        success, msg = install_requirements(folder, website_id)
+        success, msg = install_requirements(folder, website_id, log_callback)
         if not success:
             log_website(website_id, f"Requirements failed: {msg}", 'error')
             update_website_status(website_id, 'failed')
@@ -331,6 +327,9 @@ def start_website_process(website_id):
         cmd = [sys.executable, '-m', 'http.server', str(port)]
     else:
         cmd = [sys.executable, startup]
+    
+    if log_callback:
+        log_callback("STARTUP", f"Starting: {' '.join(cmd)} on port {port}")
     
     try:
         if os.name == 'nt':
@@ -352,6 +351,8 @@ def start_website_process(website_id):
                 conn.execute('UPDATE websites SET startup_file = ?, last_started = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                              (startup if startup else 'static', website_id))
                 conn.commit()
+            if log_callback:
+                log_callback("SUCCESS", f"Application running on port {port}")
             return True, f"Running on port {port}"
         else:
             try:
@@ -363,11 +364,15 @@ def start_website_process(website_id):
                 pass
             update_website_status(website_id, 'crashed')
             log_website(website_id, f"Health check failed: {health_msg}", 'error')
+            if log_callback:
+                log_callback("ERROR", f"Health check failed: {health_msg}")
             return False, f"Health check failed: {health_msg}"
             
     except Exception as e:
         log_website(website_id, f"Start error: {str(e)}", 'error')
         update_website_status(website_id, 'failed')
+        if log_callback:
+            log_callback("ERROR", f"Start error: {str(e)}")
         return False, str(e)
 
 def stop_website_process(website_id):
@@ -393,12 +398,108 @@ def stop_website_process(website_id):
     log_website(website_id, f"Stopped (PID {pid})")
     return True, "Stopped"
 
-# ---------- GitHub Deployment Core ----------
-def run_deployment_step(step, message):
+# ---------- Deployment Core (for ZIP & GitHub) ----------
+def write_log_step(log_file, step, message):
     ts = datetime.now().strftime("%H:%M:%S")
-    return f"[{ts}] [{step}] {message}\n"
+    line = f"[{ts}] [{step}] {message}\n"
+    with open(log_file, 'a') as f:
+        f.write(line)
+    return line
+
+def deploy_zip(website_id, extra_files=None):
+    """Deploy a ZIP-based website with logs."""
+    website = get_website_by_id(website_id)
+    if not website:
+        return
+    
+    # Create deployment record
+    with get_db() as conn:
+        cur = conn.execute('''INSERT INTO deployments (website_id, repo_url, branch, status, started_at)
+                              VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)''',
+                           (website_id, 'ZIP Upload', 'main', 'queued'))
+        deployment_id = cur.lastrowid
+        conn.commit()
+    
+    log_file = os.path.join(LOG_FOLDER, f"deploy_{deployment_id}.log")
+    with open(log_file, 'w') as f:
+        f.write(write_log_step(log_file, "SYSTEM", "ZIP Deployment started"))
+    
+    def log_cb(step, msg):
+        write_log_step(log_file, step, msg)
+        log_website(website_id, f"[{step}] {msg}", 'info')
+    
+    try:
+        log_cb("SYSTEM", "==> Extracting ZIP...")
+        with get_db() as conn:
+            conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('extracting', deployment_id))
+            conn.commit()
+        
+        folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+        zip_path = os.path.join(folder, 'upload.zip')
+        if not os.path.exists(zip_path):
+            log_cb("ERROR", "ZIP file not found")
+            with get_db() as conn:
+                conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
+                             ('failed', deployment_id))
+                conn.commit()
+            return
+        
+        ok, msg = extract_zip(zip_path, folder)
+        if not ok:
+            log_cb("ERROR", f"Extraction failed: {msg}")
+            with get_db() as conn:
+                conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
+                             ('failed', deployment_id))
+                conn.commit()
+            return
+        os.remove(zip_path)
+        log_cb("SUCCESS", "ZIP extracted successfully")
+        
+        # Copy extra files if any
+        if extra_files:
+            log_cb("SYSTEM", "Copying extra files...")
+            for (filename, content) in extra_files:
+                path = os.path.join(folder, secure_filename(filename))
+                with open(path, 'wb') as f:
+                    f.write(content)
+                log_cb("FILE", f"Added {filename}")
+        
+        # Update website size
+        size_used = calculate_folder_size(folder)
+        with get_db() as conn:
+            conn.execute('UPDATE websites SET storage_used = ?, website_size = ? WHERE id = ?',
+                         (size_used, size_used, website_id))
+            conn.commit()
+        
+        # Now start the application (which will install requirements)
+        log_cb("SYSTEM", "==> Starting application...")
+        with get_db() as conn:
+            conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('starting', deployment_id))
+            conn.commit()
+        
+        ok, msg = start_website_process(website_id, log_cb)
+        if ok:
+            with get_db() as conn:
+                conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP, duration = ? WHERE id = ?',
+                             ('success', int(time.time() - time.time()), deployment_id))
+                conn.commit()
+            log_cb("SUCCESS", "Deployment Successful!")
+        else:
+            with get_db() as conn:
+                conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
+                             ('failed', deployment_id))
+                conn.commit()
+            log_cb("ERROR", f"Deployment failed: {msg}")
+    
+    except Exception as e:
+        log_cb("ERROR", f"Deployment exception: {str(e)}")
+        with get_db() as conn:
+            conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
+                         ('failed', deployment_id))
+            conn.commit()
 
 def deploy_github(website_id, repo_url, branch):
+    """GitHub deployment with logs."""
     website = get_website_by_id(website_id)
     if not website:
         return
@@ -412,20 +513,14 @@ def deploy_github(website_id, repo_url, branch):
     
     log_file = os.path.join(LOG_FOLDER, f"deploy_{deployment_id}.log")
     with open(log_file, 'w') as f:
-        f.write(run_deployment_step("SYSTEM", f"Deployment started for {repo_url} (branch {branch})"))
+        f.write(write_log_step(log_file, "SYSTEM", f"GitHub Deployment started for {repo_url} (branch {branch})"))
     
-    with get_db() as conn:
-        conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('preparing', deployment_id))
-        conn.commit()
-    
-    def write_log(step, msg):
-        line = run_deployment_step(step, msg)
-        with open(log_file, 'a') as f:
-            f.write(line)
+    def log_cb(step, msg):
+        write_log_step(log_file, step, msg)
         log_website(website_id, f"[{step}] {msg}", 'info')
     
     try:
-        write_log("SYSTEM", "==> Cloning Repository...")
+        log_cb("SYSTEM", "==> Cloning Repository...")
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('cloning', deployment_id))
             conn.commit()
@@ -438,76 +533,77 @@ def deploy_github(website_id, repo_url, branch):
         clone_cmd = ['git', 'clone', '--depth', '1', '--branch', branch, repo_url, folder]
         proc = subprocess.Popen(clone_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         for line in iter(proc.stdout.readline, ''):
-            write_log("GIT", line.strip())
+            log_cb("GIT", line.strip())
         proc.wait()
         if proc.returncode != 0:
-            write_log("ERROR", f"Clone failed with code {proc.returncode}")
+            log_cb("ERROR", f"Clone failed with code {proc.returncode}")
             with get_db() as conn:
                 conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
                              ('failed', deployment_id))
                 conn.commit()
             return
         
-        write_log("SYSTEM", "Repository cloned successfully")
-        write_log("SYSTEM", "==> Checking Branch...")
-        write_log("SYSTEM", f"Branch: {branch}")
+        log_cb("SYSTEM", "Repository cloned successfully")
+        log_cb("SYSTEM", "==> Checking Branch...")
+        log_cb("SYSTEM", f"Branch: {branch}")
         
-        write_log("SYSTEM", "==> Detecting Python Version...")
+        log_cb("SYSTEM", "==> Detecting Python Version...")
         runtime_file = os.path.join(folder, 'runtime.txt')
         if os.path.exists(runtime_file):
             with open(runtime_file, 'r') as rf:
                 py_ver = rf.read().strip()
-            write_log("PYTHON", f"Python version from runtime.txt: {py_ver}")
+            log_cb("PYTHON", f"Python version from runtime.txt: {py_ver}")
         else:
             py_ver = '3.12.5'
-            write_log("PYTHON", f"Python version: {py_ver} (default)")
+            log_cb("PYTHON", f"Python version: {py_ver} (default)")
         
-        write_log("SYSTEM", "==> Searching requirements.txt...")
+        log_cb("SYSTEM", "==> Searching requirements.txt...")
         req_file = os.path.join(folder, 'requirements.txt')
         if os.path.exists(req_file):
-            write_log("SYSTEM", "requirements.txt found")
-            write_log("SYSTEM", "==> Installing Requirements...")
+            log_cb("SYSTEM", "requirements.txt found")
+            log_cb("SYSTEM", "==> Installing Requirements...")
             with get_db() as conn:
                 conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('installing', deployment_id))
                 conn.commit()
             
+            # Install with pip and capture output
             pip_cmd = [sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt']
             proc = subprocess.Popen(pip_cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             for line in iter(proc.stdout.readline, ''):
-                write_log("PIP", line.strip())
+                log_cb("PIP", line.strip())
             proc.wait()
             if proc.returncode != 0:
-                write_log("ERROR", f"Pip install failed with code {proc.returncode}")
+                log_cb("ERROR", f"Pip install failed with code {proc.returncode}")
                 with get_db() as conn:
                     conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
                                  ('failed', deployment_id))
                     conn.commit()
                 return
-            write_log("SYSTEM", "Requirements installed successfully")
+            log_cb("SYSTEM", "Requirements installed successfully")
         else:
-            write_log("SYSTEM", "No requirements.txt found – skipping")
+            log_cb("SYSTEM", "No requirements.txt found – skipping")
         
-        write_log("SYSTEM", "==> Detect Startup File...")
+        log_cb("SYSTEM", "==> Detect Startup File...")
         startup = find_startup_file(folder)
         if startup:
-            write_log("STARTUP", f"Found startup file: {startup}")
+            log_cb("STARTUP", f"Found startup file: {startup}")
         else:
             if os.path.exists(os.path.join(folder, 'index.html')):
-                write_log("STARTUP", "Static site detected (index.html)")
+                log_cb("STARTUP", "Static site detected (index.html)")
                 startup = 'static'
             else:
-                write_log("ERROR", "No startup file found")
+                log_cb("ERROR", "No startup file found")
                 with get_db() as conn:
                     conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
                                  ('failed', deployment_id))
                     conn.commit()
                 return
         
-        write_log("SYSTEM", "==> Allocating Port...")
+        log_cb("SYSTEM", "==> Allocating Port...")
         port = get_next_available_port()
-        write_log("PORT", f"Port {port} allocated")
+        log_cb("PORT", f"Port {port} allocated")
         
-        write_log("SYSTEM", "==> Starting Application...")
+        log_cb("SYSTEM", "==> Starting Application...")
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('starting', deployment_id))
             conn.commit()
@@ -517,61 +613,23 @@ def deploy_github(website_id, repo_url, branch):
                          (repo_url, branch, 'github', 'starting', website_id))
             conn.commit()
         
-        env = os.environ.copy()
-        env['PORT'] = str(port)
-        env['PYTHONUNBUFFERED'] = '1'
-        if startup == 'static':
-            cmd = [sys.executable, '-m', 'http.server', str(port)]
-        else:
-            cmd = [sys.executable, startup]
-        log_file_process = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
-        try:
-            if os.name == 'nt':
-                proc = subprocess.Popen(cmd, cwd=folder, env=env,
-                                        stdout=open(log_file_process, 'a'), stderr=subprocess.STDOUT,
-                                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
-            else:
-                proc = subprocess.Popen(cmd, cwd=folder, env=env,
-                                        stdout=open(log_file_process, 'a'), stderr=subprocess.STDOUT,
-                                        preexec_fn=os.setsid)
-        except Exception as e:
-            write_log("ERROR", f"Start failed: {str(e)}")
+        # Use start_website_process with logging
+        ok, msg = start_website_process(website_id, log_cb)
+        if ok:
             with get_db() as conn:
-                conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
-                             ('failed', deployment_id))
-                conn.commit()
-            return
-        
-        write_log("SYSTEM", "Application process started")
-        write_log("SYSTEM", "==> Health Check...")
-        time.sleep(3)
-        healthy, health_msg = health_check(port, timeout=5)
-        if healthy:
-            update_website_status(website_id, 'running', proc.pid, port)
-            with get_db() as conn:
-                conn.execute('UPDATE websites SET startup_file = ?, last_started = CURRENT_TIMESTAMP WHERE id = ?',
-                             (startup if startup != 'static' else 'static', website_id))
                 conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP, duration = ? WHERE id = ?',
                              ('success', int(time.time() - time.time()), deployment_id))
                 conn.commit()
-            write_log("SUCCESS", f"Deployment Successful! App running on port {port}")
+            log_cb("SUCCESS", "Deployment Successful!")
         else:
-            write_log("ERROR", f"Health check failed: {health_msg}")
-            try:
-                if os.name == 'nt':
-                    subprocess.run(['taskkill', '/PID', str(proc.pid), '/F'], capture_output=True)
-                else:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except:
-                pass
-            update_website_status(website_id, 'crashed')
             with get_db() as conn:
                 conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
                              ('failed', deployment_id))
                 conn.commit()
+            log_cb("ERROR", f"Deployment failed: {msg}")
     
     except Exception as e:
-        write_log("ERROR", f"Deployment exception: {str(e)}")
+        log_cb("ERROR", f"Deployment exception: {str(e)}")
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
                          ('failed', deployment_id))
@@ -712,7 +770,7 @@ def dashboard():
                                   base_url=base_url,
                                   user_obj=user)
 
-# ---------- Upload System ----------
+# ---------- Enhanced Upload (ZIP + extra files) ----------
 @app.route('/upload', methods=['POST'])
 def upload_website():
     if 'user_id' not in session:
@@ -723,30 +781,32 @@ def upload_website():
     if user['status'] != 'active':
         return jsonify({'success': False, 'error': 'Account disabled'}), 403
     
-    if 'file' not in request.files:
-        return jsonify({'success': False, 'error': 'No file uploaded'}), 400
+    if 'files[]' not in request.files:
+        return jsonify({'success': False, 'error': 'No files uploaded'}), 400
     
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'success': False, 'error': 'Empty filename'}), 400
+    files = request.files.getlist('files[]')
+    if not files or all(f.filename == '' for f in files):
+        return jsonify({'success': False, 'error': 'No valid files'}), 400
     
-    file.seek(0, os.SEEK_END)
-    size = file.tell()
-    file.seek(0)
-    if size > MAX_UPLOAD_SIZE:
-        return jsonify({'success': False, 'error': f'File too large (max {MAX_UPLOAD_SIZE//1024//1024} MB)'}), 400
+    # Separate zip and extra files
+    zip_file = None
+    extra_files = []
+    for f in files:
+        if f.filename.lower().endswith('.zip'):
+            zip_file = f
+        else:
+            extra_files.append(f)
     
-    if not file.filename.lower().endswith('.zip'):
-        return jsonify({'success': False, 'error': 'Only ZIP files allowed'}), 400
+    if not zip_file:
+        return jsonify({'success': False, 'error': 'A ZIP file is required'}), 400
     
+    # Create website entry
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
-    
     slug = generate_website_slug(session['username'], count)
-    with get_db() as conn:
-        if conn.execute('SELECT id FROM websites WHERE website_slug = ?', (slug,)).fetchone():
-            count += 1
-            slug = generate_website_slug(session['username'], count)
+    if get_website_by_slug(slug):
+        count += 1
+        slug = generate_website_slug(session['username'], count)
     
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, deployment_type)
@@ -762,42 +822,39 @@ def upload_website():
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': 'Permission denied'}), 500
     
+    # Save zip
     zip_path = os.path.join(folder, 'upload.zip')
     try:
-        file.save(zip_path)
+        zip_file.save(zip_path)
     except Exception as e:
         rollback_upload(website_id, folder)
-        return jsonify({'success': False, 'error': f'Failed to save: {str(e)}'}), 500
+        return jsonify({'success': False, 'error': f'Failed to save zip: {str(e)}'}), 500
     
+    # Validate zip
     valid, msg = validate_zip(zip_path)
     if not valid:
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': msg}), 400
     
-    ok, msg = extract_zip(zip_path, folder)
-    if not ok:
-        rollback_upload(website_id, folder)
-        return jsonify({'success': False, 'error': msg}), 400
+    # Save extra files as binary data for later copying
+    extra_data = []
+    for f in extra_files:
+        f.seek(0)
+        data = f.read()
+        extra_data.append((f.filename, data))
     
-    os.remove(zip_path)
-    size_used = calculate_folder_size(folder)
+    # Start deployment in background
+    def bg_deploy():
+        deploy_zip(website_id, extra_data)
     
-    with get_db() as conn:
-        conn.execute('''UPDATE websites SET 
-                        website_name = ?, 
-                        website_folder = ?,
-                        storage_used = ?,
-                        website_size = ?,
-                        status = 'uploaded',
-                        updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?''',
-                     (file.filename[:-4] if '.' in file.filename else file.filename,
-                      f"website_{website_id}", size_used, size_used, website_id))
-        conn.commit()
+    thread = threading.Thread(target=bg_deploy)
+    thread.daemon = True
+    thread.start()
     
-    log_website(website_id, f"Uploaded: {file.filename}")
-    log_activity(user_id, 'upload', f'Uploaded {file.filename}', request.remote_addr)
+    log_website(website_id, f"Uploaded: {zip_file.filename} + {len(extra_files)} extra files")
+    log_activity(user_id, 'upload', f'Uploaded {zip_file.filename}', request.remote_addr)
     
+    # Return website_id and slug so frontend can redirect to logs
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
 # ---------- GitHub Deploy Route ----------
@@ -847,6 +904,7 @@ def deploy_logs(website_id):
         if session.get('role') != 'admin':
             abort(404)
     
+    # Get latest deployment for this website
     with get_db() as conn:
         dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
     if not dep:
@@ -871,6 +929,7 @@ def deploy_logs(website_id):
                         for line in new_lines.splitlines():
                             yield f"data: {line}\n\n"
                     last_size = current_size
+            # Check if deployment status is terminal
             with get_db() as conn:
                 dep_status = conn.execute('SELECT status FROM deployments WHERE id = ?', (dep['id'],)).fetchone()
             if dep_status and dep_status['status'] in ('success', 'failed', 'stopped'):
@@ -1263,7 +1322,7 @@ def unzip_file_website(website_id):
     os.remove(full)
     return jsonify({'success': True})
 
-# ---------- Logs View ----------
+# ---------- Logs View (includes deployment logs) ----------
 @app.route('/website/<int:website_id>/logs')
 def view_logs(website_id):
     if 'user_id' not in session:
@@ -1289,7 +1348,17 @@ def view_logs(website_id):
         with open(install_log_file, 'r', errors='ignore') as f:
             install_log = f.read()
     
-    return render_template_string(LOGS_TEMPLATE, website=website, logs=logs, file_log=file_log, install_log=install_log)
+    # Get latest deployment log
+    deploy_log = ''
+    with get_db() as conn:
+        dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
+    if dep:
+        dep_log_file = os.path.join(LOG_FOLDER, f"deploy_{dep['id']}.log")
+        if os.path.exists(dep_log_file):
+            with open(dep_log_file, 'r', errors='ignore') as f:
+                deploy_log = f.read()
+    
+    return render_template_string(LOGS_TEMPLATE, website=website, logs=logs, file_log=file_log, install_log=install_log, deploy_log=deploy_log)
 
 # ---------- Deployment History ----------
 @app.route('/website/<int:website_id>/deployments')
@@ -1424,8 +1493,9 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 .plan-badge{background:linear-gradient(135deg,#7a00ff,#00e5ff);padding:2px 12px;border-radius:50px;font-size:0.7rem;font-weight:700}
 .btn-logout{color:#ff4757;text-decoration:none;font-weight:600;padding:8px 20px;border:1px solid #ff4757;border-radius:50px;transition:.3s}
 .btn-logout:hover{background:#ff4757;color:#fff}
-.upload-box, .github-box{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:2px dashed rgba(255,255,255,0.1);border-radius:25px;padding:30px;margin-bottom:30px;transition:.3s}
-.upload-box:hover, .github-box:hover{border-color:#00e5ff;animation:glow 2s ease-in-out infinite}
+.upload-box, .github-box{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:2px dashed rgba(255,255,255,0.2);border-radius:25px;padding:30px;margin-bottom:30px;transition:.3s;position:relative}
+.upload-box.dragover{border-color:#00e5ff;background:rgba(0,229,255,0.05);animation:glow 1s ease-in-out infinite}
+.upload-box:hover, .github-box:hover{border-color:#00e5ff}
 .upload-box h3, .github-box h3{font-size:1.3rem;margin-bottom:15px;color:#ddd}
 .upload-box input[type="file"], .github-box input{width:100%;padding:10px;margin:8px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;outline:none}
 .upload-box input:focus, .github-box input:focus{border-color:#00e5ff}
@@ -1489,11 +1559,12 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 </div>
 </div>
 
-<!-- Upload ZIP -->
-<div class="upload-box">
-<h3>📤 Upload Website (ZIP)</h3>
-<input type="file" id="zipFile" accept=".zip">
-<button class="btn" id="uploadBtn">Upload & Deploy</button>
+<!-- Upload ZIP with Drag & Drop -->
+<div class="upload-box" id="dropZone">
+<h3>📤 Upload Website (ZIP + extra files)</h3>
+<p style="color:#889;font-size:0.9rem;margin-bottom:10px;">Drag & drop files here or click to select</p>
+<input type="file" id="zipFile" multiple accept=".zip,.py,.txt,.html,.js,.css,application/zip">
+<button class="btn" id="uploadBtn" style="margin-top:10px;">Upload & Deploy</button>
 <div id="uploadStatus"></div>
 </div>
 
@@ -1543,6 +1614,28 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 </div>
 
 <script>
+// Drag and Drop
+const dropZone = document.getElementById('dropZone');
+dropZone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropZone.classList.add('dragover');
+});
+dropZone.addEventListener('dragleave', () => {
+    dropZone.classList.remove('dragover');
+});
+dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    const files = e.dataTransfer.files;
+    const input = document.getElementById('zipFile');
+    const dt = new DataTransfer();
+    for (let f of files) {
+        dt.items.add(f);
+    }
+    input.files = dt.files;
+    document.getElementById('uploadStatus').innerHTML = `✅ ${files.length} file(s) selected`;
+});
+
 function action(id,type){
 fetch('/website/'+id+'/'+type,{method:'POST'})
 .then(r=>r.json())
@@ -1573,17 +1666,35 @@ body:'domain='+encodeURIComponent(val)
 .then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
 .catch(()=>alert('Network error'));
 }
+
 document.getElementById('uploadBtn').onclick=function(){
-const file=document.getElementById('zipFile').files[0];
-if(!file)return alert('Select ZIP');
-const fd=new FormData();fd.append('file',file);
-const st=document.getElementById('uploadStatus');
+const files = document.getElementById('zipFile').files;
+if(!files.length)return alert('Select at least one file (ZIP required)');
+// Check if a ZIP is present
+let hasZip = false;
+for(let f of files){
+    if(f.name.toLowerCase().endsWith('.zip')) hasZip = true;
+}
+if(!hasZip)return alert('A ZIP file is required');
+const fd = new FormData();
+for(let f of files){
+    fd.append('files[]', f);
+}
+const st = document.getElementById('uploadStatus');
 st.innerHTML='⏳ Uploading...';
 fetch('/upload',{method:'POST',body:fd})
 .then(r=>r.json())
-.then(d=>{if(d.success){st.innerHTML='✅ Uploaded!';location.reload()}else st.innerHTML='❌ '+d.error})
+.then(d=>{
+    if(d.success){
+        st.innerHTML='✅ Uploaded! Redirecting to logs...';
+        window.location.href = '/deploy/'+d.website_id+'/logs';
+    } else {
+        st.innerHTML='❌ '+d.error;
+    }
+})
 .catch(()=>st.innerHTML='❌ Network error');
 };
+
 document.getElementById('githubBtn').onclick=function(){
 const repo=document.getElementById('repoUrl').value.trim();
 const branch=document.getElementById('branch').value.trim()||'main';
@@ -1775,6 +1886,9 @@ No logs yet.
 
 <h3>📦 Installation Log</h3>
 <pre>{{ install_log if install_log else 'No installation log.' }}</pre>
+
+<h3>🚀 Deployment Log</h3>
+<pre>{{ deploy_log if deploy_log else 'No deployment log.' }}</pre>
 </div>
 </body>
 </html>
