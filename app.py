@@ -9,10 +9,11 @@ import time
 import re
 import json
 import requests
+import threading
+import queue
 from datetime import datetime
 from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context
 from werkzeug.security import generate_password_hash, check_password_hash
-import threading
 
 app = Flask(__name__)
 app.secret_key = 'yuvicodex_super_secret_key_change_me_in_production'
@@ -682,7 +683,7 @@ def upload_website():
     
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
-# ---------- GitHub Deploy with SSE ----------
+# ---------- GitHub Deploy with SSE (Thread + Queue) ----------
 @app.route('/deploy_github/stream', methods=['POST'])
 def deploy_github_stream():
     if 'user_id' not in session:
@@ -719,14 +720,16 @@ def deploy_github_stream():
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     os.makedirs(folder, exist_ok=True)
     
-    def generate():
-        def log_callback(msg):
-            yield f"data: {json.dumps({'type': 'log', 'message': msg})}\n\n"
-        
+    log_queue = queue.Queue()
+    
+    def log_callback(msg):
+        log_queue.put(('log', msg))
+    
+    def do_work():
         # Clone
         success, msg, logs = clone_github_repo(repo_url, branch, folder, log_callback)
         if not success:
-            yield f"data: {json.dumps({'type': 'error', 'message': msg})}\n\n"
+            log_queue.put(('error', msg))
             shutil.rmtree(folder, ignore_errors=True)
             with get_db() as conn:
                 conn.execute('DELETE FROM websites WHERE id = ?', (website_id,))
@@ -736,14 +739,38 @@ def deploy_github_stream():
         
         # Build and start
         def start_callback(msg):
-            yield f"data: {json.dumps({'type': 'build', 'message': msg})}\n\n"
+            log_queue.put(('build', msg))
         
         update_website_status(website_id, 'starting')
         ok, start_msg, start_logs = start_website_process(website_id, start_callback)
         if ok:
-            yield f"data: {json.dumps({'type': 'done', 'website_id': website_id, 'slug': slug})}\n\n"
+            log_queue.put(('done', {'website_id': website_id, 'slug': slug}))
         else:
-            yield f"data: {json.dumps({'type': 'error', 'message': start_msg})}\n\n"
+            log_queue.put(('error', start_msg))
+    
+    thread = threading.Thread(target=do_work, daemon=True)
+    thread.start()
+    
+    def generate():
+        while True:
+            try:
+                item = log_queue.get(timeout=1)
+                typ, data = item
+                if typ == 'log':
+                    yield f"data: {json.dumps({'type': 'log', 'message': data})}\n\n"
+                elif typ == 'build':
+                    yield f"data: {json.dumps({'type': 'build', 'message': data})}\n\n"
+                elif typ == 'error':
+                    yield f"data: {json.dumps({'type': 'error', 'message': data})}\n\n"
+                elif typ == 'done':
+                    yield f"data: {json.dumps({'type': 'done', **data})}\n\n"
+                    break
+            except queue.Empty:
+                if not thread.is_alive():
+                    break
+                continue
+            except GeneratorExit:
+                break
     
     return Response(generate(), mimetype='text/event-stream')
 
@@ -1127,7 +1154,7 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 .github-box input:focus{border-color:#00e5ff}
 .github-btn{background:linear-gradient(135deg,#f0f0f0,#ccc);border:none;padding:10px 30px;border-radius:50px;color:#000;font-weight:700;cursor:pointer;transition:.3s;margin-top:10px}
 .github-btn:hover{transform:scale(1.05);box-shadow:0 0 30px rgba(255,255,255,0.1)}
-.github-logs{background:#05070d;padding:10px;border-radius:10px;max-height:250px;overflow-y:auto;font-family:monospace;font-size:12px;color:#aab;display:none;white-space:pre-wrap;margin-top:10px}
+.github-logs{background:#05070d;padding:10px;border-radius:10px;max-height:300px;overflow-y:auto;font-family:monospace;font-size:12px;color:#aab;display:none;white-space:pre-wrap;margin-top:10px;border:1px solid rgba(255,255,255,0.05)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:25px;margin-top:20px}
 .card{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.07);border-radius:20px;padding:25px;transition:.3s}
 .card:hover{transform:translateY(-5px);border-color:rgba(0,229,255,0.2);box-shadow:0 20px 60px rgba(0,0,0,0.3)}
