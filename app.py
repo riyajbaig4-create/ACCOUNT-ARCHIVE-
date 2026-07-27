@@ -377,7 +377,6 @@ def install_dependencies(folder, framework, log_callback=None):
                 return False, logs
             log("✅ Python dependencies installed")
         else:
-            # Auto-install common packages
             packages = []
             for pkg in AUTO_INSTALL_PACKAGES:
                 for root, dirs, files in os.walk(folder):
@@ -422,14 +421,12 @@ def inject_compatibility_routes(filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # Remove existing /api/login and /api/signup
         import re
         pattern = r'@app\.route\(\'/api/login\'[^\n]*\n.*?def api_login\(\):.*?(?=\n@app\.route|\Z)'
         content = re.sub(pattern, '', content, flags=re.DOTALL)
         pattern = r'@app\.route\(\'/api/signup\'[^\n]*\n.*?def api_signup\(\):.*?(?=\n@app\.route|\Z)'
         content = re.sub(pattern, '', content, flags=re.DOTALL)
         
-        # Ensure import of jsonify
         if 'from flask import jsonify' not in content:
             lines = content.split('\n')
             new_lines = []
@@ -441,7 +438,6 @@ def inject_compatibility_routes(filepath):
             if 'from flask import' not in content:
                 content = 'from flask import jsonify, request, render_template_string, redirect, url_for, session, jsonify, abort, Response, stream_with_context\n' + content
         
-        # Add routes (GET+POST)
         api_routes = '''
 @app.route('/api/login', methods=['GET', 'POST'])
 def api_login():
@@ -463,28 +459,18 @@ def api_signup():
     return jsonify({'success': True, 'message': 'Account created (dummy)'})
 '''
         
-        # Ensure app.run uses PORT env
-        # Find if there is an if __name__ block
         if 'if __name__' in content:
-            # Check if app.run is inside it
             match = re.search(r'if __name__\s*==\s*[\'"]__main__[\'"]\s*:\s*(.*?)(?=\n\S|$)', content, re.DOTALL)
             if match:
                 block = match.group(0)
                 if 'app.run' in block:
-                    # Check if port is specified
                     if 'port=' not in block:
-                        # Replace app.run with port from env
                         new_block = re.sub(r'app\.run\(', 'app.run(host=\'0.0.0.0\', port=int(os.environ.get(\'PORT\', 5000))', block)
                         content = content.replace(block, new_block)
-                    else:
-                        # Already has port, we can keep
-                        pass
                 else:
-                    # No app.run in main block, add it
                     new_block = block + '\n    port = int(os.environ.get(\'PORT\', 5000))\n    app.run(host=\'0.0.0.0\', port=port)'
                     content = content.replace(block, new_block)
             else:
-                # No if __name__ block, add one at the end
                 content += '''
 if __name__ == '__main__':
     import os
@@ -492,15 +478,12 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=port)
 '''
         else:
-            # Add if __name__ at end
             content += '''
 if __name__ == '__main__':
     import os
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
 '''
-        
-        # Insert api routes before if __name__
         if 'if __name__' in content:
             content = content.replace('if __name__', api_routes + '\nif __name__')
         else:
@@ -581,7 +564,6 @@ def start_website_process(website_id, log_callback=None):
         if log_callback:
             log_callback(msg)
     
-    # Install dependencies
     success, install_logs = install_dependencies(folder, framework, log_callback)
     log_lines.extend(install_logs)
     if not success:
@@ -589,7 +571,6 @@ def start_website_process(website_id, log_callback=None):
         log_website(website_id, "Installation failed", 'error')
         return False, "Dependency installation failed", log_lines
     
-    # Inject compatibility routes and fix PORT
     if framework in ['flask', 'fastapi', 'bottle']:
         main_file = os.path.join(folder, startup_file)
         if os.path.exists(main_file):
@@ -598,7 +579,6 @@ def start_website_process(website_id, log_callback=None):
                 log("✅ Auto-injected /api/login, /api/signup, and PORT fix")
                 log_website(website_id, "Injected compatibility routes and PORT fix", 'info')
     
-    # Allocate port
     port = get_next_available_port()
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
     
@@ -635,7 +615,6 @@ def start_website_process(website_id, log_callback=None):
             log(f"✅ Server running on port {port} (PID {proc.pid})")
             return True, f"Running on port {port}", log_lines
         else:
-            # Still mark as running to allow debugging
             update_website_status(website_id, 'running', proc.pid, port)
             log(f"⚠️ Health check failed: {health_msg}. Check logs.")
             return True, f"Running (health check failed: {health_msg})", log_lines
@@ -720,7 +699,503 @@ monitor_thread = threading.Thread(target=monitor_websites, daemon=True)
 monitor_thread.start()
 
 # ============================================================
-# स्पेसिफिक रूट्स (पहले)
+# टेम्प्लेट्स (सभी को परिभाषित करें)
+# ============================================================
+
+ERROR_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Website Unavailable</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
+.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:50px;text-align:center;max-width:500px;box-shadow:0 0 80px rgba(0,229,255,0.05)}
+h1{font-size:2.5rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:15px}
+p{color:#aab;font-size:1.1rem;margin:15px 0}
+a{color:#00e5ff;text-decoration:none;padding:12px 30px;border:2px solid #00e5ff;border-radius:50px;display:inline-block;margin-top:20px;transition:.3s}
+a:hover{background:#00e5ff;color:#000;transform:scale(1.05)}
+</style>
+</head>
+<body>
+<div class="glass">
+<h1>⚠️ {{ message }}</h1>
+<p>Slug: <strong>{{ slug }}</strong></p>
+<a href="/dashboard">← Go to Dashboard</a>
+</div>
+</body>
+</html>
+"""
+
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Yuvicodex Host</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+@keyframes zoomIn{0%{opacity:0;transform:scale(0.9)}100%{opacity:1;transform:scale(1)}}
+@keyframes float{0%{transform:translateY(0px)}50%{transform:translateY(-10px)}100%{transform:translateY(0px)}}
+body{background:linear-gradient(135deg,#0a0e1a 0%,#1a1040 50%,#0a1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
+.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:40px;width:100%;max-width:400px;animation:zoomIn 0.6s ease;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
+.logo{text-align:center;font-size:2.5rem;font-weight:900;background:linear-gradient(135deg,#00e5ff,#7a00ff,#00e5ff);background-size:300% 300%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:float 3s ease-in-out infinite;margin-bottom:10px}
+.sub{text-align:center;color:#889;font-size:0.9rem;margin-bottom:30px}
+input{width:100%;padding:14px 18px;margin:10px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;font-size:1rem;outline:none;transition:.3s}
+input:focus{border-color:#00e5ff;box-shadow:0 0 30px rgba(0,229,255,0.1)}
+.btn{width:100%;padding:14px;background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;border-radius:15px;color:#fff;font-size:1.1rem;font-weight:700;cursor:pointer;transition:.3s;margin-top:15px}
+.btn:hover{transform:scale(1.02);box-shadow:0 0 40px rgba(0,229,255,0.2)}
+.error{color:#ff4757;text-align:center;margin-top:10px;font-size:0.9rem}
+.link{text-align:center;margin-top:20px;color:#889}
+.link a{color:#00e5ff;text-decoration:none;font-weight:600}
+</style>
+</head>
+<body>
+<div class="glass">
+<div class="logo">🚀 Yuvicodex</div>
+<div class="sub">Premium Cloud Hosting</div>
+<form method="POST" action="/login">
+<input type="text" name="username" placeholder="Username" required>
+<input type="password" name="password" placeholder="Password" required>
+<button class="btn" type="submit">Access Dashboard</button>
+</form>
+<div class="error">{{ error if error else '' }}</div>
+<div class="link">New here? <a href="/register">Create Account</a></div>
+</div>
+</body>
+</html>
+"""
+
+REGISTER_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Register - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+@keyframes zoomIn{0%{opacity:0;transform:scale(0.9)}100%{opacity:1;transform:scale(1)}}
+body{background:linear-gradient(135deg,#0a0e1a 0%,#1a1040 50%,#0a1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
+.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:40px;width:100%;max-width:400px;animation:zoomIn 0.6s ease;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
+.logo{text-align:center;font-size:2rem;font-weight:900;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:5px}
+.sub{text-align:center;color:#889;font-size:0.9rem;margin-bottom:30px}
+input{width:100%;padding:14px 18px;margin:10px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;font-size:1rem;outline:none;transition:.3s}
+input:focus{border-color:#00e5ff;box-shadow:0 0 30px rgba(0,229,255,0.1)}
+.btn{width:100%;padding:14px;background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;border-radius:15px;color:#fff;font-size:1.1rem;font-weight:700;cursor:pointer;transition:.3s;margin-top:15px}
+.btn:hover{transform:scale(1.02);box-shadow:0 0 40px rgba(0,229,255,0.2)}
+.error{color:#ff4757;text-align:center;margin-top:10px;font-size:0.9rem}
+.link{text-align:center;margin-top:20px;color:#889}
+.link a{color:#00e5ff;text-decoration:none;font-weight:600}
+</style>
+</head>
+<body>
+<div class="glass">
+<div class="logo">✨ Create Account</div>
+<div class="sub">Start hosting in minutes</div>
+<form method="POST" action="/register">
+<input type="text" name="username" placeholder="Username" required>
+<input type="email" name="email" placeholder="Email" required>
+<input type="password" name="password" placeholder="Password" required>
+<button class="btn" type="submit">Register</button>
+</form>
+<div class="error">{{ error if error else '' }}</div>
+<div class="link">Already have account? <a href="/">Login</a></div>
+</div>
+</body>
+</html>
+"""
+
+DASHBOARD_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Dashboard - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+@keyframes zoomIn{0%{opacity:0;transform:scale(0.95)}100%{opacity:1;transform:scale(1)}}
+@keyframes glow{0%{box-shadow:0 0 20px rgba(0,229,255,0.1)}50%{box-shadow:0 0 40px rgba(0,229,255,0.2)}100%{box-shadow:0 0 20px rgba(0,229,255,0.1)}}
+body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;padding:20px;min-height:100vh}
+.container{max-width:1300px;margin:auto;animation:zoomIn 0.5s ease}
+.header{display:flex;justify-content:space-between;align-items:center;padding:15px 25px;background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border-radius:20px;border:1px solid rgba(255,255,255,0.08);margin-bottom:30px}
+.header h1{font-size:1.8rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.user-badge{display:flex;align-items:center;gap:15px}
+.badge{background:rgba(0,229,255,0.15);padding:4px 14px;border-radius:50px;font-size:0.8rem;border:1px solid rgba(0,229,255,0.2)}
+.btn-logout{color:#ff4757;text-decoration:none;font-weight:600;padding:8px 20px;border:1px solid #ff4757;border-radius:50px;transition:.3s}
+.btn-logout:hover{background:#ff4757;color:#fff}
+.upload-box{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:2px dashed rgba(255,255,255,0.1);border-radius:25px;padding:40px;text-align:center;margin-bottom:30px;transition:.3s}
+.upload-box:hover{border-color:#00e5ff;animation:glow 2s ease-in-out infinite}
+.upload-box h3{font-size:1.3rem;margin-bottom:15px;color:#ddd}
+.upload-box input[type="file"]{margin:15px auto;display:block;color:#aaa;width:100%;padding:8px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.1);border-radius:8px;cursor:pointer}
+.upload-btn{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 40px;border-radius:50px;color:#fff;font-size:1rem;font-weight:700;cursor:pointer;transition:.3s}
+.upload-btn:hover{transform:scale(1.05);box-shadow:0 0 40px rgba(0,229,255,0.2)}
+#uploadStatus{margin-top:15px;font-weight:500}
+.github-box{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:25px;margin-bottom:30px}
+.github-box h3{color:#ddd;margin-bottom:15px}
+.github-box input{width:100%;padding:10px 15px;margin:8px 0;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;color:#fff;font-size:0.9rem;outline:none}
+.github-box input:focus{border-color:#00e5ff}
+.github-btn{background:linear-gradient(135deg,#f0f0f0,#ccc);border:none;padding:10px 30px;border-radius:50px;color:#000;font-weight:700;cursor:pointer;transition:.3s;margin-top:10px}
+.github-btn:hover{transform:scale(1.05);box-shadow:0 0 30px rgba(255,255,255,0.1)}
+.github-logs{background:#05070d;padding:10px;border-radius:10px;max-height:300px;overflow-y:auto;font-family:monospace;font-size:12px;color:#aab;display:none;white-space:pre-wrap;margin-top:10px;border:1px solid rgba(255,255,255,0.05)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:25px;margin-top:20px}
+.card{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.07);border-radius:20px;padding:25px;transition:.3s}
+.card:hover{transform:translateY(-5px);border-color:rgba(0,229,255,0.2);box-shadow:0 20px 60px rgba(0,0,0,0.3)}
+.card-title{font-size:1.2rem;font-weight:700;color:#fff}
+.card-slug{color:#889;font-size:0.9rem;margin:5px 0}
+.card-port{color:#889;font-size:0.8rem}
+.status-badge{display:inline-block;padding:4px 14px;border-radius:50px;font-size:0.75rem;font-weight:600;margin:10px 0}
+.status-running{background:rgba(0,229,255,0.15);color:#00e5ff;border:1px solid rgba(0,229,255,0.2)}
+.status-stopped{background:rgba(255,71,87,0.15);color:#ff4757;border:1px solid rgba(255,71,87,0.2)}
+.status-uploaded{background:rgba(255,170,0,0.15);color:#ffaa00;border:1px solid rgba(255,170,0,0.2)}
+.status-cloning{background:rgba(255,170,0,0.15);color:#ffaa00;border:1px solid rgba(255,170,0,0.2)}
+.card-meta{color:#666;font-size:0.8rem;margin:8px 0}
+.visit-link{display:inline-block;padding:8px 20px;border-radius:50px;background:#00e5ff;color:#000;text-decoration:none;font-weight:700;font-size:0.9rem;transition:.3s;margin:10px 0}
+.visit-link:hover{transform:scale(1.05);box-shadow:0 0 30px rgba(0,229,255,0.3)}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:15px}
+.actions button{padding:6px 14px;border:none;border-radius:12px;font-size:0.8rem;font-weight:600;cursor:pointer;transition:.2s}
+.actions button:hover{transform:scale(1.05)}
+.btn-start{background:rgba(0,229,255,0.2);color:#00e5ff}
+.btn-start:hover{background:#00e5ff;color:#000}
+.btn-stop{background:rgba(255,71,87,0.2);color:#ff4757}
+.btn-stop:hover{background:#ff4757;color:#fff}
+.btn-restart{background:rgba(255,170,0,0.2);color:#ffaa00}
+.btn-restart:hover{background:#ffaa00;color:#000}
+.btn-manage{background:rgba(255,255,255,0.08);color:#aaa}
+.btn-manage:hover{background:rgba(255,255,255,0.15);color:#fff}
+.btn-delete{background:rgba(255,0,0,0.15);color:#ff4444}
+.btn-delete:hover{background:#ff0000;color:#fff}
+.url-edit{display:flex;gap:8px;margin-top:12px}
+.url-edit input{flex:1;padding:8px 12px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;color:#fff;outline:none;font-size:0.85rem}
+.url-edit input:focus{border-color:#00e5ff}
+.url-edit button{padding:8px 16px;background:#00e5ff;border:none;border-radius:12px;color:#000;font-weight:600;cursor:pointer;transition:.2s}
+.url-edit button:hover{transform:scale(1.05)}
+.plan-badge{background:linear-gradient(135deg,#7a00ff,#00e5ff);padding:2px 12px;border-radius:50px;font-size:0.7rem;font-weight:700}
+@media(max-width:600px){.header{flex-direction:column;gap:10px;text-align:center}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>🚀 Yuvicodex Host</h1>
+<div class="user-badge">
+<span class="badge">{{ user }}</span>
+<span class="plan-badge">{{ plan.upper() }}</span>
+<a href="/logout" class="btn-logout">Logout</a>
+</div>
+</div>
+
+<div class="upload-box">
+<h3>📤 Upload Website (ZIP or Multiple Files)</h3>
+<input type="file" id="zipFile" multiple>
+<button class="upload-btn" id="uploadBtn">Upload & Deploy</button>
+<div id="uploadStatus"></div>
+</div>
+
+<div class="github-box">
+<h3>🐙 Deploy from GitHub</h3>
+<input type="text" id="repoUrl" placeholder="https://github.com/username/repo.git">
+<input type="text" id="repoBranch" placeholder="branch (default: main)" value="main">
+<button class="github-btn" id="deployGitHubBtn">Deploy from GitHub</button>
+<div id="githubStatus" style="margin-top:10px;"></div>
+<div id="githubLogs" class="github-logs"></div>
+</div>
+
+<h2 style="margin-bottom:15px;">Your Websites</h2>
+<div class="grid">
+{% for w in websites %}
+<div class="card">
+<div class="card-title">{{ w.website_name or w.website_slug }}</div>
+<div class="card-slug">🔗 {{ base_url }}/<strong>{{ w.website_slug }}</strong>/</div>
+<div class="card-port">Port: {{ w.allocated_port or 'Not allocated' }}</div>
+<div class="status-badge status-{{ w.status }}">{{ w.status.upper() }}</div>
+<div class="card-meta">Created: {{ w.created_at[:10] }} | Size: {{ (w.website_size or 0)//1024 }} KB</div>
+{% if w.status == 'running' %}
+<a href="{{ w.url }}" target="_blank" class="visit-link">🌐 Visit Site</a>
+{% else %}
+<div style="color:#666;font-size:0.85rem;margin:10px 0;">⚪ Website not running</div>
+{% endif %}
+<div class="actions">
+<button class="btn-start" onclick="action({{ w.id }},'start')">▶ Start</button>
+<button class="btn-stop" onclick="action({{ w.id }},'stop')">■ Stop</button>
+<button class="btn-restart" onclick="action({{ w.id }},'restart')">⟳ Restart</button>
+<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/files'">📁 Files</button>
+<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/logs'">📜 Logs</button>
+<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/env'">🔑 Env</button>
+<button class="btn-delete" onclick="if(confirm('Delete this website?')) action({{ w.id }},'delete')">🗑 Delete</button>
+</div>
+<div class="url-edit">
+<input type="text" id="slug_input_{{ w.id }}" value="{{ w.website_slug }}" placeholder="new-slug">
+<button onclick="changeSlug({{ w.id }})">Change</button>
+</div>
+</div>
+{% endfor %}
+</div>
+</div>
+
+<script>
+function action(id,type){
+fetch('/website/'+id+'/'+type,{method:'POST'})
+.then(r=>r.json())
+.then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
+.catch(()=>alert('Network error'));
+}
+
+function changeSlug(id){
+const val=document.getElementById('slug_input_'+id).value.trim();
+if(!val)return alert('Enter slug');
+fetch('/website/'+id+'/change_url',{
+method:'POST',
+headers:{'Content-Type':'application/x-www-form-urlencoded'},
+body:'slug='+encodeURIComponent(val)
+})
+.then(r=>r.json())
+.then(d=>{
+if(d.success){
+location.reload();
+}else{
+if(d.suggestions && d.suggestions.length){
+alert(d.error+'\\n\\nSuggestions:\\n'+d.suggestions.join('\\n'));
+}else{
+alert('Error: '+d.error);
+}
+}
+})
+.catch(()=>alert('Network error'));
+}
+
+document.getElementById('uploadBtn').onclick=function(){
+const input=document.getElementById('zipFile');
+const files=input.files;
+if(!files || files.length===0)return alert('Select at least one file');
+const fd=new FormData();
+for(let i=0;i<files.length;i++){
+fd.append('files[]', files[i]);
+}
+const st=document.getElementById('uploadStatus');
+st.innerHTML='⏳ Uploading...';
+fetch('/upload',{method:'POST',body:fd})
+.then(r=>r.json())
+.then(d=>{if(d.success){st.innerHTML='✅ Uploaded!';location.reload()}else st.innerHTML='❌ '+d.error})
+.catch(()=>st.innerHTML='❌ Network error');
+};
+
+document.getElementById('deployGitHubBtn').onclick=function(){
+const repo=document.getElementById('repoUrl').value.trim();
+const branch=document.getElementById('repoBranch').value.trim() || 'main';
+if(!repo)return alert('Enter GitHub repo URL');
+const st=document.getElementById('githubStatus');
+const logBox=document.getElementById('githubLogs');
+logBox.style.display='block';
+logBox.innerHTML='';
+st.innerHTML='⏳ Deploying...';
+
+fetch('/deploy_github/stream', {
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({repo_url:repo, branch:branch})
+}).then(response => {
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+function read() {
+reader.read().then(({done, value}) => {
+if (done) return;
+const chunk = decoder.decode(value);
+const lines = chunk.split('\\n');
+for (let line of lines) {
+if (line.startsWith('data: ')) {
+try {
+const data = JSON.parse(line.slice(6));
+if (data.type === 'log' || data.type === 'build') {
+logBox.innerHTML += data.message + '\\n';
+logBox.scrollTop = logBox.scrollHeight;
+} else if (data.type === 'done') {
+st.innerHTML = '✅ Deployed! Website ID: ' + data.website_id;
+setTimeout(() => location.reload(), 2000);
+} else if (data.type === 'error') {
+st.innerHTML = '❌ ' + data.message;
+}
+} catch(e) {}
+}
+}
+read();
+});
+}
+read();
+}).catch(() => {
+st.innerHTML = '❌ Network error';
+});
+};
+</script>
+</body>
+</html>
+"""
+
+FILES_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Files - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:1000px;margin:auto}
+.back{color:#00e5ff;text-decoration:none;font-weight:600}
+h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+ul{list-style:none;padding:0}
+li{display:flex;justify-content:space-between;padding:12px 15px;border-bottom:1px solid rgba(255,255,255,0.05);border-radius:10px;transition:.2s}
+li:hover{background:rgba(255,255,255,0.03)}
+a{color:#00e5ff;text-decoration:none}
+.edit-link{color:#ffaa00;font-size:0.8rem}
+</style>
+</head>
+<body>
+<div class="container">
+<a href="/dashboard" class="back">← Dashboard</a>
+<h2>📁 {{ website.website_name or website.website_slug }}</h2>
+<ul>
+{% for item in items %}
+<li>
+<span>{% if item.is_dir %}📁 {% else %}📄 {% endif %}<a href="?path={{ item.path }}">{{ item.name }}</a></span>
+<span>{% if not item.is_dir %}<a href="/website/{{ website.id }}/edit?path={{ item.path }}" class="edit-link">✏️ Edit</a>{% endif %}</span>
+</li>
+{% endfor %}
+</ul>
+</div>
+</body>
+</html>
+"""
+
+EDIT_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Edit - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:900px;margin:auto}
+.back{color:#00e5ff;text-decoration:none;font-weight:600}
+h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+textarea{width:100%;height:400px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;padding:15px;font-family:'Courier New',monospace;font-size:14px;outline:none}
+textarea:focus{border-color:#00e5ff}
+.btns{display:flex;gap:12px;margin-top:15px}
+.save{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 30px;border-radius:50px;color:#fff;font-weight:700;cursor:pointer;transition:.3s}
+.save:hover{transform:scale(1.05)}
+.cancel{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);padding:12px 30px;border-radius:50px;color:#aaa;text-decoration:none;transition:.3s}
+.cancel:hover{background:rgba(255,255,255,0.15);color:#fff}
+</style>
+</head>
+<body>
+<div class="container">
+<a href="/website/{{ website.id }}/files" class="back">← Back</a>
+<h2>✏️ {{ file_path }}</h2>
+<form method="POST">
+<textarea name="content">{{ content }}</textarea>
+<div class="btns">
+<button class="save" type="submit">💾 Save</button>
+<a href="/website/{{ website.id }}/files" class="cancel">Cancel</a>
+</div>
+</form>
+</div>
+</body>
+</html>
+"""
+
+LOGS_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Logs - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:1000px;margin:auto}
+.back{color:#00e5ff;text-decoration:none;font-weight:600}
+h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+h3{color:#889;margin:20px 0 10px;font-weight:400}
+pre{background:rgba(0,0,0,0.4);padding:15px;border-radius:15px;max-height:300px;overflow-y:auto;border:1px solid rgba(255,255,255,0.05);font-family:'Courier New',monospace;font-size:12px;white-space:pre-wrap;color:#aab}
+.log-entry{padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.03)}
+.timestamp{color:#666;margin-right:10px}
+</style>
+</head>
+<body>
+<div class="container">
+<a href="/dashboard" class="back">← Dashboard</a>
+<h2>📜 Logs for {{ website.website_name or website.website_slug }}</h2>
+
+<h3>📋 Database Logs</h3>
+<pre>
+{% for log in logs %}
+<span class="timestamp">{{ log.timestamp }}</span>[{{ log.log_type.upper() }}] {{ log.log_text }}
+{% else %}
+No logs yet.
+{% endfor %}
+</pre>
+
+<h3>🖥️ Process Output</h3>
+<pre>{{ file_log if file_log else 'No output file.' }}</pre>
+
+<h3>📦 Installation Log</h3>
+<pre>{{ install_log if install_log else 'No installation log.' }}</pre>
+
+<h3>📋 Build Log (GitHub Deploy)</h3>
+<pre>{{ build_log if build_log else 'No build log available.' }}</pre>
+</div>
+</body>
+</html>
+"""
+
+ENV_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Environment Variables</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:800px;margin:auto}
+.back{color:#00e5ff;text-decoration:none;font-weight:600}
+h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+textarea{width:100%;height:200px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;padding:15px;font-family:monospace;outline:none;font-size:14px}
+textarea:focus{border-color:#00e5ff}
+.btns{display:flex;gap:12px;margin-top:15px;flex-wrap:wrap}
+.save{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 30px;border-radius:50px;color:#fff;font-weight:700;cursor:pointer}
+.save:hover{transform:scale(1.05)}
+.cancel{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);padding:12px 30px;border-radius:50px;color:#aaa;text-decoration:none}
+.note{color:#888;font-size:0.8rem;margin-top:10px;border-top:1px solid rgba(255,255,255,0.05);padding-top:10px}
+</style>
+</head>
+<body>
+<div class="container">
+<a href="/dashboard" class="back">← Dashboard</a>
+<h2>🔑 Environment Variables – {{ website.website_name or website.website_slug }}</h2>
+<p style="color:#889;margin-bottom:10px;">Enter each variable on a new line: <code>KEY=VALUE</code></p>
+<form id="envForm">
+<textarea id="envText" name="env" rows="8">{{ env_text }}</textarea>
+<div class="btns">
+<button type="submit" class="save">💾 Save &amp; Restart (if running)</button>
+<a href="/dashboard" class="cancel">Cancel</a>
+</div>
+</form>
+<div id="msg" style="margin-top:10px;"></div>
+<div class="note">💡 Changes will take effect immediately by restarting the website.</div>
+</div>
+<script>
+document.getElementById('envForm').onsubmit = function(e){
+e.preventDefault();
+const val = document.getElementById('envText').value.trim();
+fetch(window.location.href, {
+method:'POST',
+headers:{'Content-Type':'application/x-www-form-urlencoded'},
+body:'env='+encodeURIComponent(val)
+})
+.then(r=>r.json())
+.then(d=>{
+if(d.success){
+document.getElementById('msg').innerHTML='✅ Saved and restarted!';
+setTimeout(()=>location.reload(), 1500);
+} else {
+document.getElementById('msg').innerHTML='❌ '+d.error;
+}
+})
+.catch(()=>document.getElementById('msg').innerHTML='❌ Network error');
+};
+</script>
+</body>
+</html>
+"""
+
+# ============================================================
+# स्पेसिफिक रूट्स (अब टेम्प्लेट्स परिभाषित होने के बाद)
 # ============================================================
 
 @app.route('/')
@@ -940,7 +1415,6 @@ def upload_website():
     log_website(website_id, f"Uploaded {len(files)} file(s), framework: {framework}")
     log_activity(user_id, 'upload', f'Uploaded {len(files)} files', request.remote_addr)
 
-    # Auto-start
     update_website_status(website_id, 'starting')
     ok, msg, logs = start_website_process(website_id)
     if ok:
@@ -1335,9 +1809,6 @@ def proxy_website(slug, path):
     except Exception as e:
         log_website(website['id'], f"Proxy error: {str(e)}", 'error')
         return f"Proxy error: {str(e)}", 500
-
-# ---------- TEMPLATES (same as before) ----------
-# ... (templates remain unchanged - but for brevity I'm skipping them here, but they are the same as the previous code)
 
 # ---------- सर्वर स्टार्ट ----------
 if __name__ == '__main__':
