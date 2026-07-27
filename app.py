@@ -9,9 +9,11 @@ import time
 import re
 import requests
 import threading
+import tempfile
 from datetime import datetime
 from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.secret_key = 'yuvicodex_super_secret_key_change_me_in_production'
@@ -71,6 +73,8 @@ def init_db():
             ssl_enabled INTEGER DEFAULT 0,
             restart_count INTEGER DEFAULT 0,
             crash_count INTEGER DEFAULT 0,
+            is_github INTEGER DEFAULT 0,
+            github_repo TEXT,
             FOREIGN KEY (owner_id) REFERENCES users (id)
         )''')
         
@@ -364,25 +368,38 @@ def monitor_websites():
                 for site in running_sites:
                     pid = site['pid']
                     try:
-                        # UNIX: signal 0 से PID की मौजूदगी चेक करें
                         if os.name == 'posix':
                             os.kill(pid, 0)
                         else:
-                            # Windows: tasklist का उपयोग करें
                             result = subprocess.run(['tasklist', '/FI', f'PID eq {pid}'], capture_output=True, text=True)
                             if str(pid) not in result.stdout:
                                 raise ProcessLookupError()
                     except (ProcessLookupError, OSError):
-                        # प्रोसेस मर चुकी है
                         update_website_status(site['id'], 'crashed', None, None)
                         log_website(site['id'], f"Monitor detected crash (PID {pid})", 'error')
                         with get_db() as conn:
                             conn.execute('UPDATE websites SET crash_count = crash_count + 1 WHERE id = ?', (site['id'],))
                             conn.commit()
             except Exception as e:
-                # मॉनिटर में कोई त्रुटि हो तो उसे लॉग करें
                 print(f"Monitor error: {e}")
             time.sleep(10)
+
+# ---------- GitHub Deploy Helper ----------
+def clone_github_repo(repo_url, target_folder):
+    """GitHub repo को clone करें और लॉग फ़ाइल return करें"""
+    log_path = os.path.join(LOG_FOLDER, f"github_deploy_{int(time.time())}.log")
+    try:
+        cmd = ['git', 'clone', repo_url, target_folder]
+        with open(log_path, 'w') as f:
+            proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
+            proc.wait()
+        if proc.returncode != 0:
+            with open(log_path, 'r') as f:
+                error = f.read()
+            return False, f"Clone failed: {error}", log_path
+        return True, "Clone successful", log_path
+    except Exception as e:
+        return False, f"Clone error: {str(e)}", log_path
 
 # ---------- प्रॉक्सी रूट ----------
 @app.route('/<slug>/', defaults={'path': ''})
@@ -519,6 +536,7 @@ def dashboard():
                                   base_url=base_url,
                                   user_obj=user)
 
+# ---------- अपलोड (ZIP) ----------
 @app.route('/upload', methods=['POST'])
 def upload_website():
     if 'user_id' not in session:
@@ -588,6 +606,10 @@ def upload_website():
     os.remove(zip_path)
     size_used = calculate_folder_size(folder)
     
+    # startup file detect and set as website_name
+    startup = find_startup_file(folder)
+    website_name = startup if startup else (file.filename[:-4] if '.' in file.filename else file.filename)
+    
     with get_db() as conn:
         conn.execute('''UPDATE websites SET 
                         website_name = ?, 
@@ -597,7 +619,7 @@ def upload_website():
                         status = 'uploaded',
                         updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?''',
-                     (file.filename[:-4] if '.' in file.filename else file.filename,
+                     (website_name,
                       f"website_{website_id}", size_used, size_used, website_id))
         conn.commit()
     
@@ -606,6 +628,203 @@ def upload_website():
     
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
+# ---------- Multiple Files Upload (नया) ----------
+@app.route('/upload-files', methods=['POST'])
+def upload_multiple_files():
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Not logged in'}), 401
+    
+    user_id = session['user_id']
+    user = get_user_by_id(user_id)
+    if user['status'] != 'active':
+        return jsonify({'success': False, 'error': 'Account disabled'}), 403
+    
+    if 'files' not in request.files:
+        return jsonify({'success': False, 'error': 'No files uploaded'}), 400
+    
+    files = request.files.getlist('files')
+    if not files or all(f.filename == '' for f in files):
+        return jsonify({'success': False, 'error': 'Empty file list'}), 400
+    
+    # Check total size
+    total_size = 0
+    for f in files:
+        f.seek(0, os.SEEK_END)
+        total_size += f.tell()
+        f.seek(0)
+    if total_size > MAX_UPLOAD_SIZE:
+        return jsonify({'success': False, 'error': f'Total size too large (max {MAX_UPLOAD_SIZE//1024//1024} MB)'}), 400
+    
+    # Create new website record
+    with get_db() as conn:
+        count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
+    
+    slug = generate_website_slug(session['username'], count)
+    with get_db() as conn:
+        if conn.execute('SELECT id FROM websites WHERE website_slug = ?', (slug,)).fetchone():
+            count += 1
+            slug = generate_website_slug(session['username'], count)
+    
+    with get_db() as conn:
+        cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status)
+                              VALUES (?, ?, ?, ?)''',
+                           (user_id, slug, f"website_{0}", 'uploaded'))
+        website_id = cur.lastrowid
+        conn.commit()
+    
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception as e:
+        rollback_upload(website_id, folder)
+        return jsonify({'success': False, 'error': f'Folder creation failed: {str(e)}'}), 500
+    
+    # Save all files
+    saved_names = []
+    for f in files:
+        if f.filename == '':
+            continue
+        filename = secure_filename(f.filename)
+        f.save(os.path.join(folder, filename))
+        saved_names.append(filename)
+    
+    size_used = calculate_folder_size(folder)
+    startup = find_startup_file(folder)
+    website_name = startup if startup else (saved_names[0] if saved_names else 'website')
+    
+    with get_db() as conn:
+        conn.execute('''UPDATE websites SET 
+                        website_name = ?,
+                        website_folder = ?,
+                        storage_used = ?,
+                        website_size = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?''',
+                     (website_name, f"website_{website_id}", size_used, size_used, website_id))
+        conn.commit()
+    
+    log_website(website_id, f"Uploaded {len(saved_names)} files")
+    log_activity(user_id, 'upload_files', f'Uploaded {len(saved_names)} files', request.remote_addr)
+    
+    return jsonify({'success': True, 'website_id': website_id, 'slug': slug, 'files': saved_names})
+
+# ---------- GitHub Deploy (नया) ----------
+@app.route('/deploy-github', methods=['POST'])
+def deploy_github():
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Not logged in'}), 401
+    
+    user_id = session['user_id']
+    user = get_user_by_id(user_id)
+    if user['status'] != 'active':
+        return jsonify({'success': False, 'error': 'Account disabled'}), 403
+    
+    repo_url = request.form.get('repo_url', '').strip()
+    if not repo_url:
+        return jsonify({'success': False, 'error': 'Repository URL required'}), 400
+    
+    # Validate URL (basic)
+    if not repo_url.startswith(('https://github.com/', 'http://github.com/')):
+        return jsonify({'success': False, 'error': 'Invalid GitHub URL'}), 400
+    
+    # Create website record
+    with get_db() as conn:
+        count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
+    
+    slug = generate_website_slug(session['username'], count)
+    with get_db() as conn:
+        if conn.execute('SELECT id FROM websites WHERE website_slug = ?', (slug,)).fetchone():
+            count += 1
+            slug = generate_website_slug(session['username'], count)
+    
+    with get_db() as conn:
+        cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, is_github, github_repo)
+                              VALUES (?, ?, ?, ?, ?, ?)''',
+                           (user_id, slug, f"website_{0}", 'cloning', 1, repo_url))
+        website_id = cur.lastrowid
+        conn.commit()
+    
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception as e:
+        rollback_upload(website_id, folder)
+        return jsonify({'success': False, 'error': f'Folder creation failed: {str(e)}'}), 500
+    
+    # Clone repository
+    success, msg, log_path = clone_github_repo(repo_url, folder)
+    if not success:
+        rollback_upload(website_id, folder)
+        return jsonify({'success': False, 'error': msg}), 400
+    
+    # Update website record
+    size_used = calculate_folder_size(folder)
+    startup = find_startup_file(folder)
+    website_name = startup if startup else 'github-repo'
+    
+    with get_db() as conn:
+        conn.execute('''UPDATE websites SET 
+                        website_name = ?,
+                        website_folder = ?,
+                        storage_used = ?,
+                        website_size = ?,
+                        status = 'uploaded',
+                        updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?''',
+                     (website_name, f"website_{website_id}", size_used, size_used, website_id))
+        conn.commit()
+    
+    # Start the website automatically
+    update_website_status(website_id, 'starting')
+    ok, start_msg = start_website_process(website_id)
+    
+    if ok:
+        log_website(website_id, f"GitHub deploy successful: {repo_url}")
+        log_activity(user_id, 'github_deploy', f'Deployed {repo_url}', request.remote_addr)
+        return jsonify({'success': True, 'website_id': website_id, 'slug': slug, 'message': start_msg})
+    else:
+        # Even if start fails, website is created, but status failed
+        log_website(website_id, f"GitHub deploy start failed: {start_msg}", 'error')
+        return jsonify({'success': False, 'error': start_msg, 'website_id': website_id}), 500
+
+# ---------- GitHub Build Logs (SSE) ----------
+@app.route('/github-logs/<int:website_id>')
+def github_logs(website_id):
+    """Server-Sent Events for real-time build logs"""
+    if 'user_id' not in session:
+        return "Unauthorized", 401
+    
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            return "Forbidden", 403
+    
+    # Find the log file (install log or general log)
+    log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
+    if not os.path.exists(log_file):
+        log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
+    
+    def generate():
+        if not os.path.exists(log_file):
+            yield f"data: No log file found\n\n"
+            return
+        
+        # Tail the file
+        with open(log_file, 'r') as f:
+            # Read existing content
+            content = f.read()
+            yield f"data: {content}\n\n"
+            # Watch for new content
+            while True:
+                line = f.readline()
+                if line:
+                    yield f"data: {line}\n\n"
+                else:
+                    time.sleep(1)
+    
+    return Response(generate(), mimetype="text/event-stream")
+
+# ---------- Website Management Routes ----------
 @app.route('/website/<int:website_id>/start', methods=['POST'])
 def start_website(website_id):
     if 'user_id' not in session:
@@ -809,7 +1028,7 @@ def change_subdomain(website_id):
 
 # ---------- (custom_domain रूट हटा दिया) ----------
 
-# ---------- प्रीमियम UI टेम्प्लेट्स ----------
+# ---------- प्रीमियम UI टेम्प्लेट्स (संशोधित डैशबोर्ड) ----------
 ERROR_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -932,6 +1151,12 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 .upload-btn{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 40px;border-radius:50px;color:#fff;font-size:1rem;font-weight:700;cursor:pointer;transition:.3s}
 .upload-btn:hover{transform:scale(1.05);box-shadow:0 0 40px rgba(0,229,255,0.2)}
 #uploadStatus{margin-top:15px;font-weight:500}
+.github-box{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.08);border-radius:25px;padding:30px;margin-bottom:30px;text-align:center}
+.github-box input{width:70%;padding:12px 18px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;font-size:1rem;outline:none}
+.github-box input:focus{border-color:#7a00ff}
+.github-btn{background:linear-gradient(135deg,#24292e,#3f4448);border:none;padding:12px 30px;border-radius:15px;color:#fff;font-weight:700;cursor:pointer;transition:.3s;margin-left:10px}
+.github-btn:hover{transform:scale(1.05)}
+.github-logs{margin-top:15px;background:rgba(0,0,0,0.3);border-radius:15px;padding:15px;max-height:300px;overflow-y:auto;text-align:left;font-family:monospace;font-size:13px;white-space:pre-wrap;display:none}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:25px;margin-top:20px}
 .card{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.07);border-radius:20px;padding:25px;transition:.3s}
 .card:hover{transform:translateY(-5px);border-color:rgba(0,229,255,0.2);box-shadow:0 20px 60px rgba(0,0,0,0.3)}
@@ -963,7 +1188,6 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 .url-edit input:focus{border-color:#00e5ff}
 .url-edit button{padding:8px 16px;background:#00e5ff;border:none;border-radius:12px;color:#000;font-weight:600;cursor:pointer;transition:.2s}
 .url-edit button:hover{transform:scale(1.05)}
-/* custom domain वाला भाग हटा दिया */
 .plan-badge{background:linear-gradient(135deg,#7a00ff,#00e5ff);padding:2px 12px;border-radius:50px;font-size:0.7rem;font-weight:700}
 @media(max-width:600px){.header{flex-direction:column;gap:10px;text-align:center}.grid{grid-template-columns:1fr}}
 </style>
@@ -979,11 +1203,22 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 </div>
 </div>
 
+<!-- Upload Box (ZIP + Multiple Files) -->
 <div class="upload-box">
-<h3>📤 Upload Website (ZIP)</h3>
-<input type="file" id="zipFile" accept=".zip">
+<h3>📤 Upload Website</h3>
+<p style="color:#889;margin-bottom:15px;">ZIP, single file or multiple files</p>
+<input type="file" id="fileInput" multiple accept=".zip,.*">
 <button class="upload-btn" id="uploadBtn">Upload & Deploy</button>
 <div id="uploadStatus"></div>
+</div>
+
+<!-- GitHub Deploy -->
+<div class="github-box">
+<h3>🐙 Deploy from GitHub</h3>
+<input type="text" id="repoUrl" placeholder="https://github.com/username/repo" style="width:60%;">
+<button class="github-btn" id="deployGitHubBtn">Deploy</button>
+<div id="githubLogs" class="github-logs"></div>
+<div id="githubStatus" style="margin-top:10px;"></div>
 </div>
 
 <h2 style="margin-bottom:15px;">Your Websites</h2>
@@ -1036,16 +1271,65 @@ body:'slug='+encodeURIComponent(val)
 .then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
 .catch(()=>alert('Network error'));
 }
+
+// Upload (ZIP or multiple files)
 document.getElementById('uploadBtn').onclick=function(){
-const file=document.getElementById('zipFile').files[0];
-if(!file)return alert('Select ZIP');
-const fd=new FormData();fd.append('file',file);
+const files = document.getElementById('fileInput').files;
+if(!files.length) return alert('Select at least one file');
 const st=document.getElementById('uploadStatus');
 st.innerHTML='⏳ Uploading...';
+
+// Check if only one file and it's a ZIP -> use /upload
+if(files.length === 1 && files[0].name.toLowerCase().endsWith('.zip')){
+const fd=new FormData(); fd.append('file', files[0]);
 fetch('/upload',{method:'POST',body:fd})
 .then(r=>r.json())
 .then(d=>{if(d.success){st.innerHTML='✅ Uploaded!';location.reload()}else st.innerHTML='❌ '+d.error})
 .catch(()=>st.innerHTML='❌ Network error');
+return;
+}
+
+// Multiple files -> use /upload-files
+const fd=new FormData();
+for(let f of files) fd.append('files', f);
+fetch('/upload-files',{method:'POST',body:fd})
+.then(r=>r.json())
+.then(d=>{if(d.success){st.innerHTML='✅ Uploaded '+d.files.length+' files!';location.reload()}else st.innerHTML='❌ '+d.error})
+.catch(()=>st.innerHTML='❌ Network error');
+};
+
+// GitHub Deploy
+document.getElementById('deployGitHubBtn').onclick=function(){
+const url=document.getElementById('repoUrl').value.trim();
+if(!url) return alert('Enter GitHub repo URL');
+const statusDiv=document.getElementById('githubStatus');
+const logsDiv=document.getElementById('githubLogs');
+logsDiv.style.display='block';
+logsDiv.innerHTML='⏳ Cloning and deploying...';
+statusDiv.innerHTML='';
+
+fetch('/deploy-github',{
+method:'POST',
+headers:{'Content-Type':'application/x-www-form-urlencoded'},
+body:'repo_url='+encodeURIComponent(url)
+})
+.then(r=>r.json())
+.then(d=>{
+if(d.success){
+statusDiv.innerHTML='✅ Deployed! Website ID: '+d.website_id;
+// Start SSE for logs
+const eventSource = new EventSource('/github-logs/'+d.website_id);
+eventSource.onmessage = function(e){
+logsDiv.innerHTML += e.data;
+logsDiv.scrollTop = logsDiv.scrollHeight;
+};
+setTimeout(()=> location.reload(), 3000);
+} else {
+statusDiv.innerHTML='❌ Error: '+d.error;
+logsDiv.innerHTML += '\\n\\n❌ '+d.error;
+}
+})
+.catch(err=>{statusDiv.innerHTML='❌ Network error'; logsDiv.innerHTML += '\\n\\n❌ Network error';});
 };
 </script>
 </body>
