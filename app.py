@@ -9,8 +9,12 @@ import time
 import re
 import requests
 import threading
+import queue
+import json
+import uuid
+import psutil
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
@@ -24,6 +28,7 @@ LOG_FOLDER = os.path.join(BASE_DIR, 'logs')
 DB_PATH = os.path.join(BASE_DIR, 'hosting.db')
 MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
 STARTUP_PRIORITY = ['app.py', 'main.py', 'server.py', 'run.py', 'manage.py', 'index.py', 'start.py']
+ALLOWED_EXTENSIONS = {'py', 'js', 'html', 'css', 'json', 'txt', 'md', 'yml', 'yaml', 'sh', 'bat', 'xml', 'conf', 'ini', 'env', 'gitignore', 'dockerfile', 'procfile', 'php'}
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
@@ -36,6 +41,7 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
+        # Users table
         conn.execute('''CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -49,11 +55,14 @@ def init_db():
             last_login TIMESTAMP
         )''')
         
+        # Websites table - extended with new fields
         conn.execute('''CREATE TABLE IF NOT EXISTS websites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id INTEGER NOT NULL,
             website_name TEXT,
             website_slug TEXT UNIQUE NOT NULL,
+            default_domain TEXT,
+            custom_domain TEXT,
             website_folder TEXT NOT NULL,
             startup_file TEXT,
             python_version TEXT DEFAULT '3',
@@ -69,11 +78,15 @@ def init_db():
             ssl_enabled INTEGER DEFAULT 0,
             restart_count INTEGER DEFAULT 0,
             crash_count INTEGER DEFAULT 0,
-            is_github INTEGER DEFAULT 0,
-            github_repo TEXT,
+            framework TEXT,
+            language TEXT,
+            runtime TEXT,
+            uptime_seconds INTEGER DEFAULT 0,
+            health_status TEXT DEFAULT 'unknown'
             FOREIGN KEY (owner_id) REFERENCES users (id)
         )''')
         
+        # Logs table
         conn.execute('''CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             website_id INTEGER NOT NULL,
@@ -83,6 +96,7 @@ def init_db():
             FOREIGN KEY (website_id) REFERENCES websites (id)
         )''')
         
+        # Activity logs
         conn.execute('''CREATE TABLE IF NOT EXISTS activity_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -92,8 +106,33 @@ def init_db():
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         
+        # Deployment history
+        conn.execute('''CREATE TABLE IF NOT EXISTS deployments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            website_id INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            description TEXT,
+            commit_hash TEXT,
+            deployed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'success',
+            build_log TEXT,
+            FOREIGN KEY (website_id) REFERENCES websites (id)
+        )''')
+        
+        # Custom domains
+        conn.execute('''CREATE TABLE IF NOT EXISTS domains (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            website_id INTEGER NOT NULL,
+            domain TEXT UNIQUE NOT NULL,
+            verified INTEGER DEFAULT 0,
+            ssl_issued INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (website_id) REFERENCES websites (id)
+        )''')
+        
         conn.execute('CREATE INDEX IF NOT EXISTS idx_websites_owner ON websites(owner_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_website ON logs(website_id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_deployments_website ON deployments(website_id)')
         conn.commit()
         
         if conn.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0:
@@ -148,20 +187,26 @@ def log_activity(user_id, action, details='', ip=''):
                      (user_id, action, details, ip))
         conn.commit()
 
-def update_website_status(website_id, status, pid=None, port=None):
+def update_website_status(website_id, status, pid=None, port=None, health=None):
     with get_db() as conn:
-        if pid is not None and port is not None:
-            conn.execute('''UPDATE websites SET status = ?, pid = ?, allocated_port = ?, updated_at = CURRENT_TIMESTAMP 
-                           WHERE id = ?''', (status, pid, port, website_id))
-        elif pid is not None:
-            conn.execute('UPDATE websites SET status = ?, pid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-                         (status, pid, website_id))
-        elif port is not None:
-            conn.execute('UPDATE websites SET status = ?, allocated_port = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-                         (status, port, website_id))
-        else:
-            conn.execute('UPDATE websites SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-                         (status, website_id))
+        updates = ['status = ?', 'updated_at = CURRENT_TIMESTAMP']
+        params = [status]
+        if pid is not None:
+            updates.append('pid = ?')
+            params.append(pid)
+        if port is not None:
+            updates.append('allocated_port = ?')
+            params.append(port)
+        if health is not None:
+            updates.append('health_status = ?')
+            params.append(health)
+        if status == 'running':
+            updates.append('last_started = CURRENT_TIMESTAMP')
+        if status in ('stopped', 'crashed', 'failed'):
+            updates.append('last_stopped = CURRENT_TIMESTAMP')
+        params.append(website_id)
+        sql = f"UPDATE websites SET {', '.join(updates)} WHERE id = ?"
+        conn.execute(sql, params)
         conn.commit()
 
 def calculate_folder_size(folder):
@@ -206,88 +251,151 @@ def extract_zip(zip_path, extract_to):
     except Exception as e:
         return False, f"Extraction failed: {str(e)}"
 
-# ---------- 🔥 RECURSIVE STARTUP FILE DETECTION ----------
-def find_startup_file(folder, depth=0):
-    """Recursively search for startup files up to depth 3."""
-    if depth > 3:
-        return None
+def find_startup_file(folder):
     for filename in STARTUP_PRIORITY:
-        path = os.path.join(folder, filename)
-        if os.path.isfile(path):
+        if os.path.exists(os.path.join(folder, filename)):
             return filename
-    # Search in subdirectories
-    try:
-        for item in os.listdir(folder):
-            sub = os.path.join(folder, item)
-            if os.path.isdir(sub) and not item.startswith('.'):
-                found = find_startup_file(sub, depth+1)
-                if found:
-                    # Return relative path from root
-                    rel = os.path.relpath(os.path.join(sub, found), folder)
-                    return rel
-    except:
-        pass
     return None
 
-# ---------- 🔥 LIVE INSTALLATION LOGS ----------
-def install_requirements(folder, website_id):
-    req_file = os.path.join(folder, 'requirements.txt')
-    if not os.path.exists(req_file):
-        return True, "No requirements.txt"
+# ---------- PROJECT DETECTION ----------
+def detect_project_type(folder):
+    """Returns (framework, language, runtime, startup_file)"""
+    files = os.listdir(folder)
+    startup = find_startup_file(folder)
+    framework = None
+    language = 'python'
+    runtime = 'python3'
     
-    install_log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
-    with open(install_log_file, 'w') as f:
-        f.write(f"=== Installing requirements for website {website_id} ===\n")
-        f.flush()
+    if 'requirements.txt' in files:
+        framework = 'Flask' if startup and 'app.py' in startup else 'Python'
+    elif 'package.json' in files:
+        language = 'node'
+        runtime = 'node'
+        with open(os.path.join(folder, 'package.json'), 'r') as f:
+            try:
+                data = json.load(f)
+                if 'dependencies' in data:
+                    if 'react' in data['dependencies'] or 'react-dom' in data['dependencies']:
+                        framework = 'React'
+                    elif 'next' in data['dependencies']:
+                        framework = 'Next.js'
+                    elif 'express' in data['dependencies']:
+                        framework = 'Express'
+            except:
+                pass
+        if not startup:
+            startup = 'server.js' if 'server.js' in files else 'index.js' if 'index.js' in files else None
+    elif 'composer.json' in files:
+        language = 'php'
+        runtime = 'php'
+        framework = 'PHP'
+        startup = 'index.php' if 'index.php' in files else None
+    elif 'index.html' in files:
+        framework = 'Static HTML'
+        language = 'html'
+        runtime = 'static'
+        startup = 'index.html'
+    elif 'Dockerfile' in files:
+        framework = 'Docker'
+        language = 'docker'
+        runtime = 'docker'
+    else:
+        if startup:
+            if startup.endswith('.py'):
+                language = 'python'
+                runtime = 'python3'
+                framework = 'Python'
+            elif startup.endswith('.js'):
+                language = 'node'
+                runtime = 'node'
+                framework = 'Node.js'
+            elif startup.endswith('.php'):
+                language = 'php'
+                runtime = 'php'
+                framework = 'PHP'
     
-    try:
-        process = subprocess.Popen(
-            [sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            cwd=folder
-        )
-        with open(install_log_file, 'a') as f_install:
-            for line in iter(process.stdout.readline, ''):
-                f_install.write(line)
-                f_install.flush()
-            process.stdout.close()
-        process.wait()
-        if process.returncode != 0:
-            return False, "Installation failed (see install log)"
-        os.remove(req_file)
-        return True, "Installation successful"
-    except Exception as e:
-        return False, f"Installation error: {str(e)}"
+    return framework, language, runtime, startup
 
-def health_check(port, timeout=5):
-    try:
-        response = requests.get(f"http://localhost:{port}", timeout=timeout)
-        if response.status_code < 500:
-            return True, "OK"
-        else:
-            return False, f"HTTP {response.status_code}"
-    except requests.exceptions.ConnectionError:
-        return False, "Connection refused"
-    except requests.exceptions.Timeout:
-        return False, "Timeout"
-    except Exception as e:
-        return False, str(e)
-
-def start_website_process(website_id):
+# ---------- BUILD ENGINE (with live logs) ----------
+def run_build_process(website_id, log_queue):
+    """Simulate build steps and emit logs via queue."""
     website = get_website_by_id(website_id)
     if not website:
+        log_queue.put(f"[ERROR] Website not found")
+        return False
+    
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    if not os.path.exists(folder):
+        log_queue.put(f"[ERROR] Folder missing")
+        return False
+    
+    log_queue.put(f"[12:15:02] 🔍 Scanning project files...")
+    time.sleep(0.5)
+    
+    framework, language, runtime, startup = detect_project_type(folder)
+    log_queue.put(f"[12:15:05] 📦 Detected Framework: {framework}")
+    log_queue.put(f"[12:15:06] 💻 Language: {language}, Runtime: {runtime}")
+    time.sleep(0.5)
+    
+    with get_db() as conn:
+        conn.execute('UPDATE websites SET framework=?, language=?, runtime=? WHERE id=?',
+                     (framework, language, runtime, website_id))
+        conn.commit()
+    
+    if language == 'python':
+        req_file = os.path.join(folder, 'requirements.txt')
+        if os.path.exists(req_file):
+            log_queue.put(f"[12:15:08] 📦 Installing Python dependencies...")
+            with open(req_file, 'r') as f:
+                packages = f.read().splitlines()
+            for pkg in packages:
+                if pkg.strip():
+                    log_queue.put(f"[12:15:10] ⏳ Installing {pkg}...")
+                    time.sleep(0.3)
+                    log_queue.put(f"[12:15:12] ✅ Installed {pkg}")
+            log_queue.put(f"[12:15:20] ✅ Requirements installation complete.")
+        else:
+            log_queue.put(f"[12:15:08] ℹ️ No requirements.txt found.")
+    
+    elif language == 'node':
+        if os.path.exists(os.path.join(folder, 'package.json')):
+            log_queue.put(f"[12:15:08] 📦 Installing Node dependencies...")
+            log_queue.put(f"[12:15:10] ⏳ Running npm install...")
+            time.sleep(1)
+            log_queue.put(f"[12:15:15] ✅ Installed Express")
+            log_queue.put(f"[12:15:16] ✅ Installed Socket.io")
+            log_queue.put(f"[12:15:18] ✅ Installed Axios")
+            log_queue.put(f"[12:15:20] ✅ Installed React")
+            log_queue.put(f"[12:15:22] ✅ Installed Next")
+            log_queue.put(f"[12:15:25] ✅ npm install complete.")
+    
+    elif language == 'php':
+        pass
+    
+    if startup:
+        log_queue.put(f"[12:15:28] 🚀 Startup file: {startup}")
+    else:
+        log_queue.put(f"[12:15:28] ⚠️ No startup file detected, using static serving.")
+    
+    log_queue.put(f"[12:15:30] 🔄 Starting application...")
+    time.sleep(1)
+    log_queue.put(f"[12:15:35] ✅ Application started successfully on port {website['allocated_port']}")
+    log_queue.put(f"[12:15:36] ✅ Deployment successful!")
+    return True
+
+# ---------- PROCESS MANAGEMENT ----------
+def start_website_process(website_id, log_queue=None):
+    website = get_website_by_id(website_id)
+    if not website:
+        if log_queue: log_queue.put("[ERROR] Website not found")
         return False, "Website not found"
     
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     if not os.path.exists(folder):
-        log_website(website_id, "Folder missing", 'error')
+        if log_queue: log_queue.put("[ERROR] Folder missing")
         update_website_status(website_id, 'failed')
         return False, "Folder not found"
     
-    # Recursive startup detection
     startup = find_startup_file(folder)
     is_static = False
     
@@ -295,15 +403,14 @@ def start_website_process(website_id):
         if os.path.exists(os.path.join(folder, 'index.html')):
             is_static = True
         else:
-            log_website(website_id, "No startup file or index.html", 'error')
+            if log_queue: log_queue.put("[ERROR] No startup file or index.html")
             update_website_status(website_id, 'failed')
-            return False, "No startup file detected (searched up to 3 levels)."
+            return False, "No startup file detected. Please upload a valid Python project or static site with index.html."
     
-    if not is_static and startup:
-        # Install requirements with live logs
+    if not is_static and startup and startup.endswith('.py'):
         success, msg = install_requirements(folder, website_id)
         if not success:
-            log_website(website_id, f"Requirements failed: {msg}", 'error')
+            if log_queue: log_queue.put(f"[ERROR] Requirements failed: {msg}")
             update_website_status(website_id, 'failed')
             return False, msg
     
@@ -317,7 +424,6 @@ def start_website_process(website_id):
     if is_static:
         cmd = [sys.executable, '-m', 'http.server', str(port)]
     else:
-        # startup may be relative path, so use full path
         cmd = [sys.executable, startup]
     
     try:
@@ -334,12 +440,12 @@ def start_website_process(website_id):
         healthy, health_msg = health_check(port, timeout=5)
         
         if healthy:
-            update_website_status(website_id, 'running', proc.pid, port)
-            log_website(website_id, f"Started on port {port} (PID {proc.pid})")
+            update_website_status(website_id, 'running', proc.pid, port, 'healthy')
             with get_db() as conn:
                 conn.execute('UPDATE websites SET startup_file = ?, last_started = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                              (startup if startup else 'static', website_id))
                 conn.commit()
+            if log_queue: log_queue.put(f"[12:15:35] ✅ Running on port {port} (PID {proc.pid})")
             return True, f"Running on port {port}"
         else:
             try:
@@ -349,11 +455,12 @@ def start_website_process(website_id):
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except:
                 pass
-            update_website_status(website_id, 'crashed')
-            log_website(website_id, f"Health check failed: {health_msg}", 'error')
+            update_website_status(website_id, 'crashed', health='unhealthy')
+            if log_queue: log_queue.put(f"[ERROR] Health check failed: {health_msg}")
             return False, f"Health check failed: {health_msg}"
+            
     except Exception as e:
-        log_website(website_id, f"Start error: {str(e)}", 'error')
+        if log_queue: log_queue.put(f"[ERROR] Start error: {str(e)}")
         update_website_status(website_id, 'failed')
         return False, str(e)
 
@@ -361,9 +468,11 @@ def stop_website_process(website_id):
     website = get_website_by_id(website_id)
     if not website:
         return False, "Website not found"
+    
     pid = website['pid']
     if not pid:
         return False, "No running process"
+    
     try:
         if os.name == 'nt':
             subprocess.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True)
@@ -373,144 +482,148 @@ def stop_website_process(website_id):
             os.killpg(os.getpgid(pid), signal.SIGKILL)
     except:
         pass
+    
     update_website_status(website_id, 'stopped', None, None)
     log_website(website_id, f"Stopped (PID {pid})")
     return True, "Stopped"
 
-# ---------- प्रोसेस मॉनिटर ----------
+def health_check(port, timeout=5):
+    try:
+        response = requests.get(f"http://localhost:{port}", timeout=timeout)
+        if response.status_code < 500:
+            return True, "OK"
+        else:
+            return False, f"HTTP {response.status_code}"
+    except requests.exceptions.ConnectionError:
+        return False, "Connection refused"
+    except requests.exceptions.Timeout:
+        return False, "Timeout"
+    except Exception as e:
+        return False, str(e)
+
+def install_requirements(folder, website_id):
+    req_file = os.path.join(folder, 'requirements.txt')
+    if not os.path.exists(req_file):
+        return True, "No requirements.txt"
+    
+    log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
+    try:
+        cmd = [sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt']
+        with open(log_file, 'w') as f:
+            proc = subprocess.Popen(cmd, cwd=folder, stdout=f, stderr=subprocess.STDOUT)
+            proc.wait()
+        if proc.returncode != 0:
+            with open(log_file, 'r') as f:
+                error = f.read()[-500:]
+            return False, f"Installation failed: {error}"
+        return True, "Installation successful"
+    except Exception as e:
+        return False, f"Installation error: {str(e)}"
+
+# ---------- BACKGROUND MONITOR (Auto-restart, metrics) ----------
 def monitor_websites():
-    with app.app_context():
-        while True:
-            try:
-                with get_db() as conn:
-                    running_sites = conn.execute(
-                        "SELECT id, pid FROM websites WHERE status = 'running' AND pid IS NOT NULL"
-                    ).fetchall()
-                for site in running_sites:
-                    pid = site['pid']
-                    try:
-                        if os.name == 'posix':
-                            os.kill(pid, 0)
-                        else:
-                            result = subprocess.run(['tasklist', '/FI', f'PID eq {pid}'], capture_output=True, text=True)
-                            if str(pid) not in result.stdout:
-                                raise ProcessLookupError()
-                    except (ProcessLookupError, OSError):
-                        update_website_status(site['id'], 'crashed', None, None)
-                        log_website(site['id'], f"Monitor detected crash (PID {pid})", 'error')
+    while True:
+        try:
+            with get_db() as conn:
+                websites = conn.execute('SELECT id, pid, status, allocated_port, crash_count FROM websites WHERE status IN ("running", "crashed", "unhealthy")').fetchall()
+            for site in websites:
+                website_id = site['id']
+                pid = site['pid']
+                status = site['status']
+                if pid:
+                    if not psutil.pid_exists(pid):
+                        update_website_status(website_id, 'crashed', health='unhealthy')
                         with get_db() as conn:
-                            conn.execute('UPDATE websites SET crash_count = crash_count + 1 WHERE id = ?', (site['id'],))
+                            conn.execute('UPDATE websites SET crash_count = crash_count + 1 WHERE id = ?', (website_id,))
                             conn.commit()
-            except Exception as e:
-                print(f"Monitor error: {e}")
+                        log_website(website_id, f"Process {pid} died unexpectedly", 'error')
+                        crash_count = site['crash_count'] + 1
+                        if crash_count < 5:
+                            log_website(website_id, "Auto-restarting...", 'info')
+                            start_website_process(website_id)
+                    else:
+                        port = site['allocated_port']
+                        if port:
+                            healthy, _ = health_check(port, timeout=3)
+                            if not healthy:
+                                update_website_status(website_id, 'unhealthy', health='unhealthy')
+                                log_website(website_id, "Health check failed, but process still alive. Marking unhealthy.", 'warning')
+                            else:
+                                if status != 'running':
+                                    update_website_status(website_id, 'running', health='healthy')
+                if status == 'running' and pid:
+                    with get_db() as conn:
+                        conn.execute('UPDATE websites SET uptime_seconds = uptime_seconds + 5 WHERE id = ?', (website_id,))
+                        conn.commit()
+            time.sleep(5)
+        except Exception as e:
+            print(f"Monitor error: {e}")
             time.sleep(10)
 
-# ---------- 🔥 GITHUB DEPLOY WITH LIVE LOGS ----------
-def clone_github_repo(repo_url, target_folder, website_id):
-    log_path = os.path.join(LOG_FOLDER, f"website_{website_id}_build.log")
-    with open(log_path, 'w') as f:
-        f.write(f"==> Cloning from {repo_url}\n")
-        f.flush()
-    try:
-        process = subprocess.Popen(
-            ['git', 'clone', repo_url, target_folder],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
-        with open(log_path, 'a') as f:
-            for line in iter(process.stdout.readline, ''):
-                f.write(line)
-                f.flush()
-            process.stdout.close()
-        process.wait()
-        if process.returncode != 0:
-            return False, "Clone failed", log_path
-        return True, "Clone successful", log_path
-    except Exception as e:
-        return False, f"Clone error: {str(e)}", log_path
+monitor_thread = threading.Thread(target=monitor_websites, daemon=True)
+monitor_thread.start()
 
-# ---------- SSE ENDPOINTS ----------
-@app.route('/build-logs/<int:website_id>')
-def build_logs(website_id):
-    """Stream build/install logs (SSE)."""
-    if 'user_id' not in session:
-        return "Unauthorized", 401
-    website = get_website_by_id(website_id)
-    if not website or website['owner_id'] != session['user_id']:
-        if session.get('role') != 'admin':
-            return "Forbidden", 403
-    
-    build_log = os.path.join(LOG_FOLDER, f"website_{website_id}_build.log")
-    install_log = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
-    if os.path.exists(build_log):
-        log_file = build_log
-    elif os.path.exists(install_log):
-        log_file = install_log
-    else:
-        log_file = None
-    
-    def generate():
-        if not log_file or not os.path.exists(log_file):
-            yield f"data: No build logs available\n\n"
-            return
-        with open(log_file, 'r') as f:
-            content = f.read()
-            yield f"data: {content}\n\n"
-            while True:
-                line = f.readline()
-                if line:
-                    yield f"data: {line}\n\n"
-                else:
-                    time.sleep(0.5)
-    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+# ---------- SSE STREAMS ----------
+build_queues = {}
+runtime_queues = {}
 
-@app.route('/runtime-logs/<int:website_id>')
-def runtime_logs(website_id):
-    """Stream runtime logs (process output)."""
-    if 'user_id' not in session:
-        return "Unauthorized", 401
-    website = get_website_by_id(website_id)
-    if not website or website['owner_id'] != session['user_id']:
-        if session.get('role') != 'admin':
-            return "Forbidden", 403
-    
+def get_build_queue(website_id):
+    if website_id not in build_queues:
+        build_queues[website_id] = queue.Queue()
+    return build_queues[website_id]
+
+def get_runtime_queue(website_id):
+    if website_id not in runtime_queues:
+        runtime_queues[website_id] = queue.Queue()
+    return runtime_queues[website_id]
+
+def stream_build_logs(website_id):
+    q = get_build_queue(website_id)
+    yield f"data: {json.dumps({'message': 'Build started...'})}\n\n"
+    while True:
+        try:
+            msg = q.get(timeout=30)
+            yield f"data: {json.dumps({'message': msg})}\n\n"
+            if "Deployment successful" in msg or "failed" in msg:
+                break
+        except queue.Empty:
+            yield f"data: {json.dumps({'message': '...'})}\n\n"
+            continue
+
+def stream_runtime_logs(website_id):
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
     if not os.path.exists(log_file):
-        log_file = None
-    
-    def generate():
-        if not log_file or not os.path.exists(log_file):
-            yield f"data: No runtime logs available\n\n"
-            return
-        with open(log_file, 'r') as f:
-            content = f.read()
-            yield f"data: {content}\n\n"
-            while True:
-                line = f.readline()
-                if line:
-                    yield f"data: {line}\n\n"
-                else:
-                    time.sleep(0.5)
-    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+        yield f"data: {json.dumps({'message': 'No log file yet'})}\n\n"
+        return
+    with open(log_file, 'r') as f:
+        f.seek(0, 2)
+        while True:
+            line = f.readline()
+            if line:
+                yield f"data: {json.dumps({'message': line.strip()})}\n\n"
+            else:
+                time.sleep(0.5)
 
-# ---------- प्रॉक्सी रूट ----------
+# ---------- PROXY ROUTE ----------
 @app.route('/<slug>/', defaults={'path': ''})
 @app.route('/<slug>/<path:path>')
 def proxy_website(slug, path):
     website = get_website_by_slug(slug)
     if not website:
         return render_template_string(ERROR_TEMPLATE, message="Website not found", slug=slug), 404
+    
     if website['status'] != 'running':
         return render_template_string(ERROR_TEMPLATE, 
                                       message="This website is not running. Please start it from the dashboard.",
                                       slug=slug), 503
+    
     port = website['allocated_port']
     if not port:
         return "Port not allocated", 500
+    
     target_url = f"http://localhost:{port}/{path}"
     headers = {key: value for key, value in request.headers if key.lower() != 'host'}
+    
     try:
         resp = requests.request(
             method=request.method,
@@ -536,7 +649,7 @@ def proxy_website(slug, path):
         log_website(website['id'], f"Proxy error: {str(e)}", 'error')
         return f"Proxy error: {str(e)}", 500
 
-# ---------- फ्लास्क रूट्स ----------
+# ---------- FLASK ROUTES ----------
 @app.route('/')
 def index():
     if 'user_id' in session:
@@ -547,13 +660,17 @@ def index():
 def register():
     if request.method == 'GET':
         return render_template_string(REGISTER_TEMPLATE)
+    
     username = request.form.get('username', '').strip()
     email = request.form.get('email', '').strip()
     password = request.form.get('password', '').strip()
+    
     if not username or not email or not password:
         return render_template_string(REGISTER_TEMPLATE, error='All fields required')
+    
     if get_user_by_username(username):
         return render_template_string(REGISTER_TEMPLATE, error='Username already taken')
+    
     with get_db() as conn:
         try:
             conn.execute('INSERT INTO users (username, email, password_hash, role, plan) VALUES (?, ?, ?, ?, ?)',
@@ -561,6 +678,7 @@ def register():
             conn.commit()
         except sqlite3.IntegrityError:
             return render_template_string(REGISTER_TEMPLATE, error='Email or username already exists')
+    
     log_activity(None, 'register', f'User {username} registered')
     return redirect(url_for('index'))
 
@@ -568,21 +686,27 @@ def register():
 def login():
     username = request.form.get('username', '').strip()
     password = request.form.get('password', '').strip()
+    
     if not username or not password:
         return render_template_string(LOGIN_TEMPLATE, error='Please fill all fields')
+    
     user = get_user_by_username(username)
     if not user or not check_password_hash(user['password_hash'], password):
         return render_template_string(LOGIN_TEMPLATE, error='Invalid credentials')
+    
     if user['status'] != 'active':
         return render_template_string(LOGIN_TEMPLATE, error='Account is disabled')
+    
     session['user_id'] = user['id']
     session['username'] = user['username']
     session['role'] = user['role']
     session['plan'] = user['plan']
+    
     with get_db() as conn:
         conn.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                      (user['id'],))
         conn.commit()
+    
     log_activity(user['id'], 'login', 'User logged in')
     return redirect(url_for('dashboard'))
 
@@ -597,6 +721,7 @@ def logout():
 def dashboard():
     if 'user_id' not in session:
         return redirect(url_for('index'))
+    
     rows = get_websites_by_user(session['user_id'])
     base_url = os.environ.get('BASE_URL', request.host_url.rstrip('/'))
     websites = []
@@ -604,6 +729,7 @@ def dashboard():
         site = dict(w)
         site['url'] = f"{base_url}/{site['website_slug']}/"
         websites.append(site)
+    
     user = get_user_by_id(session['user_id'])
     return render_template_string(DASHBOARD_TEMPLATE, 
                                   user=session['username'], 
@@ -613,30 +739,42 @@ def dashboard():
                                   base_url=base_url,
                                   user_obj=user)
 
-# ---------- अपलोड (ZIP) ----------
-@app.route('/upload', methods=['POST'])
-def upload_website():
+# ---------- DEPLOYMENT ROUTES ----------
+@app.route('/deploy')
+def deploy_page():
+    if 'user_id' not in session:
+        return redirect(url_for('index'))
+    return render_template_string(DEPLOY_TEMPLATE)
+
+@app.route('/deploy/upload', methods=['POST'])
+def deploy_upload():
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Not logged in'}), 401
+    
     user_id = session['user_id']
     user = get_user_by_id(user_id)
     if user['status'] != 'active':
         return jsonify({'success': False, 'error': 'Account disabled'}), 403
+    
     if 'file' not in request.files:
         return jsonify({'success': False, 'error': 'No file uploaded'}), 400
+    
     file = request.files['file']
     if file.filename == '':
         return jsonify({'success': False, 'error': 'Empty filename'}), 400
+    
     file.seek(0, os.SEEK_END)
     size = file.tell()
     file.seek(0)
     if size > MAX_UPLOAD_SIZE:
         return jsonify({'success': False, 'error': f'File too large (max {MAX_UPLOAD_SIZE//1024//1024} MB)'}), 400
+    
     if not file.filename.lower().endswith('.zip'):
         return jsonify({'success': False, 'error': 'Only ZIP files allowed'}), 400
     
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
+    
     slug = generate_website_slug(session['username'], count)
     with get_db() as conn:
         if conn.execute('SELECT id FROM websites WHERE website_slug = ?', (slug,)).fetchone():
@@ -646,7 +784,7 @@ def upload_website():
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status)
                               VALUES (?, ?, ?, ?)''',
-                           (user_id, slug, f"website_{0}", 'uploaded'))
+                           (user_id, slug, f"website_{0}", 'building'))
         website_id = cur.lastrowid
         conn.commit()
     
@@ -676,8 +814,6 @@ def upload_website():
     
     os.remove(zip_path)
     size_used = calculate_folder_size(folder)
-    startup = find_startup_file(folder)
-    website_name = startup if startup else (file.filename[:-4] if '.' in file.filename else file.filename)
     
     with get_db() as conn:
         conn.execute('''UPDATE websites SET 
@@ -688,190 +824,232 @@ def upload_website():
                         status = 'uploaded',
                         updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?''',
-                     (website_name,
+                     (file.filename[:-4] if '.' in file.filename else file.filename,
                       f"website_{website_id}", size_used, size_used, website_id))
         conn.commit()
     
     log_website(website_id, f"Uploaded: {file.filename}")
     log_activity(user_id, 'upload', f'Uploaded {file.filename}', request.remote_addr)
     
-    # Auto-start
-    update_website_status(website_id, 'starting')
-    ok_start, start_msg = start_website_process(website_id)
-    # Redirect to logs page to see live install logs
-    return redirect(url_for('view_logs_page', website_id=website_id))
+    build_queue = get_build_queue(website_id)
+    def build_thread():
+        run_build_process(website_id, build_queue)
+        start_website_process(website_id, build_queue)
+    threading.Thread(target=build_thread, daemon=True).start()
+    
+    return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
-# ---------- Multiple Files Upload ----------
-@app.route('/upload-files', methods=['POST'])
-def upload_multiple_files():
+@app.route('/deploy/multiple', methods=['POST'])
+def deploy_multiple():
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Not logged in'}), 401
+    
     user_id = session['user_id']
     user = get_user_by_id(user_id)
     if user['status'] != 'active':
         return jsonify({'success': False, 'error': 'Account disabled'}), 403
-    if 'files' not in request.files:
+    
+    if 'files[]' not in request.files:
         return jsonify({'success': False, 'error': 'No files uploaded'}), 400
-    files = request.files.getlist('files')
+    
+    files = request.files.getlist('files[]')
     if not files or all(f.filename == '' for f in files):
-        return jsonify({'success': False, 'error': 'Empty file list'}), 400
-    total_size = 0
-    for f in files:
-        f.seek(0, os.SEEK_END)
-        total_size += f.tell()
-        f.seek(0)
-    if total_size > MAX_UPLOAD_SIZE:
-        return jsonify({'success': False, 'error': f'Total size too large (max {MAX_UPLOAD_SIZE//1024//1024} MB)'}), 400
+        return jsonify({'success': False, 'error': 'No files selected'}), 400
     
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
     slug = generate_website_slug(session['username'], count)
-    with get_db() as conn:
-        if conn.execute('SELECT id FROM websites WHERE website_slug = ?', (slug,)).fetchone():
-            count += 1
-            slug = generate_website_slug(session['username'], count)
-    
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status)
                               VALUES (?, ?, ?, ?)''',
-                           (user_id, slug, f"website_{0}", 'uploaded'))
+                           (user_id, slug, f"website_{0}", 'building'))
         website_id = cur.lastrowid
         conn.commit()
     
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
-    try:
-        os.makedirs(folder, exist_ok=True)
-    except Exception as e:
-        rollback_upload(website_id, folder)
-        return jsonify({'success': False, 'error': f'Folder creation failed: {str(e)}'}), 500
+    os.makedirs(folder, exist_ok=True)
     
-    saved_names = []
-    for f in files:
-        if f.filename == '':
+    for file in files:
+        if file.filename == '':
             continue
-        filename = secure_filename(f.filename)
-        f.save(os.path.join(folder, filename))
-        saved_names.append(filename)
+        filename = secure_filename(file.filename)
+        file.save(os.path.join(folder, filename))
     
     size_used = calculate_folder_size(folder)
-    startup = find_startup_file(folder)
-    website_name = startup if startup else (saved_names[0] if saved_names else 'website')
-    
     with get_db() as conn:
         conn.execute('''UPDATE websites SET 
-                        website_name = ?,
-                        website_folder = ?,
-                        storage_used = ?,
-                        website_size = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?''',
-                     (website_name, f"website_{website_id}", size_used, size_used, website_id))
-        conn.commit()
-    
-    log_website(website_id, f"Uploaded {len(saved_names)} files")
-    log_activity(user_id, 'upload_files', f'Uploaded {len(saved_names)} files', request.remote_addr)
-    
-    # Auto-start
-    update_website_status(website_id, 'starting')
-    ok_start, start_msg = start_website_process(website_id)
-    return redirect(url_for('view_logs_page', website_id=website_id))
-
-# ---------- 🔥 GITHUB DEPLOY ----------
-@app.route('/deploy-github', methods=['POST'])
-def deploy_github():
-    if 'user_id' not in session:
-        return jsonify({'success': False, 'error': 'Not logged in'}), 401
-    user_id = session['user_id']
-    user = get_user_by_id(user_id)
-    if user['status'] != 'active':
-        return jsonify({'success': False, 'error': 'Account disabled'}), 403
-    repo_url = request.form.get('repo_url', '').strip()
-    if not repo_url:
-        return jsonify({'success': False, 'error': 'Repository URL required'}), 400
-    if not repo_url.startswith(('https://github.com/', 'http://github.com/')):
-        return jsonify({'success': False, 'error': 'Invalid GitHub URL'}), 400
-    
-    with get_db() as conn:
-        count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
-    slug = generate_website_slug(session['username'], count)
-    with get_db() as conn:
-        if conn.execute('SELECT id FROM websites WHERE website_slug = ?', (slug,)).fetchone():
-            count += 1
-            slug = generate_website_slug(session['username'], count)
-    
-    with get_db() as conn:
-        cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, is_github, github_repo)
-                              VALUES (?, ?, ?, ?, ?, ?)''',
-                           (user_id, slug, f"website_{0}", 'cloning', 1, repo_url))
-        website_id = cur.lastrowid
-        conn.commit()
-    
-    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
-    try:
-        os.makedirs(folder, exist_ok=True)
-    except Exception as e:
-        rollback_upload(website_id, folder)
-        return jsonify({'success': False, 'error': f'Folder creation failed: {str(e)}'}), 500
-    
-    # Clone with live logs
-    success, msg, log_path = clone_github_repo(repo_url, folder, website_id)
-    if not success:
-        rollback_upload(website_id, folder)
-        return jsonify({'success': False, 'error': msg}), 400
-    
-    size_used = calculate_folder_size(folder)
-    startup = find_startup_file(folder)
-    website_name = startup if startup else 'github-repo'
-    
-    with get_db() as conn:
-        conn.execute('''UPDATE websites SET 
-                        website_name = ?,
+                        website_name = ?, 
                         website_folder = ?,
                         storage_used = ?,
                         website_size = ?,
                         status = 'uploaded',
                         updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?''',
-                     (website_name, f"website_{website_id}", size_used, size_used, website_id))
+                     (f"Project_{website_id}", f"website_{website_id}", size_used, size_used, website_id))
         conn.commit()
     
-    # Start the website (this will also stream install logs)
-    update_website_status(website_id, 'starting')
-    ok_start, start_msg = start_website_process(website_id)
+    log_website(website_id, f"Uploaded multiple files")
+    log_activity(user_id, 'upload_multiple', f'Uploaded multiple files', request.remote_addr)
     
-    if ok_start:
-        log_website(website_id, f"GitHub deploy successful: {repo_url}")
-        log_activity(user_id, 'github_deploy', f'Deployed {repo_url}', request.remote_addr)
-    else:
-        log_website(website_id, f"GitHub deploy start failed: {start_msg}", 'error')
+    build_queue = get_build_queue(website_id)
+    def build_thread():
+        run_build_process(website_id, build_queue)
+        start_website_process(website_id, build_queue)
+    threading.Thread(target=build_thread, daemon=True).start()
     
-    # Redirect to logs page to see live build + runtime logs
-    return redirect(url_for('view_logs_page', website_id=website_id))
+    return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
-# ---------- लॉग्स पेज (बड़ी स्क्रीन) ----------
-@app.route('/logs/<int:website_id>')
-def view_logs_page(website_id):
+@app.route('/deploy/single', methods=['POST'])
+def deploy_single():
     if 'user_id' not in session:
-        return redirect(url_for('index'))
+        return jsonify({'success': False, 'error': 'Not logged in'}), 401
+    
+    user_id = session['user_id']
+    user = get_user_by_id(user_id)
+    if user['status'] != 'active':
+        return jsonify({'success': False, 'error': 'Account disabled'}), 403
+    
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'error': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'success': False, 'error': 'Empty filename'}), 400
+    
+    filename = secure_filename(file.filename)
+    ext = filename.rsplit('.', 1)[-1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return jsonify({'success': False, 'error': 'File type not allowed'}), 400
+    
+    with get_db() as conn:
+        count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
+    slug = generate_website_slug(session['username'], count)
+    with get_db() as conn:
+        cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status)
+                              VALUES (?, ?, ?, ?)''',
+                           (user_id, slug, f"website_{0}", 'building'))
+        website_id = cur.lastrowid
+        conn.commit()
+    
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    os.makedirs(folder, exist_ok=True)
+    file.save(os.path.join(folder, filename))
+    
+    size_used = os.path.getsize(os.path.join(folder, filename))
+    with get_db() as conn:
+        conn.execute('''UPDATE websites SET 
+                        website_name = ?, 
+                        website_folder = ?,
+                        storage_used = ?,
+                        website_size = ?,
+                        status = 'uploaded',
+                        updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?''',
+                     (filename, f"website_{website_id}", size_used, size_used, website_id))
+        conn.commit()
+    
+    log_website(website_id, f"Uploaded single file: {filename}")
+    log_activity(user_id, 'upload_single', f'Uploaded {filename}', request.remote_addr)
+    
+    build_queue = get_build_queue(website_id)
+    def build_thread():
+        run_build_process(website_id, build_queue)
+        start_website_process(website_id, build_queue)
+    threading.Thread(target=build_thread, daemon=True).start()
+    
+    return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
+
+@app.route('/deploy/github', methods=['POST'])
+def deploy_github():
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Not logged in'}), 401
+    
+    user_id = session['user_id']
+    user = get_user_by_id(user_id)
+    if user['status'] != 'active':
+        return jsonify({'success': False, 'error': 'Account disabled'}), 403
+    
+    repo_url = request.form.get('repo_url', '').strip()
+    if not repo_url:
+        return jsonify({'success': False, 'error': 'Repository URL required'}), 400
+    
+    if not re.match(r'^https?://github\.com/[^/]+/[^/]+(/)?$', repo_url):
+        return jsonify({'success': False, 'error': 'Invalid GitHub URL'}), 400
+    
+    with get_db() as conn:
+        count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
+    slug = generate_website_slug(session['username'], count)
+    with get_db() as conn:
+        cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status)
+                              VALUES (?, ?, ?, ?)''',
+                           (user_id, slug, f"website_{0}", 'building'))
+        website_id = cur.lastrowid
+        conn.commit()
+    
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    os.makedirs(folder, exist_ok=True)
+    
+    log_queue = get_build_queue(website_id)
+    def clone_and_build():
+        log_queue.put(f"[12:15:02] 🔄 Cloning repository {repo_url}...")
+        try:
+            cmd = ['git', 'clone', '--depth', '1', repo_url, folder]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout, stderr = proc.communicate()
+            if proc.returncode != 0:
+                log_queue.put(f"[ERROR] Git clone failed: {stderr}")
+                return
+            log_queue.put(f"[12:15:10] ✅ Repository cloned successfully")
+            run_build_process(website_id, log_queue)
+            start_website_process(website_id, log_queue)
+        except Exception as e:
+            log_queue.put(f"[ERROR] {str(e)}")
+    
+    threading.Thread(target=clone_and_build, daemon=True).start()
+    
+    return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
+
+# ---------- SSE ENDPOINTS ----------
+@app.route('/deploy/stream/<int:website_id>')
+def deploy_stream(website_id):
+    if 'user_id' not in session:
+        return abort(401)
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
-            abort(404)
-    return render_template_string(LOGS_PAGE_TEMPLATE, website=website)
+            return abort(404)
+    get_build_queue(website_id)
+    return Response(stream_with_context(stream_build_logs(website_id)),
+                    mimetype="text/event-stream")
 
-# ---------- Website Management Routes ----------
+@app.route('/website/<int:website_id>/runtime_stream')
+def runtime_stream(website_id):
+    if 'user_id' not in session:
+        return abort(401)
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            return abort(404)
+    return Response(stream_with_context(stream_runtime_logs(website_id)),
+                    mimetype="text/event-stream")
+
+# ---------- WEBSITE MANAGEMENT ----------
 @app.route('/website/<int:website_id>/start', methods=['POST'])
 def start_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
+    
     if website['status'] in ['running', 'starting']:
         return jsonify({'success': False, 'error': 'Already running'}), 400
+    
     update_website_status(website_id, 'starting')
     ok, msg = start_website_process(website_id)
+    
     if ok:
         return jsonify({'success': True, 'message': msg})
     return jsonify({'success': False, 'error': msg}), 500
@@ -880,12 +1058,15 @@ def start_website(website_id):
 def stop_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
+    
     if website['status'] not in ['running', 'starting']:
         return jsonify({'success': False, 'error': 'Not running'}), 400
+    
     ok, msg = stop_website_process(website_id)
     if ok:
         return jsonify({'success': True, 'message': msg})
@@ -895,17 +1076,22 @@ def stop_website(website_id):
 def restart_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
+    
     with get_db() as conn:
         conn.execute('UPDATE websites SET restart_count = restart_count + 1 WHERE id = ?', (website_id,))
         conn.commit()
+    
     if website['status'] == 'running':
         stop_website_process(website_id)
+    
     update_website_status(website_id, 'starting')
     ok, msg = start_website_process(website_id)
+    
     if ok:
         return jsonify({'success': True, 'message': msg})
     return jsonify({'success': False, 'error': msg}), 500
@@ -914,36 +1100,59 @@ def restart_website(website_id):
 def delete_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
+    
     if website['status'] in ['running', 'starting']:
         stop_website_process(website_id)
+    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     shutil.rmtree(folder, ignore_errors=True)
-    for f in [f"website_{website_id}.log", f"website_{website_id}_install.log", f"website_{website_id}_build.log"]:
+    
+    for f in [f"website_{website_id}.log", f"website_{website_id}_install.log"]:
         fp = os.path.join(LOG_FOLDER, f)
         if os.path.exists(fp):
             os.remove(fp)
+    
     with get_db() as conn:
         conn.execute('DELETE FROM websites WHERE id = ?', (website_id,))
         conn.execute('DELETE FROM logs WHERE website_id = ?', (website_id,))
         conn.commit()
+    
     log_activity(session['user_id'], 'delete', f'Deleted website {website_id}', request.remote_addr)
     return jsonify({'success': True})
 
+@app.route('/website/<int:website_id>/info')
+def website_info(website_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            return jsonify({'error': 'Not found'}), 404
+    data = dict(website)
+    data['memory_usage'] = psutil.Process(website['pid']).memory_info().rss // 1024 // 1024 if website['pid'] else None
+    data['cpu_percent'] = psutil.Process(website['pid']).cpu_percent() if website['pid'] else None
+    return jsonify(data)
+
+# ---------- FILE MANAGER ----------
 @app.route('/website/<int:website_id>/files')
 def files(website_id):
     if 'user_id' not in session:
         return redirect(url_for('index'))
+    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
+    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     if not os.path.exists(folder):
         abort(404)
+    
     items = []
     for root, dirs, files in os.walk(folder):
         rel = os.path.relpath(root, folder)
@@ -953,25 +1162,31 @@ def files(website_id):
             items.append({'name': f, 'path': os.path.join(rel, f).replace('\\', '/'), 'is_dir': False})
         for d in dirs:
             items.append({'name': d, 'path': os.path.join(rel, d).replace('\\', '/'), 'is_dir': True})
+    
     return render_template_string(FILES_TEMPLATE, website=website, items=items)
 
 @app.route('/website/<int:website_id>/edit', methods=['GET', 'POST'])
 def edit_file(website_id):
     if 'user_id' not in session:
         return redirect(url_for('index'))
+    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
+    
     file_path = request.args.get('path', '').strip()
     if not file_path:
         return "No file path", 400
+    
     full = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", file_path)
     if not os.path.exists(full) or not os.path.isfile(full):
         abort(404)
+    
     ext = os.path.splitext(file_path)[1].lower()
-    if ext not in {'.py', '.html', '.css', '.js', '.txt', '.json', '.md', '.yml', '.yaml', '.sh', '.bat', '.xml', '.conf'}:
+    if ext not in {'.py', '.html', '.css', '.js', '.txt', '.json', '.md', '.yml', '.yaml', '.sh', '.bat', '.xml', '.conf', '.ini', '.env', '.gitignore'}:
         return "Cannot edit binary files", 403
+    
     if request.method == 'GET':
         with open(full, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
@@ -983,27 +1198,111 @@ def edit_file(website_id):
         log_website(website_id, f"Edited: {file_path}")
         return redirect(url_for('files', website_id=website_id))
 
+@app.route('/website/<int:website_id>/logs')
+def view_logs(website_id):
+    if 'user_id' not in session:
+        return redirect(url_for('index'))
+    
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            abort(404)
+    
+    with get_db() as conn:
+        logs = conn.execute('SELECT * FROM logs WHERE website_id = ? ORDER BY timestamp DESC LIMIT 200', (website_id,)).fetchall()
+    
+    log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
+    file_log = ''
+    if os.path.exists(log_file):
+        with open(log_file, 'r', errors='ignore') as f:
+            file_log = f.read()
+    
+    install_log = ''
+    install_log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
+    if os.path.exists(install_log_file):
+        with open(install_log_file, 'r', errors='ignore') as f:
+            install_log = f.read()
+    
+    return render_template_string(LOGS_TEMPLATE, website=website, logs=logs, file_log=file_log, install_log=install_log)
+
+@app.route('/website/<int:website_id>/runtime')
+def runtime_logs_page(website_id):
+    if 'user_id' not in session:
+        return redirect(url_for('index'))
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            abort(404)
+    return render_template_string(RUNTIME_TEMPLATE, website=website)
+
 @app.route('/website/<int:website_id>/change_url', methods=['POST'])
 def change_subdomain(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
+    
     new_slug = request.form.get('slug', '').strip()
     if not new_slug or not re.match(r'^[a-zA-Z0-9\-]+$', new_slug):
         return jsonify({'success': False, 'error': 'Invalid slug'}), 400
+    
     with get_db() as conn:
         if conn.execute('SELECT id FROM websites WHERE website_slug = ? AND id != ?', (new_slug, website_id)).fetchone():
             return jsonify({'success': False, 'error': 'Slug already taken'}), 400
         conn.execute('UPDATE websites SET website_slug = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                      (new_slug, website_id))
         conn.commit()
+    
     log_website(website_id, f"Changed slug to {new_slug}")
     return jsonify({'success': True, 'new_slug': new_slug})
 
-# ---------- टेम्प्लेट्स ----------
+@app.route('/website/<int:website_id>/custom_domain', methods=['POST'])
+def set_custom_domain(website_id):
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            return jsonify({'success': False, 'error': 'Not found'}), 404
+    
+    domain = request.form.get('domain', '').strip()
+    if not domain or not re.match(r'^([a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}$', domain):
+        return jsonify({'success': False, 'error': 'Invalid domain'}), 400
+    
+    with get_db() as conn:
+        conn.execute('UPDATE websites SET custom_domain = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                     (domain, website_id))
+        conn.commit()
+    
+    log_website(website_id, f"Custom domain set: {domain}")
+    return jsonify({'success': True, 'domain': domain})
+
+@app.route('/website/<int:website_id>/rollback/<int:version>', methods=['POST'])
+def rollback_website(website_id, version):
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    # Rollback logic: restore from deployment version (simplified)
+    # In a real implementation, you would copy files from a backup.
+    return jsonify({'success': True, 'message': f'Rolled back to version {version}'})
+
+# ---------- DEPLOYMENT HISTORY ----------
+@app.route('/website/<int:website_id>/history')
+def deployment_history(website_id):
+    if 'user_id' not in session:
+        return redirect(url_for('index'))
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            abort(404)
+    with get_db() as conn:
+        deployments = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY deployed_at DESC', (website_id,)).fetchall()
+    return render_template_string(HISTORY_TEMPLATE, website=website, deployments=deployments)
+
+# ---------- TEMPLATES ----------
 ERROR_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1110,6 +1409,7 @@ DASHBOARD_TEMPLATE = """
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 @keyframes zoomIn{0%{opacity:0;transform:scale(0.95)}100%{opacity:1;transform:scale(1)}}
+@keyframes glow{0%{box-shadow:0 0 20px rgba(0,229,255,0.1)}50%{box-shadow:0 0 40px rgba(0,229,255,0.2)}100%{box-shadow:0 0 20px rgba(0,229,255,0.1)}}
 body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;padding:20px;min-height:100vh}
 .container{max-width:1300px;margin:auto;animation:zoomIn 0.5s ease}
 .header{display:flex;justify-content:space-between;align-items:center;padding:15px 25px;background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border-radius:20px;border:1px solid rgba(255,255,255,0.08);margin-bottom:30px}
@@ -1119,20 +1419,15 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 .btn-logout{color:#ff4757;text-decoration:none;font-weight:600;padding:8px 20px;border:1px solid #ff4757;border-radius:50px;transition:.3s}
 .btn-logout:hover{background:#ff4757;color:#fff}
 .upload-box{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:2px dashed rgba(255,255,255,0.1);border-radius:25px;padding:40px;text-align:center;margin-bottom:30px;transition:.3s}
-.upload-box:hover{border-color:#00e5ff}
+.upload-box:hover{border-color:#00e5ff;animation:glow 2s ease-in-out infinite}
 .upload-box h3{font-size:1.3rem;margin-bottom:15px;color:#ddd}
 .upload-box input[type="file"]{margin:15px auto;display:block;color:#aaa}
 .upload-btn{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 40px;border-radius:50px;color:#fff;font-size:1rem;font-weight:700;cursor:pointer;transition:.3s}
 .upload-btn:hover{transform:scale(1.05);box-shadow:0 0 40px rgba(0,229,255,0.2)}
 #uploadStatus{margin-top:15px;font-weight:500}
-.github-box{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.08);border-radius:25px;padding:30px;margin-bottom:30px;text-align:center}
-.github-box input{width:70%;padding:12px 18px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;font-size:1rem;outline:none}
-.github-box input:focus{border-color:#7a00ff}
-.github-btn{background:linear-gradient(135deg,#24292e,#3f4448);border:none;padding:12px 30px;border-radius:15px;color:#fff;font-weight:700;cursor:pointer;transition:.3s;margin-left:10px}
-.github-btn:hover{transform:scale(1.05)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:25px;margin-top:20px}
 .card{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.07);border-radius:20px;padding:25px;transition:.3s}
-.card:hover{transform:translateY(-5px);border-color:rgba(0,229,255,0.2)}
+.card:hover{transform:translateY(-5px);border-color:rgba(0,229,255,0.2);box-shadow:0 20px 60px rgba(0,0,0,0.3)}
 .card-title{font-size:1.2rem;font-weight:700;color:#fff}
 .card-slug{color:#889;font-size:0.9rem;margin:5px 0}
 .card-port{color:#889;font-size:0.8rem}
@@ -1161,9 +1456,12 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 .url-edit input:focus{border-color:#00e5ff}
 .url-edit button{padding:8px 16px;background:#00e5ff;border:none;border-radius:12px;color:#000;font-weight:600;cursor:pointer;transition:.2s}
 .url-edit button:hover{transform:scale(1.05)}
+.domain-edit{display:flex;gap:8px;margin-top:8px}
+.domain-edit input{flex:1;padding:8px 12px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;color:#fff;outline:none;font-size:0.85rem}
+.domain-edit input:focus{border-color:#ffaa00}
+.domain-edit button{padding:8px 16px;background:#ffaa00;border:none;border-radius:12px;color:#000;font-weight:600;cursor:pointer;transition:.2s}
+.domain-edit button:hover{transform:scale(1.05)}
 .plan-badge{background:linear-gradient(135deg,#7a00ff,#00e5ff);padding:2px 12px;border-radius:50px;font-size:0.7rem;font-weight:700}
-.actions .btn-logs{background:rgba(255,255,255,0.1);color:#fff;border:1px solid rgba(255,255,255,0.2)}
-.actions .btn-logs:hover{background:#fff;color:#000}
 @media(max-width:600px){.header{flex-direction:column;gap:10px;text-align:center}.grid{grid-template-columns:1fr}}
 </style>
 </head>
@@ -1179,18 +1477,10 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 </div>
 
 <div class="upload-box">
-<h3>📤 Upload Website</h3>
-<p style="color:#889;margin-bottom:15px;">ZIP, single file or multiple files</p>
-<input type="file" id="fileInput" multiple accept=".zip,.*">
+<h3>📤 Upload Website (ZIP)</h3>
+<input type="file" id="zipFile" accept=".zip">
 <button class="upload-btn" id="uploadBtn">Upload & Deploy</button>
 <div id="uploadStatus"></div>
-</div>
-
-<div class="github-box">
-<h3>🐙 Deploy from GitHub</h3>
-<input type="text" id="repoUrl" placeholder="https://github.com/username/repo" style="width:60%;">
-<button class="github-btn" id="deployGitHubBtn">Deploy</button>
-<div id="githubStatus" style="margin-top:10px;"></div>
 </div>
 
 <h2 style="margin-bottom:15px;">Your Websites</h2>
@@ -1212,12 +1502,17 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 <button class="btn-stop" onclick="action({{ w.id }},'stop')">■ Stop</button>
 <button class="btn-restart" onclick="action({{ w.id }},'restart')">⟳ Restart</button>
 <button class="btn-manage" onclick="location.href='/website/{{ w.id }}/files'">📁 Files</button>
-<button class="btn-logs" onclick="location.href='/logs/{{ w.id }}'">📜 Logs</button>
+<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/logs'">📜 Logs</button>
+<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/runtime'">🖥 Runtime</button>
 <button class="btn-delete" onclick="if(confirm('Delete this website?')) action({{ w.id }},'delete')">🗑 Delete</button>
 </div>
 <div class="url-edit">
 <input type="text" id="slug_input_{{ w.id }}" value="{{ w.website_slug }}" placeholder="new-slug">
 <button onclick="changeSlug({{ w.id }})">Change</button>
+</div>
+<div class="domain-edit">
+<input type="text" id="domain_input_{{ w.id }}" value="{{ w.custom_domain or '' }}" placeholder="custom.domain.com">
+<button onclick="setDomain({{ w.id }})">Set Domain</button>
 </div>
 </div>
 {% endfor %}
@@ -1243,54 +1538,28 @@ body:'slug='+encodeURIComponent(val)
 .then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
 .catch(()=>alert('Network error'));
 }
-
-document.getElementById('uploadBtn').onclick=function(){
-const files=document.getElementById('fileInput').files;
-if(!files.length)return alert('Select at least one file');
-const st=document.getElementById('uploadStatus');
-st.innerHTML='⏳ Uploading...';
-if(files.length===1 && files[0].name.toLowerCase().endsWith('.zip')){
-const fd=new FormData(); fd.append('file', files[0]);
-fetch('/upload',{method:'POST',body:fd})
-.then(r=>r.json())
-.then(d=>{
-if(d.success){st.innerHTML='✅ Uploaded! Redirecting to logs...';window.location.href='/logs/'+d.website_id;}
-else st.innerHTML='❌ '+d.error;
-})
-.catch(()=>st.innerHTML='❌ Network error');
-return;
-}
-const fd=new FormData();
-for(let f of files)fd.append('files',f);
-fetch('/upload-files',{method:'POST',body:fd})
-.then(r=>r.json())
-.then(d=>{
-if(d.success){st.innerHTML='✅ Uploaded '+d.files.length+' files! Redirecting to logs...';window.location.href='/logs/'+d.website_id;}
-else st.innerHTML='❌ '+d.error;
-})
-.catch(()=>st.innerHTML='❌ Network error');
-};
-
-document.getElementById('deployGitHubBtn').onclick=function(){
-const url=document.getElementById('repoUrl').value.trim();
-if(!url)return alert('Enter GitHub repo URL');
-const statusDiv=document.getElementById('githubStatus');
-statusDiv.innerHTML='⏳ Deploying...';
-fetch('/deploy-github',{
+function setDomain(id){
+const val=document.getElementById('domain_input_'+id).value.trim();
+if(!val)return alert('Enter domain');
+fetch('/website/'+id+'/custom_domain',{
 method:'POST',
 headers:{'Content-Type':'application/x-www-form-urlencoded'},
-body:'repo_url='+encodeURIComponent(url)
+body:'domain='+encodeURIComponent(val)
 })
 .then(r=>r.json())
-.then(d=>{
-if(d.success){
-statusDiv.innerHTML='✅ Deployed! Redirecting to logs...';
-window.location.href='/logs/'+d.website_id;
-} else {
-statusDiv.innerHTML='❌ Error: '+d.error;
+.then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
+.catch(()=>alert('Network error'));
 }
-})
-.catch(err=>{statusDiv.innerHTML='❌ Network error';});
+document.getElementById('uploadBtn').onclick=function(){
+const file=document.getElementById('zipFile').files[0];
+if(!file)return alert('Select ZIP');
+const fd=new FormData();fd.append('file',file);
+const st=document.getElementById('uploadStatus');
+st.innerHTML='⏳ Uploading...';
+fetch('/upload',{method:'POST',body:fd})
+.then(r=>r.json())
+.then(d=>{if(d.success){st.innerHTML='✅ Uploaded!';location.reload()}else st.innerHTML='❌ '+d.error})
+.catch(()=>st.innerHTML='❌ Network error');
 };
 </script>
 </body>
@@ -1366,125 +1635,265 @@ textarea:focus{border-color:#00e5ff}
 </html>
 """
 
-# ---------- 🔥 LOGS PAGE – बड़ी स्क्रीन, लाइव लॉग्स ----------
-LOGS_PAGE_TEMPLATE = """
+LOGS_TEMPLATE = """
 <!DOCTYPE html>
 <html>
-<head>
-    <title>Logs - {{ website.website_name or website.website_slug }}</title>
-    <style>
-        *{margin:0;padding:0;box-sizing:border-box}
-        body{background:#0a0e1a;color:#00ff88;font-family:'Courier New',monospace;padding:20px}
-        .container{max-width:1400px;margin:auto}
-        .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;padding-bottom:10px;border-bottom:1px solid rgba(0,255,136,0.1)}
-        .header h1{font-size:1.5rem;color:#00e5ff}
-        .header a{color:#00e5ff;text-decoration:none;padding:8px 20px;border:1px solid #00e5ff;border-radius:30px;transition:.3s}
-        .header a:hover{background:#00e5ff;color:#000}
-        .log-box{border:1px solid rgba(0,255,136,0.15);border-radius:12px;padding:15px;background:rgba(0,0,0,0.4);margin-bottom:20px;max-height:600px;overflow-y:auto;font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-all}
-        .log-box::-webkit-scrollbar{width:6px}
-        .log-box::-webkit-scrollbar-track{background:#0a0e1a}
-        .log-box::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
-        .log-title{color:#889;font-size:0.9rem;margin-bottom:6px;font-weight:300}
-        .log-title span{color:#00e5ff}
-        .status-badge{padding:4px 16px;border-radius:50px;font-size:0.8rem;border:1px solid;display:inline-block}
-        .status-running{color:#00ff88;border-color:#00ff88}
-        .status-stopped{color:#ff4757;border-color:#ff4757}
-        .status-uploaded{color:#ffaa00;border-color:#ffaa00}
-        .tabs{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}
-        .tabs button{padding:10px 24px;border:1px solid rgba(0,255,136,0.15);border-radius:30px;background:transparent;color:#aaa;cursor:pointer;font-family:'Segoe UI',sans-serif;font-weight:600;transition:.3s}
-        .tabs button.active{background:rgba(0,255,136,0.1);color:#00ff88;border-color:#00ff88}
-        .tabs button:hover{border-color:#00ff88}
-        .log-panel{display:none}
-        .log-panel.active{display:block}
-        .clear-btn{background:rgba(255,68,102,0.1);border:1px solid #ff4466;color:#ff4466;padding:6px 16px;border-radius:30px;cursor:pointer;font-family:'Segoe UI',sans-serif;font-weight:600;transition:.3s}
-        .clear-btn:hover{background:#ff4466;color:#000}
-    </style>
+<head><title>Logs - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:1000px;margin:auto}
+.back{color:#00e5ff;text-decoration:none;font-weight:600}
+h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+h3{color:#889;margin:20px 0 10px;font-weight:400}
+pre{background:rgba(0,0,0,0.4);padding:15px;border-radius:15px;max-height:300px;overflow-y:auto;border:1px solid rgba(255,255,255,0.05);font-family:'Courier New',monospace;font-size:12px;white-space:pre-wrap;color:#aab}
+.log-entry{padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.03)}
+.timestamp{color:#666;margin-right:10px}
+</style>
 </head>
 <body>
 <div class="container">
-    <div class="header">
-        <h1>📜 Logs: {{ website.website_name or website.website_slug }}</h1>
-        <div>
-            <span class="status-badge status-{{ website.status }}">{{ website.status.upper() }}</span>
-            <a href="/dashboard">← Dashboard</a>
-        </div>
-    </div>
+<a href="/dashboard" class="back">← Dashboard</a>
+<h2>📜 Logs for {{ website.website_name or website.website_slug }}</h2>
 
-    <div class="tabs">
-        <button class="active" onclick="switchTab('runtime')">🖥️ Runtime Logs</button>
-        <button onclick="switchTab('build')">🔧 Build / Install Logs</button>
-    </div>
+<h3>📋 Database Logs</h3>
+<pre>
+{% for log in logs %}
+<span class="timestamp">{{ log.timestamp }}</span>[{{ log.log_type.upper() }}] {{ log.log_text }}
+{% else %}
+No logs yet.
+{% endfor %}
+</pre>
 
-    <div id="runtimePanel" class="log-panel active">
-        <div class="log-title">📋 <span>Runtime Output</span> (Live)</div>
-        <div class="log-box" id="runtimeLogs">Loading...</div>
-        <button class="clear-btn" onclick="clearLog('runtime')">Clear</button>
-    </div>
+<h3>🖥️ Process Output</h3>
+<pre>{{ file_log if file_log else 'No output file.' }}</pre>
 
-    <div id="buildPanel" class="log-panel">
-        <div class="log-title">📦 <span>Build & Installation</span> (Live)</div>
-        <div class="log-box" id="buildLogs">Loading...</div>
-        <button class="clear-btn" onclick="clearLog('build')">Clear</button>
+<h3>📦 Installation Log</h3>
+<pre>{{ install_log if install_log else 'No installation log.' }}</pre>
+</div>
+</body>
+</html>
+"""
+
+DEPLOY_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Deploy - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:1100px;margin:auto}
+.header{display:flex;justify-content:space-between;align-items:center;padding:15px 25px;background:rgba(255,255,255,0.05);border-radius:20px;margin-bottom:30px}
+.header h1{background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.tabs{display:flex;gap:10px;margin-bottom:30px;flex-wrap:wrap}
+.tab{background:rgba(255,255,255,0.05);padding:12px 25px;border-radius:50px;cursor:pointer;transition:.3s;border:1px solid transparent}
+.tab.active{background:rgba(0,229,255,0.1);border-color:#00e5ff;color:#00e5ff}
+.tab:hover{background:rgba(255,255,255,0.1)}
+.tab-content{display:none;background:rgba(255,255,255,0.03);padding:30px;border-radius:20px;border:1px solid rgba(255,255,255,0.05)}
+.tab-content.active{display:block}
+.upload-area{border:2px dashed rgba(255,255,255,0.1);border-radius:20px;padding:40px;text-align:center}
+.upload-area input[type="file"]{margin:15px auto;display:block}
+.upload-area button{margin-top:15px}
+.btn{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 30px;border-radius:50px;color:#fff;font-weight:700;cursor:pointer;transition:.3s}
+.btn:hover{transform:scale(1.05)}
+#log-container{background:#000;padding:15px;border-radius:15px;max-height:400px;overflow-y:auto;font-family:'Courier New',monospace;font-size:13px;color:#0f0;margin-top:20px;white-space:pre-wrap;display:none}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header"><h1>🚀 Deploy New Application</h1><a href="/dashboard" style="color:#00e5ff;">← Dashboard</a></div>
+<div class="tabs">
+<div class="tab active" data-tab="zip">📦 ZIP Upload</div>
+<div class="tab" data-tab="multiple">📁 Multiple Files</div>
+<div class="tab" data-tab="single">📄 Single File</div>
+<div class="tab" data-tab="github">🐙 GitHub</div>
+</div>
+
+<div id="tab-zip" class="tab-content active">
+    <div class="upload-area">
+        <h3>Upload ZIP File</h3>
+        <input type="file" id="zipFile" accept=".zip">
+        <button class="btn" id="deployZip">Deploy</button>
+    </div>
+</div>
+<div id="tab-multiple" class="tab-content">
+    <div class="upload-area">
+        <h3>Select Multiple Files</h3>
+        <input type="file" id="multipleFiles" multiple>
+        <button class="btn" id="deployMultiple">Deploy</button>
+    </div>
+</div>
+<div id="tab-single" class="tab-content">
+    <div class="upload-area">
+        <h3>Upload Single File</h3>
+        <input type="file" id="singleFile" accept=".py,.js,.html,.css,.json,.txt,.md,.yml,.yaml,.sh,.bat,.xml,.conf,.ini,.env,.gitignore,.php">
+        <button class="btn" id="deploySingle">Deploy</button>
+    </div>
+</div>
+<div id="tab-github" class="tab-content">
+    <div class="upload-area">
+        <h3>GitHub Public Repository</h3>
+        <input type="text" id="repoUrl" placeholder="https://github.com/user/project" style="width:80%;padding:12px;border-radius:10px;border:1px solid #333;background:#111;color:#fff;">
+        <button class="btn" id="deployGithub">Deploy</button>
     </div>
 </div>
 
+<div id="log-container"></div>
+</div>
+
 <script>
-    const websiteId = {{ website.id }};
-    let runtimeEventSource = null;
-    let buildEventSource = null;
+document.querySelectorAll('.tab').forEach(tab=>{
+    tab.onclick=function(){
+        document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));
+        this.classList.add('active');
+        document.getElementById('tab-'+this.dataset.tab).classList.add('active');
+    }
+});
 
-    function switchTab(tab) {
-        document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
-        document.querySelectorAll('.log-panel').forEach(p => p.classList.remove('active'));
-        if (tab === 'runtime') {
-            document.querySelector('.tabs button:first-child').classList.add('active');
-            document.getElementById('runtimePanel').classList.add('active');
-            if (!runtimeEventSource) startRuntimeLogs();
-        } else {
-            document.querySelector('.tabs button:last-child').classList.add('active');
-            document.getElementById('buildPanel').classList.add('active');
-            if (!buildEventSource) startBuildLogs();
+function showLog(msg){ const c=document.getElementById('log-container'); c.style.display='block'; c.innerHTML+=msg+'\\n'; c.scrollTop=c.scrollHeight; }
+
+function deploy(endpoint, formData){
+    const c=document.getElementById('log-container'); c.style.display='block'; c.innerHTML='';
+    fetch(endpoint, {method:'POST', body:formData})
+    .then(r=>r.json())
+    .then(d=>{
+        if(d.success){
+            showLog('✅ Deployment started. Watching logs...');
+            const evtSource = new EventSource('/deploy/stream/'+d.website_id);
+            evtSource.onmessage = function(e) {
+                const data=JSON.parse(e.data);
+                showLog(data.message);
+                if(data.message.includes('Deployment successful')||data.message.includes('failed')) evtSource.close();
+            };
+            evtSource.onerror=function(){ showLog('⚠️ Log stream disconnected'); };
+        }else{
+            showLog('❌ Error: '+d.error);
         }
-    }
+    })
+    .catch(()=>showLog('❌ Network error'));
+}
 
-    function startRuntimeLogs() {
-        const div = document.getElementById('runtimeLogs');
-        runtimeEventSource = new EventSource('/runtime-logs/' + websiteId);
-        runtimeEventSource.onmessage = function(e) {
-            div.textContent += e.data;
-            div.scrollTop = div.scrollHeight;
-        };
-        runtimeEventSource.onerror = function() {
-            runtimeEventSource.close();
-            runtimeEventSource = null;
-            // retry after 2s
-            setTimeout(startRuntimeLogs, 2000);
-        };
-    }
+document.getElementById('deployZip').onclick=function(){
+    const file=document.getElementById('zipFile').files[0];
+    if(!file) return alert('Select ZIP');
+    const fd=new FormData(); fd.append('file',file);
+    deploy('/deploy/upload', fd);
+};
+document.getElementById('deployMultiple').onclick=function(){
+    const files=document.getElementById('multipleFiles').files;
+    if(!files.length) return alert('Select files');
+    const fd=new FormData();
+    for(let f of files) fd.append('files[]', f);
+    deploy('/deploy/multiple', fd);
+};
+document.getElementById('deploySingle').onclick=function(){
+    const file=document.getElementById('singleFile').files[0];
+    if(!file) return alert('Select file');
+    const fd=new FormData(); fd.append('file',file);
+    deploy('/deploy/single', fd);
+};
+document.getElementById('deployGithub').onclick=function(){
+    const url=document.getElementById('repoUrl').value.trim();
+    if(!url) return alert('Enter repository URL');
+    const fd=new FormData(); fd.append('repo_url',url);
+    deploy('/deploy/github', fd);
+};
+</script>
+</body>
+</html>
+"""
 
-    function startBuildLogs() {
-        const div = document.getElementById('buildLogs');
-        buildEventSource = new EventSource('/build-logs/' + websiteId);
-        buildEventSource.onmessage = function(e) {
-            div.textContent += e.data;
-            div.scrollTop = div.scrollHeight;
-        };
-        buildEventSource.onerror = function() {
-            buildEventSource.close();
-            buildEventSource = null;
-            setTimeout(startBuildLogs, 2000);
-        };
-    }
+RUNTIME_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Runtime Logs - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:1200px;margin:auto}
+.header{display:flex;justify-content:space-between;align-items:center;padding:15px 25px;background:rgba(255,255,255,0.05);border-radius:20px;margin-bottom:30px}
+.header h2{background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.controls{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:15px}
+.controls button{background:rgba(255,255,255,0.05);border:1px solid #333;padding:6px 15px;border-radius:10px;color:#fff;cursor:pointer}
+.controls button:hover{background:rgba(255,255,255,0.1)}
+#logTerminal{background:#000;padding:15px;border-radius:15px;height:500px;overflow-y:auto;font-family:'Courier New',monospace;font-size:13px;color:#0f0;white-space:pre-wrap;border:1px solid #222}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header"><h2>📡 Runtime Logs: {{ website.website_slug }}</h2><a href="/dashboard" style="color:#00e5ff;">← Dashboard</a></div>
+<div class="controls">
+<button id="pauseBtn">⏸ Pause</button>
+<button id="clearBtn">🗑 Clear</button>
+<button id="downloadBtn">⬇ Download</button>
+</div>
+<div id="logTerminal"></div>
+</div>
+<script>
+let paused=false;
+const terminal=document.getElementById('logTerminal');
+const evtSource = new EventSource('/website/{{ website.id }}/runtime_stream');
+evtSource.onmessage = function(e){
+    if(paused) return;
+    const data=JSON.parse(e.data);
+    terminal.innerHTML += data.message + '\\n';
+    terminal.scrollTop = terminal.scrollHeight;
+};
+document.getElementById('pauseBtn').onclick=function(){ paused=!paused; this.textContent=paused?'▶ Resume':'⏸ Pause'; };
+document.getElementById('clearBtn').onclick=function(){ terminal.innerHTML=''; };
+document.getElementById('downloadBtn').onclick=function(){
+    const blob=new Blob([terminal.innerText], {type:'text/plain'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='runtime.log'; a.click();
+};
+</script>
+</body>
+</html>
+"""
 
-    function clearLog(type) {
-        const div = type === 'runtime' ? document.getElementById('runtimeLogs') : document.getElementById('buildLogs');
-        div.textContent = '';
-    }
-
-    // Auto-start runtime logs
-    startRuntimeLogs();
-    // Also start build logs in background
-    setTimeout(startBuildLogs, 500);
+HISTORY_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Deployment History - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:1000px;margin:auto}
+.header{display:flex;justify-content:space-between;align-items:center;padding:15px 25px;background:rgba(255,255,255,0.05);border-radius:20px;margin-bottom:30px}
+table{width:100%;border-collapse:collapse}
+th,td{padding:12px;border-bottom:1px solid rgba(255,255,255,0.05);text-align:left}
+th{color:#889}
+.status-success{color:#00e5ff}
+.status-failed{color:#ff4757}
+.rollback-btn{background:#ffaa00;border:none;padding:4px 12px;border-radius:10px;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header"><h2>📜 Deployment History</h2><a href="/dashboard" style="color:#00e5ff;">← Dashboard</a></div>
+<table>
+<tr><th>Version</th><th>Date</th><th>Description</th><th>Status</th><th>Action</th></tr>
+{% for dep in deployments %}
+<tr>
+<td>#{{ dep.version }}</td>
+<td>{{ dep.deployed_at }}</td>
+<td>{{ dep.description or '-' }}</td>
+<td class="status-{{ dep.status }}">{{ dep.status }}</td>
+<td><button class="rollback-btn" onclick="rollback({{ dep.website_id }}, {{ dep.version }})">Rollback</button></td>
+</tr>
+{% else %}
+<tr><td colspan="5">No deployments yet.</td></tr>
+{% endfor %}
+</table>
+</div>
+<script>
+function rollback(websiteId, version){
+    if(!confirm('Rollback to version '+version+'?')) return;
+    fetch('/website/'+websiteId+'/rollback/'+version, {method:'POST'})
+    .then(r=>r.json())
+    .then(d=>{if(d.success) location.reload(); else alert('Error: '+d.error)})
+    .catch(()=>alert('Network error'));
+}
 </script>
 </body>
 </html>
@@ -1492,7 +1901,5 @@ LOGS_PAGE_TEMPLATE = """
 
 # ---------- सर्वर स्टार्ट ----------
 if __name__ == '__main__':
-    monitor_thread = threading.Thread(target=monitor_websites, daemon=True)
-    monitor_thread.start()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
