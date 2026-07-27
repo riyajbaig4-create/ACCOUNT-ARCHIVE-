@@ -235,6 +235,24 @@ def find_startup_file(folder):
             return f, 'static'
     return None, None
 
+def load_env_file(folder):
+    """Read .env file from folder and return dict of env vars."""
+    env_path = os.path.join(folder, '.env')
+    env_dict = {}
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        env_dict[key.strip()] = value.strip()
+        except:
+            pass
+    return env_dict
+
 def install_requirements(folder, website_id, log_file=None):
     req_file = os.path.join(folder, 'requirements.txt')
     if not os.path.exists(req_file):
@@ -295,7 +313,6 @@ def health_check(port, timeout=5):
         return False, str(e)
 
 def start_website_process(website_id, log_callback=None):
-    """Start website and send build logs via callback."""
     website = get_website_by_id(website_id)
     if not website:
         return False, "Website not found", []
@@ -361,9 +378,16 @@ def start_website_process(website_id, log_callback=None):
     port = get_next_available_port()
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
     
+    # Base environment
     env = os.environ.copy()
     env['PORT'] = str(port)
     env['PYTHONUNBUFFERED'] = '1'
+    
+    # Load .env file if present
+    dotenv_vars = load_env_file(folder)
+    env.update(dotenv_vars)
+    
+    # DB env vars (from button) override .env
     if website['env_vars']:
         try:
             extra_env = json.loads(website['env_vars'])
@@ -428,7 +452,6 @@ def stop_website_process(website_id):
     return True, "Stopped"
 
 def clone_github_repo(repo_url, branch, target_folder, log_callback=None):
-    """Clone repo and call log_callback with each line of output."""
     logs = []
     def log(msg):
         logs.append(msg)
@@ -536,6 +559,36 @@ def index():
     if 'user_id' in session:
         return redirect(url_for('dashboard'))
     return render_template_string(LOGIN_TEMPLATE)
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    """JSON login API for frontend (used by JavaScript)"""
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Invalid request'}), 400
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    
+    if not username or not password:
+        return jsonify({'error': 'Username and password required'}), 400
+    
+    user = get_user_by_username(username)
+    if not user or not check_password_hash(user['password_hash'], password):
+        return jsonify({'error': 'Invalid credentials'}), 401
+    
+    if user['status'] != 'active':
+        return jsonify({'error': 'Account disabled'}), 403
+    
+    session['user_id'] = user['id']
+    session['username'] = user['username']
+    session['role'] = user['role']
+    session['plan'] = user['plan']
+    
+    return jsonify({
+        'success': True,
+        'username': user['username'],
+        'role': user['role']
+    })
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
@@ -1063,21 +1116,52 @@ def env_vars(website_id):
                 env_dict = json.loads(website['env_vars'])
             except:
                 pass
-        return render_template_string(ENV_TEMPLATE, website=website, env=env_dict)
+        env_text = '\n'.join([f"{k}={v}" for k, v in env_dict.items()])
+        return render_template_string(ENV_TEMPLATE, website=website, env_text=env_text)
     else:
-        env_raw = request.form.get('env', '')
-        try:
-            env_dict = json.loads(env_raw)
+        env_raw = request.form.get('env', '').strip()
+        if not env_raw:
             with get_db() as conn:
-                conn.execute('UPDATE websites SET env_vars = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-                             (json.dumps(env_dict), website_id))
+                conn.execute('UPDATE websites SET env_vars = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?', (website_id,))
                 conn.commit()
-            log_website(website_id, "Updated environment variables")
+            log_website(website_id, "Cleared environment variables")
             return jsonify({'success': True})
-        except json.JSONDecodeError:
-            return jsonify({'success': False, 'error': 'Invalid JSON format'}), 400
+        
+        env_dict = {}
+        lines = env_raw.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' not in line:
+                return jsonify({'success': False, 'error': f'Invalid line: {line} (must contain =)'}), 400
+            key, value = line.split('=', 1)
+            key = key.strip()
+            if not key:
+                return jsonify({'success': False, 'error': 'Empty key not allowed'}), 400
+            env_dict[key] = value.strip()
+        
+        with get_db() as conn:
+            conn.execute('UPDATE websites SET env_vars = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                         (json.dumps(env_dict), website_id))
+            conn.commit()
+        log_website(website_id, f"Updated environment variables: {list(env_dict.keys())}")
+        
+        # Auto-restart if website is running
+        if website['status'] == 'running':
+            stop_website_process(website_id)
+            time.sleep(1)
+            ok, msg, logs = start_website_process(website_id)
+            if ok:
+                return jsonify({'success': True, 'restarted': True})
+            else:
+                return jsonify({'success': False, 'error': f'Env saved but restart failed: {msg}'}), 500
+        else:
+            return jsonify({'success': True, 'restarted': False})
 
 # ---------- टेम्प्लेट्स ----------
+# (सभी टेम्प्लेट्स पहले की तरह ही हैं, बस ENV_TEMPLATE को KEY=VALUE फॉर्मेट में बदला गया है)
+
 ERROR_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1518,27 +1602,29 @@ body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20p
 .container{max-width:800px;margin:auto}
 .back{color:#00e5ff;text-decoration:none;font-weight:600}
 h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-textarea{width:100%;height:200px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;padding:15px;font-family:monospace;outline:none}
+textarea{width:100%;height:200px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;padding:15px;font-family:monospace;outline:none;font-size:14px}
 textarea:focus{border-color:#00e5ff}
-.btns{display:flex;gap:12px;margin-top:15px}
+.btns{display:flex;gap:12px;margin-top:15px;flex-wrap:wrap}
 .save{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 30px;border-radius:50px;color:#fff;font-weight:700;cursor:pointer}
 .save:hover{transform:scale(1.05)}
 .cancel{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);padding:12px 30px;border-radius:50px;color:#aaa;text-decoration:none}
+.note{color:#888;font-size:0.8rem;margin-top:10px;border-top:1px solid rgba(255,255,255,0.05);padding-top:10px}
 </style>
 </head>
 <body>
 <div class="container">
 <a href="/dashboard" class="back">← Dashboard</a>
 <h2>🔑 Environment Variables – {{ website.website_name or website.website_slug }}</h2>
-<p style="color:#889;margin-bottom:15px;">Enter JSON format: {"KEY":"VALUE", "ANOTHER":"123"}</p>
+<p style="color:#889;margin-bottom:10px;">Enter each variable on a new line: <code>KEY=VALUE</code></p>
 <form id="envForm">
-<textarea id="envText" name="env">{{ env|tojson|safe if env else '{}' }}</textarea>
+<textarea id="envText" name="env" rows="8">{{ env_text }}</textarea>
 <div class="btns">
-<button type="submit" class="save">💾 Save</button>
+<button type="submit" class="save">💾 Save &amp; Restart (if running)</button>
 <a href="/dashboard" class="cancel">Cancel</a>
 </div>
 </form>
 <div id="msg" style="margin-top:10px;"></div>
+<div class="note">💡 Changes will take effect immediately by restarting the website.</div>
 </div>
 <script>
 document.getElementById('envForm').onsubmit = function(e){
@@ -1550,7 +1636,14 @@ headers:{'Content-Type':'application/x-www-form-urlencoded'},
 body:'env='+encodeURIComponent(val)
 })
 .then(r=>r.json())
-.then(d=>{if(d.success){document.getElementById('msg').innerHTML='✅ Saved!';}else{document.getElementById('msg').innerHTML='❌ '+d.error;}})
+.then(d=>{
+if(d.success){
+document.getElementById('msg').innerHTML='✅ Saved and restarted!';
+setTimeout(()=>location.reload(), 1500);
+} else {
+document.getElementById('msg').innerHTML='❌ '+d.error;
+}
+})
 .catch(()=>document.getElementById('msg').innerHTML='❌ Network error');
 };
 </script>
