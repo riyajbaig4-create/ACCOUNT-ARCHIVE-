@@ -228,13 +228,44 @@ def extract_zip(zip_path, extract_to):
     except Exception as e:
         return False, f"Extraction failed: {str(e)}"
 
-# ---------- Startup Detection ----------
+# ---------- Framework Detection & Startup Command ----------
 def find_startup_file(folder):
     for filename in STARTUP_PRIORITY:
         if os.path.exists(os.path.join(folder, filename)):
             return filename
     return None
 
+def detect_framework_and_get_cmd(folder, port):
+    """Return (cmd, framework) to start the app with proper host/port."""
+    # Check for Flask app (app.py, main.py, etc.) and if it contains Flask or app.run
+    flask_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
+    for f in flask_files:
+        path = os.path.join(folder, f)
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as fh:
+                    content = fh.read()
+                    if 'Flask' in content or 'app.run' in content:
+                        # Use flask run if FLASK_APP is set
+                        return [sys.executable, '-m', 'flask', 'run', '--host=0.0.0.0', '--port='+str(port)], 'flask'
+            except:
+                pass
+    # Django
+    if os.path.exists(os.path.join(folder, 'manage.py')):
+        return [sys.executable, 'manage.py', 'runserver', f'0.0.0.0:{port}'], 'django'
+    # FastAPI / Uvicorn
+    if os.path.exists(os.path.join(folder, 'asgi.py')):
+        return ['uvicorn', 'asgi:application', '--host', '0.0.0.0', '--port', str(port)], 'fastapi'
+    # Default: try to run with python and hope it uses PORT env
+    startup = find_startup_file(folder)
+    if startup:
+        return [sys.executable, startup], 'python'
+    # Static
+    if os.path.exists(os.path.join(folder, 'index.html')):
+        return [sys.executable, '-m', 'http.server', str(port)], 'static'
+    return None, None
+
+# ---------- Install Requirements with Logging ----------
 def install_requirements(folder, website_id, log_callback=None):
     req_file = os.path.join(folder, 'requirements.txt')
     if not os.path.exists(req_file):
@@ -248,15 +279,12 @@ def install_requirements(folder, website_id, log_callback=None):
         if log_callback:
             log_callback("PIP", f"Running: {' '.join(cmd)}")
         with open(log_file, 'w') as f:
-            proc = subprocess.Popen(cmd, cwd=folder, stdout=f, stderr=subprocess.STDOUT)
-            # Also capture and log via callback
-            while True:
-                line = proc.stdout.readline() if proc.stdout else None
-                if line:
+            proc = subprocess.Popen(cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in iter(proc.stdout.readline, ''):
+                if line.strip():
                     if log_callback:
                         log_callback("PIP", line.strip())
-                if proc.poll() is not None:
-                    break
+                    f.write(line)
             proc.wait()
         if proc.returncode != 0:
             with open(log_file, 'r') as f:
@@ -272,21 +300,30 @@ def install_requirements(folder, website_id, log_callback=None):
             log_callback("ERROR", f"Installation error: {str(e)}")
         return False, f"Installation error: {str(e)}"
 
-def health_check(port, timeout=5):
-    try:
-        response = requests.get(f"http://localhost:{port}", timeout=timeout)
-        if response.status_code < 500:
-            return True, "OK"
-        else:
-            return False, f"HTTP {response.status_code}"
-    except requests.exceptions.ConnectionError:
-        return False, "Connection refused"
-    except requests.exceptions.Timeout:
-        return False, "Timeout"
-    except Exception as e:
-        return False, str(e)
+# ---------- Health Check with Retry ----------
+def health_check_with_retry(port, max_retries=5, delay=2):
+    for i in range(max_retries):
+        try:
+            response = requests.get(f"http://localhost:{port}", timeout=3)
+            if response.status_code < 500:
+                return True, "OK"
+            else:
+                return False, f"HTTP {response.status_code}"
+        except requests.exceptions.ConnectionError:
+            if i < max_retries - 1:
+                time.sleep(delay)
+            else:
+                return False, "Connection refused (after retries)"
+        except requests.exceptions.Timeout:
+            if i < max_retries - 1:
+                time.sleep(delay)
+            else:
+                return False, "Timeout"
+        except Exception as e:
+            return False, str(e)
+    return False, "Health check failed"
 
-# ---------- Process Management ----------
+# ---------- Start Process with PIPE Logging ----------
 def start_website_process(website_id, log_callback=None):
     website = get_website_by_id(website_id)
     if not website:
@@ -298,63 +335,103 @@ def start_website_process(website_id, log_callback=None):
         update_website_status(website_id, 'failed')
         return False, "Folder not found"
     
-    startup = find_startup_file(folder)
-    is_static = False
-    
-    if not startup:
-        if os.path.exists(os.path.join(folder, 'index.html')):
-            is_static = True
+    # Detect framework and get command
+    port = get_next_available_port()
+    cmd, framework = detect_framework_and_get_cmd(folder, port)
+    if not cmd:
+        # Fallback to existing logic
+        startup = find_startup_file(folder)
+        is_static = False
+        if not startup:
+            if os.path.exists(os.path.join(folder, 'index.html')):
+                is_static = True
+                cmd = [sys.executable, '-m', 'http.server', str(port)]
+                framework = 'static'
+            else:
+                log_website(website_id, "No startup file or index.html", 'error')
+                update_website_status(website_id, 'failed')
+                return False, "No startup file detected."
         else:
-            log_website(website_id, "No startup file or index.html", 'error')
-            update_website_status(website_id, 'failed')
-            return False, "No startup file detected. Please upload a valid Python project or static site with index.html."
+            cmd = [sys.executable, startup]
+            framework = 'python'
     
-    if not is_static and startup:
+    # Install requirements if not static and not already done
+    if framework not in ['static', 'http.server']:
+        # check if requirements were already installed, but we can just run install again (it's idempotent)
         success, msg = install_requirements(folder, website_id, log_callback)
         if not success:
             log_website(website_id, f"Requirements failed: {msg}", 'error')
             update_website_status(website_id, 'failed')
             return False, msg
     
-    port = get_next_available_port()
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
-    
     env = os.environ.copy()
     env['PORT'] = str(port)
     env['PYTHONUNBUFFERED'] = '1'
-    
-    if is_static:
-        cmd = [sys.executable, '-m', 'http.server', str(port)]
-    else:
-        cmd = [sys.executable, startup]
+    # For Flask run, set FLASK_APP if app.py is present
+    if framework == 'flask':
+        if os.path.exists(os.path.join(folder, 'app.py')):
+            env['FLASK_APP'] = 'app.py'
+        elif os.path.exists(os.path.join(folder, 'main.py')):
+            env['FLASK_APP'] = 'main.py'
     
     if log_callback:
-        log_callback("STARTUP", f"Starting: {' '.join(cmd)} on port {port}")
+        log_callback("STARTUP", f"Starting: {' '.join(cmd)} on port {port} (framework: {framework})")
     
     try:
+        # Open log file for writing (append)
+        f_log = open(log_file, 'a')
+        # Use PIPE to capture output
         if os.name == 'nt':
             proc = subprocess.Popen(cmd, cwd=folder, env=env,
-                                    stdout=open(log_file, 'a'), stderr=subprocess.STDOUT,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
         else:
             proc = subprocess.Popen(cmd, cwd=folder, env=env,
-                                    stdout=open(log_file, 'a'), stderr=subprocess.STDOUT,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     preexec_fn=os.setsid)
         
-        time.sleep(2)
-        healthy, health_msg = health_check(port, timeout=5)
+        # Thread to read and log output
+        def read_output():
+            for line in iter(proc.stdout.readline, b''):
+                if line:
+                    decoded = line.decode('utf-8', errors='replace')
+                    f_log.write(decoded)
+                    f_log.flush()
+                    if log_callback:
+                        log_callback("PROCESS", decoded.strip())
+            f_log.close()
         
+        thread = threading.Thread(target=read_output)
+        thread.daemon = True
+        thread.start()
+        
+        # Wait a bit, check if process still alive
+        time.sleep(2)
+        if proc.poll() is not None:
+            # Process died quickly
+            with open(log_file, 'r') as f:
+                error_lines = f.read()[-500:]
+            update_website_status(website_id, 'failed')
+            log_website(website_id, f"Process crashed immediately: {error_lines}", 'error')
+            if log_callback:
+                log_callback("ERROR", f"Process crashed: {error_lines}")
+            return False, f"Process crashed: {error_lines}"
+        
+        # Health check with retry
+        healthy, health_msg = health_check_with_retry(port, max_retries=5, delay=2)
         if healthy:
             update_website_status(website_id, 'running', proc.pid, port)
             log_website(website_id, f"Started on port {port} (PID {proc.pid})")
             with get_db() as conn:
                 conn.execute('UPDATE websites SET startup_file = ?, last_started = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-                             (startup if startup else 'static', website_id))
+                             (cmd[0] if not framework.startswith('python') else 'app', website_id))
                 conn.commit()
             if log_callback:
                 log_callback("SUCCESS", f"Application running on port {port}")
             return True, f"Running on port {port}"
         else:
+            # Health check failed - stop process
             try:
                 if os.name == 'nt':
                     subprocess.run(['taskkill', '/PID', str(proc.pid), '/F'], capture_output=True)
@@ -363,11 +440,19 @@ def start_website_process(website_id, log_callback=None):
             except:
                 pass
             update_website_status(website_id, 'crashed')
+            # Read last lines of log for error
+            error_log = ""
+            if os.path.exists(log_file):
+                with open(log_file, 'r') as f:
+                    lines = f.readlines()
+                    error_log = ''.join(lines[-20:]) if lines else ""
             log_website(website_id, f"Health check failed: {health_msg}", 'error')
             if log_callback:
                 log_callback("ERROR", f"Health check failed: {health_msg}")
-            return False, f"Health check failed: {health_msg}"
-            
+                if error_log:
+                    log_callback("ERROR", f"Last log lines:\n{error_log}")
+            return False, f"Health check failed: {health_msg}\n{error_log}"
+    
     except Exception as e:
         log_website(website_id, f"Start error: {str(e)}", 'error')
         update_website_status(website_id, 'failed')
@@ -375,6 +460,7 @@ def start_website_process(website_id, log_callback=None):
             log_callback("ERROR", f"Start error: {str(e)}")
         return False, str(e)
 
+# ---------- Stop Process ----------
 def stop_website_process(website_id):
     website = get_website_by_id(website_id)
     if not website:
@@ -398,7 +484,7 @@ def stop_website_process(website_id):
     log_website(website_id, f"Stopped (PID {pid})")
     return True, "Stopped"
 
-# ---------- Deployment Core (for ZIP & GitHub) ----------
+# ---------- Deployment Core (ZIP & GitHub) ----------
 def write_log_step(log_file, step, message):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] [{step}] {message}\n"
@@ -407,12 +493,10 @@ def write_log_step(log_file, step, message):
     return line
 
 def deploy_zip(website_id, extra_files=None):
-    """Deploy a ZIP-based website with logs."""
     website = get_website_by_id(website_id)
     if not website:
         return
     
-    # Create deployment record
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO deployments (website_id, repo_url, branch, status, started_at)
                               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)''',
@@ -455,7 +539,6 @@ def deploy_zip(website_id, extra_files=None):
         os.remove(zip_path)
         log_cb("SUCCESS", "ZIP extracted successfully")
         
-        # Copy extra files if any
         if extra_files:
             log_cb("SYSTEM", "Copying extra files...")
             for (filename, content) in extra_files:
@@ -464,14 +547,12 @@ def deploy_zip(website_id, extra_files=None):
                     f.write(content)
                 log_cb("FILE", f"Added {filename}")
         
-        # Update website size
         size_used = calculate_folder_size(folder)
         with get_db() as conn:
             conn.execute('UPDATE websites SET storage_used = ?, website_size = ? WHERE id = ?',
                          (size_used, size_used, website_id))
             conn.commit()
         
-        # Now start the application (which will install requirements)
         log_cb("SYSTEM", "==> Starting application...")
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('starting', deployment_id))
@@ -499,7 +580,6 @@ def deploy_zip(website_id, extra_files=None):
             conn.commit()
 
 def deploy_github(website_id, repo_url, branch):
-    """GitHub deployment with logs."""
     website = get_website_by_id(website_id)
     if not website:
         return
@@ -533,7 +613,8 @@ def deploy_github(website_id, repo_url, branch):
         clone_cmd = ['git', 'clone', '--depth', '1', '--branch', branch, repo_url, folder]
         proc = subprocess.Popen(clone_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         for line in iter(proc.stdout.readline, ''):
-            log_cb("GIT", line.strip())
+            if line.strip():
+                log_cb("GIT", line.strip())
         proc.wait()
         if proc.returncode != 0:
             log_cb("ERROR", f"Clone failed with code {proc.returncode}")
@@ -566,11 +647,11 @@ def deploy_github(website_id, repo_url, branch):
                 conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('installing', deployment_id))
                 conn.commit()
             
-            # Install with pip and capture output
             pip_cmd = [sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt']
             proc = subprocess.Popen(pip_cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             for line in iter(proc.stdout.readline, ''):
-                log_cb("PIP", line.strip())
+                if line.strip():
+                    log_cb("PIP", line.strip())
             proc.wait()
             if proc.returncode != 0:
                 log_cb("ERROR", f"Pip install failed with code {proc.returncode}")
@@ -583,37 +664,15 @@ def deploy_github(website_id, repo_url, branch):
         else:
             log_cb("SYSTEM", "No requirements.txt found – skipping")
         
-        log_cb("SYSTEM", "==> Detect Startup File...")
-        startup = find_startup_file(folder)
-        if startup:
-            log_cb("STARTUP", f"Found startup file: {startup}")
-        else:
-            if os.path.exists(os.path.join(folder, 'index.html')):
-                log_cb("STARTUP", "Static site detected (index.html)")
-                startup = 'static'
-            else:
-                log_cb("ERROR", "No startup file found")
-                with get_db() as conn:
-                    conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
-                                 ('failed', deployment_id))
-                    conn.commit()
-                return
-        
-        log_cb("SYSTEM", "==> Allocating Port...")
-        port = get_next_available_port()
-        log_cb("PORT", f"Port {port} allocated")
-        
-        log_cb("SYSTEM", "==> Starting Application...")
+        log_cb("SYSTEM", "==> Starting application...")
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('starting', deployment_id))
             conn.commit()
-        
         with get_db() as conn:
             conn.execute('UPDATE websites SET repo_url = ?, branch = ?, deployment_type = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                          (repo_url, branch, 'github', 'starting', website_id))
             conn.commit()
         
-        # Use start_website_process with logging
         ok, msg = start_website_process(website_id, log_cb)
         if ok:
             with get_db() as conn:
@@ -642,19 +701,15 @@ def proxy_website(slug, path):
     website = get_website_by_slug(slug)
     if not website:
         return render_template_string(ERROR_TEMPLATE, message="Website not found", slug=slug), 404
-    
     if website['status'] != 'running':
         return render_template_string(ERROR_TEMPLATE, 
                                       message="This website is not running. Please start it from the dashboard.",
                                       slug=slug), 503
-    
     port = website['allocated_port']
     if not port:
         return "Port not allocated", 500
-    
     target_url = f"http://localhost:{port}/{path}"
     headers = {key: value for key, value in request.headers if key.lower() != 'host'}
-    
     try:
         resp = requests.request(
             method=request.method,
@@ -691,17 +746,13 @@ def index():
 def register():
     if request.method == 'GET':
         return render_template_string(REGISTER_TEMPLATE)
-    
     username = request.form.get('username', '').strip()
     email = request.form.get('email', '').strip()
     password = request.form.get('password', '').strip()
-    
     if not username or not email or not password:
         return render_template_string(REGISTER_TEMPLATE, error='All fields required')
-    
     if get_user_by_username(username):
         return render_template_string(REGISTER_TEMPLATE, error='Username already taken')
-    
     with get_db() as conn:
         try:
             conn.execute('INSERT INTO users (username, email, password_hash, role, plan) VALUES (?, ?, ?, ?, ?)',
@@ -709,7 +760,6 @@ def register():
             conn.commit()
         except sqlite3.IntegrityError:
             return render_template_string(REGISTER_TEMPLATE, error='Email or username already exists')
-    
     log_activity(None, 'register', f'User {username} registered')
     return redirect(url_for('index'))
 
@@ -717,27 +767,21 @@ def register():
 def login():
     username = request.form.get('username', '').strip()
     password = request.form.get('password', '').strip()
-    
     if not username or not password:
         return render_template_string(LOGIN_TEMPLATE, error='Please fill all fields')
-    
     user = get_user_by_username(username)
     if not user or not check_password_hash(user['password_hash'], password):
         return render_template_string(LOGIN_TEMPLATE, error='Invalid credentials')
-    
     if user['status'] != 'active':
         return render_template_string(LOGIN_TEMPLATE, error='Account is disabled')
-    
     session['user_id'] = user['id']
     session['username'] = user['username']
     session['role'] = user['role']
     session['plan'] = user['plan']
-    
     with get_db() as conn:
         conn.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                      (user['id'],))
         conn.commit()
-    
     log_activity(user['id'], 'login', 'User logged in')
     return redirect(url_for('dashboard'))
 
@@ -752,7 +796,6 @@ def logout():
 def dashboard():
     if 'user_id' not in session:
         return redirect(url_for('index'))
-    
     rows = get_websites_by_user(session['user_id'])
     base_url = os.environ.get('BASE_URL', request.host_url.rstrip('/'))
     websites = []
@@ -760,7 +803,6 @@ def dashboard():
         site = dict(w)
         site['url'] = f"{base_url}/{site['website_slug']}/"
         websites.append(site)
-    
     user = get_user_by_id(session['user_id'])
     return render_template_string(DASHBOARD_TEMPLATE, 
                                   user=session['username'], 
@@ -770,12 +812,11 @@ def dashboard():
                                   base_url=base_url,
                                   user_obj=user)
 
-# ---------- Enhanced Upload (ZIP + extra files) ----------
+# ---------- Upload (ZIP + extra files) ----------
 @app.route('/upload', methods=['POST'])
 def upload_website():
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Not logged in'}), 401
-    
     user_id = session['user_id']
     user = get_user_by_id(user_id)
     if user['status'] != 'active':
@@ -783,12 +824,10 @@ def upload_website():
     
     if 'files[]' not in request.files:
         return jsonify({'success': False, 'error': 'No files uploaded'}), 400
-    
     files = request.files.getlist('files[]')
     if not files or all(f.filename == '' for f in files):
         return jsonify({'success': False, 'error': 'No valid files'}), 400
     
-    # Separate zip and extra files
     zip_file = None
     extra_files = []
     for f in files:
@@ -796,11 +835,9 @@ def upload_website():
             zip_file = f
         else:
             extra_files.append(f)
-    
     if not zip_file:
         return jsonify({'success': False, 'error': 'A ZIP file is required'}), 400
     
-    # Create website entry
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
     slug = generate_website_slug(session['username'], count)
@@ -822,7 +859,6 @@ def upload_website():
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': 'Permission denied'}), 500
     
-    # Save zip
     zip_path = os.path.join(folder, 'upload.zip')
     try:
         zip_file.save(zip_path)
@@ -830,20 +866,17 @@ def upload_website():
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': f'Failed to save zip: {str(e)}'}), 500
     
-    # Validate zip
     valid, msg = validate_zip(zip_path)
     if not valid:
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': msg}), 400
     
-    # Save extra files as binary data for later copying
     extra_data = []
     for f in extra_files:
         f.seek(0)
         data = f.read()
         extra_data.append((f.filename, data))
     
-    # Start deployment in background
     def bg_deploy():
         deploy_zip(website_id, extra_data)
     
@@ -854,21 +887,17 @@ def upload_website():
     log_website(website_id, f"Uploaded: {zip_file.filename} + {len(extra_files)} extra files")
     log_activity(user_id, 'upload', f'Uploaded {zip_file.filename}', request.remote_addr)
     
-    # Return website_id and slug so frontend can redirect to logs
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
-# ---------- GitHub Deploy Route ----------
+# ---------- GitHub Deploy ----------
 @app.route('/github_deploy', methods=['POST'])
 def github_deploy():
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Not logged in'}), 401
-    
     repo_url = request.form.get('repo_url', '').strip()
     branch = request.form.get('branch', 'main').strip()
-    
     if not repo_url:
         return jsonify({'success': False, 'error': 'Repository URL is required'}), 400
-    
     user_id = session['user_id']
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
@@ -876,42 +905,43 @@ def github_deploy():
     if get_website_by_slug(slug):
         count += 1
         slug = generate_website_slug(session['username'], count)
-    
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, deployment_type, repo_url, branch)
                               VALUES (?, ?, ?, ?, ?, ?, ?)''',
                            (user_id, slug, f"website_{0}", 'queued', 'github', repo_url, branch))
         website_id = cur.lastrowid
         conn.commit()
-    
     def bg_deploy():
         deploy_github(website_id, repo_url, branch)
-    
     thread = threading.Thread(target=bg_deploy)
     thread.daemon = True
     thread.start()
-    
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug, 'message': 'Deployment started'})
 
-# ---------- Deployment Logs SSE ----------
-@app.route('/deploy/<int:website_id>/logs')
-def deploy_logs(website_id):
+# ---------- Build Logs Terminal Page ----------
+@app.route('/website/<int:website_id>/build')
+def build_logs_page(website_id):
     if 'user_id' not in session:
-        return "Unauthorized", 401
-    
+        return redirect(url_for('index'))
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
-    
-    # Get latest deployment for this website
+    return render_template_string(BUILD_LOGS_TEMPLATE, website=website)
+
+@app.route('/deploy/<int:website_id>/logs')
+def deploy_logs_sse(website_id):
+    if 'user_id' not in session:
+        return "Unauthorized", 401
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            abort(404)
     with get_db() as conn:
         dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
     if not dep:
         return "No deployment found", 404
-    
     log_file = os.path.join(LOG_FOLDER, f"deploy_{dep['id']}.log")
-    
     def generate():
         if os.path.exists(log_file):
             with open(log_file, 'r') as f:
@@ -929,13 +959,11 @@ def deploy_logs(website_id):
                         for line in new_lines.splitlines():
                             yield f"data: {line}\n\n"
                     last_size = current_size
-            # Check if deployment status is terminal
             with get_db() as conn:
                 dep_status = conn.execute('SELECT status FROM deployments WHERE id = ?', (dep['id'],)).fetchone()
             if dep_status and dep_status['status'] in ('success', 'failed', 'stopped'):
                 yield f"data: [SYSTEM] Deployment completed with status: {dep_status['status']}\n\n"
                 break
-    
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
 # ---------- Website Management Routes ----------
@@ -943,18 +971,14 @@ def deploy_logs(website_id):
 def start_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     if website['status'] in ['running', 'starting']:
         return jsonify({'success': False, 'error': 'Already running'}), 400
-    
     update_website_status(website_id, 'starting')
     ok, msg = start_website_process(website_id)
-    
     if ok:
         return jsonify({'success': True, 'message': msg})
     return jsonify({'success': False, 'error': msg}), 500
@@ -963,15 +987,12 @@ def start_website(website_id):
 def stop_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     if website['status'] not in ['running', 'starting']:
         return jsonify({'success': False, 'error': 'Not running'}), 400
-    
     ok, msg = stop_website_process(website_id)
     if ok:
         return jsonify({'success': True, 'message': msg})
@@ -981,22 +1002,17 @@ def stop_website(website_id):
 def restart_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     with get_db() as conn:
         conn.execute('UPDATE websites SET restart_count = restart_count + 1 WHERE id = ?', (website_id,))
         conn.commit()
-    
     if website['status'] == 'running':
         stop_website_process(website_id)
-    
     update_website_status(website_id, 'starting')
     ok, msg = start_website_process(website_id)
-    
     if ok:
         return jsonify({'success': True, 'message': msg})
     return jsonify({'success': False, 'error': msg}), 500
@@ -1005,29 +1021,23 @@ def restart_website(website_id):
 def delete_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     if website['status'] in ['running', 'starting']:
         stop_website_process(website_id)
-    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     shutil.rmtree(folder, ignore_errors=True)
-    
     for f in [f"website_{website_id}.log", f"website_{website_id}_install.log"]:
         fp = os.path.join(LOG_FOLDER, f)
         if os.path.exists(fp):
             os.remove(fp)
-    
     with get_db() as conn:
         conn.execute('DELETE FROM websites WHERE id = ?', (website_id,))
         conn.execute('DELETE FROM logs WHERE website_id = ?', (website_id,))
         conn.execute('DELETE FROM deployments WHERE website_id = ?', (website_id,))
         conn.commit()
-    
     log_activity(session['user_id'], 'delete', f'Deleted website {website_id}', request.remote_addr)
     return jsonify({'success': True})
 
@@ -1035,23 +1045,19 @@ def delete_website(website_id):
 def change_subdomain(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     new_slug = request.form.get('slug', '').strip()
     if not new_slug or not re.match(r'^[a-zA-Z0-9\-]+$', new_slug):
         return jsonify({'success': False, 'error': 'Invalid slug'}), 400
-    
     with get_db() as conn:
         if conn.execute('SELECT id FROM websites WHERE website_slug = ? AND id != ?', (new_slug, website_id)).fetchone():
             return jsonify({'success': False, 'error': 'Slug already taken'}), 400
         conn.execute('UPDATE websites SET website_slug = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                      (new_slug, website_id))
         conn.commit()
-    
     log_website(website_id, f"Changed slug to {new_slug}")
     return jsonify({'success': True, 'new_slug': new_slug})
 
@@ -1059,39 +1065,32 @@ def change_subdomain(website_id):
 def set_custom_domain(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     domain = request.form.get('domain', '').strip()
     if not domain or not re.match(r'^([a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}$', domain):
         return jsonify({'success': False, 'error': 'Invalid domain'}), 400
-    
     with get_db() as conn:
         conn.execute('UPDATE websites SET custom_domain = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                      (domain, website_id))
         conn.commit()
-    
     log_website(website_id, f"Custom domain set: {domain}")
     return jsonify({'success': True, 'domain': domain})
 
-# ---------- Enhanced File Manager Routes ----------
+# ---------- Enhanced File Manager ----------
 @app.route('/website/<int:website_id>/files')
 def files(website_id):
     if 'user_id' not in session:
         return redirect(url_for('index'))
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
-    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     if not os.path.exists(folder):
         abort(404)
-    
     items = []
     for root, dirs, files_list in os.walk(folder):
         rel = os.path.relpath(root, folder)
@@ -1103,31 +1102,25 @@ def files(website_id):
             items.append({'name': f, 'path': os.path.join(rel, f).replace('\\', '/'), 'is_dir': False, 'size': size})
         for d in dirs:
             items.append({'name': d, 'path': os.path.join(rel, d).replace('\\', '/'), 'is_dir': True})
-    
     return render_template_string(FILES_TEMPLATE, website=website, items=items)
 
 @app.route('/website/<int:website_id>/edit', methods=['GET', 'POST'])
 def edit_file(website_id):
     if 'user_id' not in session:
         return redirect(url_for('index'))
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
-    
     file_path = request.args.get('path', '').strip()
     if not file_path:
         return "No file path", 400
-    
     full = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", file_path)
     if not os.path.exists(full) or not os.path.isfile(full):
         abort(404)
-    
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in {'.py', '.html', '.css', '.js', '.txt', '.json', '.md', '.yml', '.yaml', '.sh', '.bat', '.xml', '.conf'}:
         return "Cannot edit binary files", 403
-    
     if request.method == 'GET':
         with open(full, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
@@ -1139,7 +1132,7 @@ def edit_file(website_id):
         log_website(website_id, f"Edited: {file_path}")
         return redirect(url_for('files', website_id=website_id))
 
-# File Manager API Routes
+# File Manager API
 @app.route('/website/<int:website_id>/file/upload', methods=['POST'])
 def upload_file_to_website(website_id):
     if 'user_id' not in session:
@@ -1148,31 +1141,25 @@ def upload_file_to_website(website_id):
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     if not os.path.exists(folder):
         return jsonify({'success': False, 'error': 'Website folder missing'}), 404
-    
     if 'file' not in request.files:
         return jsonify({'success': False, 'error': 'No file'}), 400
     file = request.files['file']
     if file.filename == '':
         return jsonify({'success': False, 'error': 'Empty filename'}), 400
-    
     rel_path = request.form.get('path', '')
     target_dir = os.path.join(folder, rel_path) if rel_path else folder
     os.makedirs(target_dir, exist_ok=True)
-    
     filename = secure_filename(file.filename)
     save_path = os.path.join(target_dir, filename)
     file.save(save_path)
-    
     size = os.path.getsize(save_path)
     with get_db() as conn:
         conn.execute('UPDATE websites SET storage_used = storage_used + ?, website_size = website_size + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                      (size, size, website_id))
         conn.commit()
-    
     return jsonify({'success': True, 'message': 'File uploaded'})
 
 @app.route('/website/<int:website_id>/file/delete', methods=['POST'])
@@ -1183,28 +1170,23 @@ def delete_file_website(website_id):
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     path = request.json.get('path', '').strip()
     if not path:
         return jsonify({'success': False, 'error': 'Path required'}), 400
     full = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", path)
     if not os.path.exists(full):
         return jsonify({'success': False, 'error': 'File not found'}), 404
-    
     if os.path.abspath(full) == os.path.abspath(os.path.join(UPLOAD_FOLDER, f"website_{website_id}")):
         return jsonify({'success': False, 'error': 'Cannot delete root'}), 400
-    
     if os.path.isdir(full):
         shutil.rmtree(full)
     else:
         os.remove(full)
-    
     new_size = calculate_folder_size(os.path.join(UPLOAD_FOLDER, f"website_{website_id}"))
     with get_db() as conn:
         conn.execute('UPDATE websites SET storage_used = ?, website_size = ? WHERE id = ?',
                      (new_size, new_size, website_id))
         conn.commit()
-    
     return jsonify({'success': True})
 
 @app.route('/website/<int:website_id>/file/rename', methods=['POST'])
@@ -1215,13 +1197,11 @@ def rename_file_website(website_id):
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     data = request.json
     old_path = data.get('old_path', '').strip()
     new_name = data.get('new_name', '').strip()
     if not old_path or not new_name:
         return jsonify({'success': False, 'error': 'Old path and new name required'}), 400
-    
     base = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     old_full = os.path.join(base, old_path)
     if not os.path.exists(old_full):
@@ -1240,18 +1220,15 @@ def create_file_website(website_id):
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     data = request.json
     path = data.get('path', '').strip()
     is_folder = data.get('is_folder', False)
     if not path:
         return jsonify({'success': False, 'error': 'Path required'}), 400
-    
     base = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     full = os.path.join(base, path)
     if os.path.exists(full):
         return jsonify({'success': False, 'error': 'Already exists'}), 400
-    
     if is_folder:
         os.makedirs(full, exist_ok=True)
     else:
@@ -1268,7 +1245,6 @@ def download_file_website(website_id):
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
-    
     path = request.args.get('path', '').strip()
     if not path:
         abort(400)
@@ -1285,7 +1261,6 @@ def zip_folder_website(website_id):
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     path = request.json.get('path', '').strip()
     if not path:
         return jsonify({'success': False, 'error': 'Path required'}), 400
@@ -1293,7 +1268,6 @@ def zip_folder_website(website_id):
     full = os.path.join(base, path)
     if not os.path.exists(full) or not os.path.isdir(full):
         return jsonify({'success': False, 'error': 'Folder not found'}), 404
-    
     zip_name = os.path.basename(full) + '.zip'
     zip_path = os.path.join(base, zip_name)
     shutil.make_archive(zip_path.replace('.zip', ''), 'zip', full)
@@ -1307,7 +1281,6 @@ def unzip_file_website(website_id):
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     path = request.json.get('path', '').strip()
     if not path:
         return jsonify({'success': False, 'error': 'Path required'}), 400
@@ -1315,40 +1288,33 @@ def unzip_file_website(website_id):
     full = os.path.join(base, path)
     if not os.path.exists(full) or not os.path.isfile(full) or not full.endswith('.zip'):
         return jsonify({'success': False, 'error': 'Invalid zip file'}), 400
-    
     extract_dir = os.path.splitext(full)[0]
     with zipfile.ZipFile(full, 'r') as zf:
         zf.extractall(extract_dir)
     os.remove(full)
     return jsonify({'success': True})
 
-# ---------- Logs View (includes deployment logs) ----------
+# ---------- Logs View ----------
 @app.route('/website/<int:website_id>/logs')
 def view_logs(website_id):
     if 'user_id' not in session:
         return redirect(url_for('index'))
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
-    
     with get_db() as conn:
         logs = conn.execute('SELECT * FROM logs WHERE website_id = ? ORDER BY timestamp DESC LIMIT 200', (website_id,)).fetchall()
-    
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
     file_log = ''
     if os.path.exists(log_file):
         with open(log_file, 'r', errors='ignore') as f:
             file_log = f.read()
-    
     install_log = ''
     install_log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
     if os.path.exists(install_log_file):
         with open(install_log_file, 'r', errors='ignore') as f:
             install_log = f.read()
-    
-    # Get latest deployment log
     deploy_log = ''
     with get_db() as conn:
         dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
@@ -1357,10 +1323,8 @@ def view_logs(website_id):
         if os.path.exists(dep_log_file):
             with open(dep_log_file, 'r', errors='ignore') as f:
                 deploy_log = f.read()
-    
     return render_template_string(LOGS_TEMPLATE, website=website, logs=logs, file_log=file_log, install_log=install_log, deploy_log=deploy_log)
 
-# ---------- Deployment History ----------
 @app.route('/website/<int:website_id>/deployments')
 def deployment_history(website_id):
     if 'user_id' not in session:
@@ -1369,112 +1333,31 @@ def deployment_history(website_id):
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
-    
     with get_db() as conn:
         deployments = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY started_at DESC', (website_id,)).fetchall()
     return render_template_string(DEPLOYMENTS_TEMPLATE, website=website, deployments=deployments)
 
 # ========== TEMPLATES ==========
-# All templates are defined here.
+# (All templates are kept identical to the previous version, except minor updates.
+# To save space, I'll include them but they are same as before.)
 
-ERROR_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head><title>Website Unavailable</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
-.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:50px;text-align:center;max-width:500px;box-shadow:0 0 80px rgba(0,229,255,0.05)}
-h1{font-size:2.5rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:15px}
-p{color:#aab;font-size:1.1rem;margin:15px 0}
-a{color:#00e5ff;text-decoration:none;padding:12px 30px;border:2px solid #00e5ff;border-radius:50px;display:inline-block;margin-top:20px;transition:.3s}
-a:hover{background:#00e5ff;color:#000;transform:scale(1.05)}
-</style>
-</head>
-<body>
-<div class="glass">
-<h1>⚠️ {{ message }}</h1>
-<p>Slug: <strong>{{ slug }}</strong></p>
-<a href="/dashboard">← Go to Dashboard</a>
-</div>
-</body>
-</html>
-"""
+ERROR_TEMPLATE = """<!DOCTYPE html>
+<html><head><title>Website Unavailable</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:50px;text-align:center;max-width:500px;box-shadow:0 0 80px rgba(0,229,255,0.05)}h1{font-size:2.5rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:15px}p{color:#aab;font-size:1.1rem;margin:15px 0}a{color:#00e5ff;text-decoration:none;padding:12px 30px;border:2px solid #00e5ff;border-radius:50px;display:inline-block;margin-top:20px;transition:.3s}a:hover{background:#00e5ff;color:#000;transform:scale(1.05)}
+</style></head>
+<body><div class="glass"><h1>⚠️ {{ message }}</h1><p>Slug: <strong>{{ slug }}</strong></p><a href="/dashboard">← Go to Dashboard</a></div></body></html>"""
 
-LOGIN_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head><title>Yuvicodex Host</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-@keyframes zoomIn{0%{opacity:0;transform:scale(0.9)}100%{opacity:1;transform:scale(1)}}
-@keyframes float{0%{transform:translateY(0px)}50%{transform:translateY(-10px)}100%{transform:translateY(0px)}}
-body{background:linear-gradient(135deg,#0a0e1a 0%,#1a1040 50%,#0a1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
-.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:40px;width:100%;max-width:400px;animation:zoomIn 0.6s ease;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
-.logo{text-align:center;font-size:2.5rem;font-weight:900;background:linear-gradient(135deg,#00e5ff,#7a00ff,#00e5ff);background-size:300% 300%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:float 3s ease-in-out infinite;margin-bottom:10px}
-.sub{text-align:center;color:#889;font-size:0.9rem;margin-bottom:30px}
-input{width:100%;padding:14px 18px;margin:10px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;font-size:1rem;outline:none;transition:.3s}
-input:focus{border-color:#00e5ff;box-shadow:0 0 30px rgba(0,229,255,0.1)}
-.btn{width:100%;padding:14px;background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;border-radius:15px;color:#fff;font-size:1.1rem;font-weight:700;cursor:pointer;transition:.3s;margin-top:15px}
-.btn:hover{transform:scale(1.02);box-shadow:0 0 40px rgba(0,229,255,0.2)}
-.error{color:#ff4757;text-align:center;margin-top:10px;font-size:0.9rem}
-.link{text-align:center;margin-top:20px;color:#889}
-.link a{color:#00e5ff;text-decoration:none;font-weight:600}
-.link a:hover{text-decoration:underline}
-</style>
-</head>
-<body>
-<div class="glass">
-<div class="logo">🚀 Yuvicodex</div>
-<div class="sub">Premium Cloud Hosting</div>
-<form method="POST" action="/login">
-<input type="text" name="username" placeholder="Username" required>
-<input type="password" name="password" placeholder="Password" required>
-<button class="btn" type="submit">Access Dashboard</button>
-</form>
-<div class="error">{{ error if error else '' }}</div>
-<div class="link">New here? <a href="/register">Create Account</a></div>
-</div>
-</body>
-</html>
-"""
+LOGIN_TEMPLATE = """<!DOCTYPE html>
+<html><head><title>Yuvicodex Host</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}@keyframes zoomIn{0%{opacity:0;transform:scale(0.9)}100%{opacity:1;transform:scale(1)}}@keyframes float{0%{transform:translateY(0px)}50%{transform:translateY(-10px)}100%{transform:translateY(0px)}}body{background:linear-gradient(135deg,#0a0e1a 0%,#1a1040 50%,#0a1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:40px;width:100%;max-width:400px;animation:zoomIn 0.6s ease;box-shadow:0 20px 60px rgba(0,0,0,0.5)}.logo{text-align:center;font-size:2.5rem;font-weight:900;background:linear-gradient(135deg,#00e5ff,#7a00ff,#00e5ff);background-size:300% 300%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:float 3s ease-in-out infinite;margin-bottom:10px}.sub{text-align:center;color:#889;font-size:0.9rem;margin-bottom:30px}input{width:100%;padding:14px 18px;margin:10px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;font-size:1rem;outline:none;transition:.3s}input:focus{border-color:#00e5ff;box-shadow:0 0 30px rgba(0,229,255,0.1)}.btn{width:100%;padding:14px;background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;border-radius:15px;color:#fff;font-size:1.1rem;font-weight:700;cursor:pointer;transition:.3s;margin-top:15px}.btn:hover{transform:scale(1.02);box-shadow:0 0 40px rgba(0,229,255,0.2)}.error{color:#ff4757;text-align:center;margin-top:10px;font-size:0.9rem}.link{text-align:center;margin-top:20px;color:#889}.link a{color:#00e5ff;text-decoration:none;font-weight:600}.link a:hover{text-decoration:underline}
+</style></head>
+<body><div class="glass"><div class="logo">🚀 Yuvicodex</div><div class="sub">Premium Cloud Hosting</div><form method="POST" action="/login"><input type="text" name="username" placeholder="Username" required><input type="password" name="password" placeholder="Password" required><button class="btn" type="submit">Access Dashboard</button></form><div class="error">{{ error if error else '' }}</div><div class="link">New here? <a href="/register">Create Account</a></div></div></body></html>"""
 
-REGISTER_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head><title>Register - Yuvicodex</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-@keyframes zoomIn{0%{opacity:0;transform:scale(0.9)}100%{opacity:1;transform:scale(1)}}
-body{background:linear-gradient(135deg,#0a0e1a 0%,#1a1040 50%,#0a1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
-.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:40px;width:100%;max-width:400px;animation:zoomIn 0.6s ease;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
-.logo{text-align:center;font-size:2rem;font-weight:900;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:5px}
-.sub{text-align:center;color:#889;font-size:0.9rem;margin-bottom:30px}
-input{width:100%;padding:14px 18px;margin:10px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;font-size:1rem;outline:none;transition:.3s}
-input:focus{border-color:#00e5ff;box-shadow:0 0 30px rgba(0,229,255,0.1)}
-.btn{width:100%;padding:14px;background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;border-radius:15px;color:#fff;font-size:1.1rem;font-weight:700;cursor:pointer;transition:.3s;margin-top:15px}
-.btn:hover{transform:scale(1.02);box-shadow:0 0 40px rgba(0,229,255,0.2)}
-.error{color:#ff4757;text-align:center;margin-top:10px;font-size:0.9rem}
-.link{text-align:center;margin-top:20px;color:#889}
-.link a{color:#00e5ff;text-decoration:none;font-weight:600}
-</style>
-</head>
-<body>
-<div class="glass">
-<div class="logo">✨ Create Account</div>
-<div class="sub">Start hosting in minutes</div>
-<form method="POST" action="/register">
-<input type="text" name="username" placeholder="Username" required>
-<input type="email" name="email" placeholder="Email" required>
-<input type="password" name="password" placeholder="Password" required>
-<button class="btn" type="submit">Register</button>
-</form>
-<div class="error">{{ error if error else '' }}</div>
-<div class="link">Already have account? <a href="/">Login</a></div>
-</div>
-</body>
-</html>
-"""
+REGISTER_TEMPLATE = """<!DOCTYPE html>
+<html><head><title>Register - Yuvicodex</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}@keyframes zoomIn{0%{opacity:0;transform:scale(0.9)}100%{opacity:1;transform:scale(1)}}body{background:linear-gradient(135deg,#0a0e1a 0%,#1a1040 50%,#0a1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:40px;width:100%;max-width:400px;animation:zoomIn 0.6s ease;box-shadow:0 20px 60px rgba(0,0,0,0.5)}.logo{text-align:center;font-size:2rem;font-weight:900;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:5px}.sub{text-align:center;color:#889;font-size:0.9rem;margin-bottom:30px}input{width:100%;padding:14px 18px;margin:10px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;font-size:1rem;outline:none;transition:.3s}input:focus{border-color:#00e5ff;box-shadow:0 0 30px rgba(0,229,255,0.1)}.btn{width:100%;padding:14px;background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;border-radius:15px;color:#fff;font-size:1.1rem;font-weight:700;cursor:pointer;transition:.3s;margin-top:15px}.btn:hover{transform:scale(1.02);box-shadow:0 0 40px rgba(0,229,255,0.2)}.error{color:#ff4757;text-align:center;margin-top:10px;font-size:0.9rem}.link{text-align:center;margin-top:20px;color:#889}.link a{color:#00e5ff;text-decoration:none;font-weight:600}
+</style></head>
+<body><div class="glass"><div class="logo">✨ Create Account</div><div class="sub">Start hosting in minutes</div><form method="POST" action="/register"><input type="text" name="username" placeholder="Username" required><input type="email" name="email" placeholder="Email" required><input type="password" name="password" placeholder="Password" required><button class="btn" type="submit">Register</button></form><div class="error">{{ error if error else '' }}</div><div class="link">Already have account? <a href="/">Login</a></div></div></body></html>"""
 
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
@@ -1598,6 +1481,7 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 <button class="btn-manage" onclick="location.href='/website/{{ w.id }}/files'">📁 Files</button>
 <button class="btn-manage" onclick="location.href='/website/{{ w.id }}/logs'">📜 Logs</button>
 <button class="btn-manage" onclick="location.href='/website/{{ w.id }}/deployments'">📋 Deployments</button>
+<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/build'">🖥 Build Logs</button>
 <button class="btn-delete" onclick="if(confirm('Delete this website?')) action({{ w.id }},'delete')">🗑 Delete</button>
 </div>
 <div class="url-edit">
@@ -1614,7 +1498,6 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 </div>
 
 <script>
-// Drag and Drop
 const dropZone = document.getElementById('dropZone');
 dropZone.addEventListener('dragover', (e) => {
     e.preventDefault();
@@ -1670,7 +1553,6 @@ body:'domain='+encodeURIComponent(val)
 document.getElementById('uploadBtn').onclick=function(){
 const files = document.getElementById('zipFile').files;
 if(!files.length)return alert('Select at least one file (ZIP required)');
-// Check if a ZIP is present
 let hasZip = false;
 for(let f of files){
     if(f.name.toLowerCase().endsWith('.zip')) hasZip = true;
@@ -1686,8 +1568,8 @@ fetch('/upload',{method:'POST',body:fd})
 .then(r=>r.json())
 .then(d=>{
     if(d.success){
-        st.innerHTML='✅ Uploaded! Redirecting to logs...';
-        window.location.href = '/deploy/'+d.website_id+'/logs';
+        st.innerHTML='✅ Uploaded! Redirecting to build logs...';
+        window.location.href = '/website/'+d.website_id+'/build';
     } else {
         st.innerHTML='❌ '+d.error;
     }
@@ -1709,7 +1591,7 @@ body:'repo_url='+encodeURIComponent(repo)+'&branch='+encodeURIComponent(branch)
 .then(r=>r.json())
 .then(d=>{
 if(d.success){
-st.innerHTML='✅ Deployment started! <a href="/deploy/'+d.website_id+'/logs" target="_blank" style="color:#00e5ff;">View Logs</a>';
+st.innerHTML='✅ Deployment started! <a href="/website/'+d.website_id+'/build" target="_blank" style="color:#00e5ff;">View Build Logs</a>';
 }else st.innerHTML='❌ '+d.error;
 })
 .catch(()=>st.innerHTML='❌ Network error');
@@ -1937,6 +1819,118 @@ th{background:rgba(255,255,255,0.05)}
 {% endfor %}
 </table>
 </div>
+</body>
+</html>
+"""
+
+BUILD_LOGS_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Build Logs - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;height:100vh;display:flex;flex-direction:column;padding:20px;overflow:hidden}
+.top-bar{display:flex;justify-content:space-between;align-items:center;padding:10px 20px;background:rgba(255,255,255,0.05);border-radius:15px;margin-bottom:15px;flex-shrink:0}
+.top-bar h2{background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.top-bar a{color:#00e5ff;text-decoration:none;font-weight:600}
+.terminal{flex:1;background:#0d0d0d;border-radius:15px;padding:20px;overflow-y:auto;font-family:'Courier New',monospace;font-size:14px;line-height:1.6;border:1px solid rgba(255,255,255,0.05);box-shadow:inset 0 0 30px rgba(0,0,0,0.5)}
+.terminal::-webkit-scrollbar{width:8px}
+.terminal::-webkit-scrollbar-track{background:#1a1a1a;border-radius:10px}
+.terminal::-webkit-scrollbar-thumb{background:#00e5ff;border-radius:10px}
+.terminal .line{margin:0;white-space:pre-wrap;word-break:break-all}
+.terminal .line .timestamp{color:#666;margin-right:10px}
+.terminal .line .step{color:#888;margin-right:10px}
+.terminal .line.SYSTEM{color:#00e5ff}
+.terminal .line.SUCCESS{color:#00ff88}
+.terminal .line.ERROR{color:#ff4757}
+.terminal .line.PIP{color:#ffaa00}
+.terminal .line.GIT{color:#a855f7}
+.terminal .line.STARTUP{color:#fbbf24}
+.terminal .line.PORT{color:#60a5fa}
+.terminal .line.FILE{color:#34d399}
+.terminal .line.PYTHON{color:#f472b6}
+.terminal .line.PROCESS{color:#9ca3af}
+.status-indicator{padding:8px 16px;border-radius:50px;font-size:0.9rem;font-weight:600}
+.status-indicator.running{background:rgba(0,229,255,0.2);color:#00e5ff;animation:pulse 1.5s infinite}
+.status-indicator.success{background:rgba(0,255,136,0.2);color:#00ff88}
+.status-indicator.failed{background:rgba(255,71,87,0.2);color:#ff4757}
+@keyframes pulse{0%{opacity:1}50%{opacity:0.5}100%{opacity:1}}
+</style>
+</head>
+<body>
+<div class="top-bar">
+<h2>🖥 Build Logs – {{ website.website_name or website.website_slug }}</h2>
+<div>
+<span class="status-indicator running" id="statusBadge">Running</span>
+<a href="/dashboard" style="margin-left:20px;">← Dashboard</a>
+</div>
+</div>
+<div class="terminal" id="terminal">
+<div id="logContainer"></div>
+</div>
+<script>
+const terminal = document.getElementById('terminal');
+const logContainer = document.getElementById('logContainer');
+const statusBadge = document.getElementById('statusBadge');
+
+const evtSource = new EventSource('/deploy/{{ website.id }}/logs');
+let autoScroll = true;
+
+evtSource.onmessage = function(event) {
+    const data = event.data;
+    if (!data) return;
+    const lineDiv = document.createElement('div');
+    lineDiv.className = 'line';
+    const match = data.match(/^\[(\d{2}:\d{2}:\d{2})\] \[([A-Z]+)\] (.*)$/);
+    if (match) {
+        const [, ts, step, msg] = match;
+        lineDiv.innerHTML = `<span class="timestamp">[${ts}]</span><span class="step">[${step}]</span>${msg}`;
+        lineDiv.classList.add(step);
+    } else {
+        lineDiv.textContent = data;
+    }
+    logContainer.appendChild(lineDiv);
+    if (autoScroll) {
+        terminal.scrollTop = terminal.scrollHeight;
+    }
+    if (data.includes('Deployment Successful')) {
+        statusBadge.textContent = '✅ Success';
+        statusBadge.className = 'status-indicator success';
+        evtSource.close();
+    } else if (data.includes('Deployment failed') || data.includes('ERROR')) {
+        statusBadge.textContent = '❌ Failed';
+        statusBadge.className = 'status-indicator failed';
+    }
+    if (data.includes('Deployment completed with status:')) {
+        if (data.includes('success')) {
+            statusBadge.textContent = '✅ Success';
+            statusBadge.className = 'status-indicator success';
+        } else {
+            statusBadge.textContent = '❌ Failed';
+            statusBadge.className = 'status-indicator failed';
+        }
+        evtSource.close();
+    }
+};
+
+evtSource.onerror = function() {
+    setTimeout(() => {
+        if (evtSource.readyState === EventSource.CLOSED) {
+            // Maybe reopen if not done
+        }
+    }, 2000);
+};
+
+terminal.addEventListener('scroll', function() {
+    if (terminal.scrollTop < terminal.scrollHeight - terminal.clientHeight - 10) {
+        autoScroll = false;
+    } else {
+        autoScroll = true;
+    }
+});
+
+logContainer.innerHTML = '<div class="line SYSTEM"><span class="timestamp">[--:--:--]</span><span class="step">[SYSTEM]</span>Connecting to build logs...</div>';
+</script>
 </body>
 </html>
 """
