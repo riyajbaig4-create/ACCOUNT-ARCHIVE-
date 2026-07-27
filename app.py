@@ -357,7 +357,6 @@ def start_website_process(website_id, log_callback=None):
     
     # Install requirements if not static and not already done
     if framework not in ['static', 'http.server']:
-        # check if requirements were already installed, but we can just run install again (it's idempotent)
         success, msg = install_requirements(folder, website_id, log_callback)
         if not success:
             log_website(website_id, f"Requirements failed: {msg}", 'error')
@@ -918,7 +917,7 @@ def github_deploy():
     thread.start()
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug, 'message': 'Deployment started'})
 
-# ---------- Build Logs Terminal Page ----------
+# ---------- Build Logs Page (Full Screen) ----------
 @app.route('/website/<int:website_id>/build')
 def build_logs_page(website_id):
     if 'user_id' not in session:
@@ -1338,9 +1337,6 @@ def deployment_history(website_id):
     return render_template_string(DEPLOYMENTS_TEMPLATE, website=website, deployments=deployments)
 
 # ========== TEMPLATES ==========
-# (All templates are kept identical to the previous version, except minor updates.
-# To save space, I'll include them but they are same as before.)
-
 ERROR_TEMPLATE = """<!DOCTYPE html>
 <html><head><title>Website Unavailable</title>
 <style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:50px;text-align:center;max-width:500px;box-shadow:0 0 80px rgba(0,229,255,0.05)}h1{font-size:2.5rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:15px}p{color:#aab;font-size:1.1rem;margin:15px 0}a{color:#00e5ff;text-decoration:none;padding:12px 30px;border:2px solid #00e5ff;border-radius:50px;display:inline-block;margin-top:20px;transition:.3s}a:hover{background:#00e5ff;color:#000;transform:scale(1.05)}
@@ -1359,6 +1355,7 @@ REGISTER_TEMPLATE = """<!DOCTYPE html>
 </style></head>
 <body><div class="glass"><div class="logo">✨ Create Account</div><div class="sub">Start hosting in minutes</div><form method="POST" action="/register"><input type="text" name="username" placeholder="Username" required><input type="email" name="email" placeholder="Email" required><input type="password" name="password" placeholder="Password" required><button class="btn" type="submit">Register</button></form><div class="error">{{ error if error else '' }}</div><div class="link">Already have account? <a href="/">Login</a></div></div></body></html>"""
 
+# ---------- DASHBOARD TEMPLATE (with inline logs) ----------
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1429,6 +1426,38 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 @media(max-width:600px){.header{flex-direction:column;gap:10px;text-align:center}.grid{grid-template-columns:1fr}}
 .github-box input[type="text"]{width:100%;padding:12px;margin:8px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;outline:none}
 .github-box input:focus{border-color:#7a00ff}
+
+/* Inline Log Container */
+.log-container {
+    display: none;
+    margin: 20px 0 30px 0;
+    background: #0d0d0d;
+    border-radius: 15px;
+    padding: 15px;
+    border: 1px solid rgba(255,255,255,0.1);
+    max-height: 400px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #aab;
+}
+.log-container::-webkit-scrollbar{width:6px}
+.log-container::-webkit-scrollbar-track{background:#1a1a1a;border-radius:10px}
+.log-container::-webkit-scrollbar-thumb{background:#00e5ff;border-radius:10px}
+.log-container .line{margin:0;white-space:pre-wrap;word-break:break-all}
+.log-container .line .ts{color:#666;margin-right:10px}
+.log-container .line .step{color:#888;margin-right:10px}
+.log-container .line.SYSTEM{color:#00e5ff}
+.log-container .line.SUCCESS{color:#00ff88}
+.log-container .line.ERROR{color:#ff4757}
+.log-container .line.PIP{color:#ffaa00}
+.log-container .line.GIT{color:#a855f7}
+.log-container .line.STARTUP{color:#fbbf24}
+.log-container .line.PORT{color:#60a5fa}
+.log-container .line.FILE{color:#34d399}
+.log-container .line.PYTHON{color:#f472b6}
+.log-container .line.PROCESS{color:#9ca3af}
 </style>
 </head>
 <body>
@@ -1458,6 +1487,11 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 <input type="text" id="branch" placeholder="Branch (default: main)" value="main">
 <button class="btn" id="githubBtn">Clone & Deploy</button>
 <div id="githubStatus"></div>
+</div>
+
+<!-- Inline Build Logs Container -->
+<div class="log-container" id="logContainer">
+    <div id="logContent"></div>
 </div>
 
 <h2 style="margin-bottom:15px;">Your Websites</h2>
@@ -1498,6 +1532,7 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 </div>
 
 <script>
+// Drag and Drop
 const dropZone = document.getElementById('dropZone');
 dropZone.addEventListener('dragover', (e) => {
     e.preventDefault();
@@ -1519,6 +1554,7 @@ dropZone.addEventListener('drop', (e) => {
     document.getElementById('uploadStatus').innerHTML = `✅ ${files.length} file(s) selected`;
 });
 
+// Action functions (start/stop/restart/delete)
 function action(id,type){
 fetch('/website/'+id+'/'+type,{method:'POST'})
 .then(r=>r.json())
@@ -1550,57 +1586,129 @@ body:'domain='+encodeURIComponent(val)
 .catch(()=>alert('Network error'));
 }
 
-document.getElementById('uploadBtn').onclick=function(){
-const files = document.getElementById('zipFile').files;
-if(!files.length)return alert('Select at least one file (ZIP required)');
-let hasZip = false;
-for(let f of files){
-    if(f.name.toLowerCase().endsWith('.zip')) hasZip = true;
-}
-if(!hasZip)return alert('A ZIP file is required');
-const fd = new FormData();
-for(let f of files){
-    fd.append('files[]', f);
-}
-const st = document.getElementById('uploadStatus');
-st.innerHTML='⏳ Uploading...';
-fetch('/upload',{method:'POST',body:fd})
-.then(r=>r.json())
-.then(d=>{
-    if(d.success){
-        st.innerHTML='✅ Uploaded! Redirecting to build logs...';
-        window.location.href = '/website/'+d.website_id+'/build';
-    } else {
-        st.innerHTML='❌ '+d.error;
+// ----- Inline Logs Logic -----
+let currentEventSource = null;
+const logContainer = document.getElementById('logContainer');
+const logContent = document.getElementById('logContent');
+
+function showLogs(websiteId) {
+    // Clear any existing connection
+    if (currentEventSource) {
+        currentEventSource.close();
+        currentEventSource = null;
     }
-})
-.catch(()=>st.innerHTML='❌ Network error');
+    // Clear previous content
+    logContent.innerHTML = '';
+    logContainer.style.display = 'block';
+    logContainer.scrollTop = 0;
+    
+    // Connect to SSE
+    const evtSource = new EventSource('/deploy/' + websiteId + '/logs');
+    currentEventSource = evtSource;
+    let autoScroll = true;
+    
+    evtSource.onmessage = function(event) {
+        const data = event.data;
+        if (!data) return;
+        const lineDiv = document.createElement('div');
+        lineDiv.className = 'line';
+        const match = data.match(/^\[(\d{2}:\d{2}:\d{2})\] \[([A-Z]+)\] (.*)$/);
+        if (match) {
+            const [, ts, step, msg] = match;
+            lineDiv.innerHTML = `<span class="ts">[${ts}]</span><span class="step">[${step}]</span>${msg}`;
+            lineDiv.classList.add(step);
+        } else {
+            lineDiv.textContent = data;
+        }
+        logContent.appendChild(lineDiv);
+        if (autoScroll) {
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+        // Check if deployment completed
+        if (data.includes('Deployment completed with status:')) {
+            // Auto-hide after 5 seconds
+            setTimeout(() => {
+                logContainer.style.display = 'none';
+                if (currentEventSource) {
+                    currentEventSource.close();
+                    currentEventSource = null;
+                }
+            }, 5000);
+        }
+    };
+    evtSource.onerror = function() {
+        // Reconnect if closed prematurely
+        if (evtSource.readyState === EventSource.CLOSED) {
+            // Do nothing, might be finished
+        }
+    };
+    // Auto-scroll toggle on user scroll
+    logContainer.addEventListener('scroll', function() {
+        if (logContainer.scrollTop < logContainer.scrollHeight - logContainer.clientHeight - 10) {
+            autoScroll = false;
+        } else {
+            autoScroll = true;
+        }
+    });
+}
+
+// ----- Upload Button -----
+document.getElementById('uploadBtn').onclick = function() {
+    const files = document.getElementById('zipFile').files;
+    if (!files.length) return alert('Select at least one file (ZIP required)');
+    let hasZip = false;
+    for (let f of files) {
+        if (f.name.toLowerCase().endsWith('.zip')) hasZip = true;
+    }
+    if (!hasZip) return alert('A ZIP file is required');
+    const fd = new FormData();
+    for (let f of files) {
+        fd.append('files[]', f);
+    }
+    const st = document.getElementById('uploadStatus');
+    st.innerHTML = '⏳ Uploading...';
+    fetch('/upload', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(d => {
+            if (d.success) {
+                st.innerHTML = '✅ Uploaded! Showing logs...';
+                showLogs(d.website_id);
+            } else {
+                st.innerHTML = '❌ ' + d.error;
+            }
+        })
+        .catch(() => st.innerHTML = '❌ Network error');
 };
 
-document.getElementById('githubBtn').onclick=function(){
-const repo=document.getElementById('repoUrl').value.trim();
-const branch=document.getElementById('branch').value.trim()||'main';
-if(!repo)return alert('Enter repository URL');
-const st=document.getElementById('githubStatus');
-st.innerHTML='⏳ Starting deployment...';
-fetch('/github_deploy',{
-method:'POST',
-headers:{'Content-Type':'application/x-www-form-urlencoded'},
-body:'repo_url='+encodeURIComponent(repo)+'&branch='+encodeURIComponent(branch)
-})
-.then(r=>r.json())
-.then(d=>{
-if(d.success){
-st.innerHTML='✅ Deployment started! <a href="/website/'+d.website_id+'/build" target="_blank" style="color:#00e5ff;">View Build Logs</a>';
-}else st.innerHTML='❌ '+d.error;
-})
-.catch(()=>st.innerHTML='❌ Network error');
+// ----- GitHub Deploy Button -----
+document.getElementById('githubBtn').onclick = function() {
+    const repo = document.getElementById('repoUrl').value.trim();
+    const branch = document.getElementById('branch').value.trim() || 'main';
+    if (!repo) return alert('Enter repository URL');
+    const st = document.getElementById('githubStatus');
+    st.innerHTML = '⏳ Starting deployment...';
+    fetch('/github_deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'repo_url=' + encodeURIComponent(repo) + '&branch=' + encodeURIComponent(branch)
+    })
+    .then(r => r.json())
+    .then(d => {
+        if (d.success) {
+            st.innerHTML = '✅ Deployment started! Showing logs...';
+            showLogs(d.website_id);
+        } else {
+            st.innerHTML = '❌ ' + d.error;
+        }
+    })
+    .catch(() => st.innerHTML = '❌ Network error');
 };
 </script>
 </body>
 </html>
 """
 
+# ---------- Other Templates (unchanged) ----------
 FILES_TEMPLATE = """
 <!DOCTYPE html>
 <html>
