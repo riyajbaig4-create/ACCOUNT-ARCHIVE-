@@ -215,13 +215,25 @@ def extract_zip(zip_path, extract_to):
         return False, f"Extraction failed: {str(e)}"
 
 def find_startup_file(folder):
+    """Detect startup file from folder. Returns (filename, runtime_type)"""
+    # 1. Python files (priority)
     for filename in STARTUP_PRIORITY:
         if os.path.exists(os.path.join(folder, filename)):
             return filename, 'python'
+    # 2. Any .py file (except __init__.py)
+    for f in os.listdir(folder):
+        if f.endswith('.py') and f != '__init__.py':
+            return f, 'python'
+    # 3. Node.js
     if os.path.exists(os.path.join(folder, 'package.json')):
         return 'package.json', 'node'
+    # 4. Static (index.html)
     if os.path.exists(os.path.join(folder, 'index.html')):
         return 'index.html', 'static'
+    # 5. Any .html file
+    for f in os.listdir(folder):
+        if f.endswith('.html'):
+            return f, 'static'
     return None, None
 
 def install_requirements(folder, website_id, log_file=None):
@@ -294,7 +306,32 @@ def start_website_process(website_id, log_callback=None):
         if log_callback: log_callback("❌ Folder missing")
         return False, "Folder not found", []
     
-    startup_file, runtime = find_startup_file(folder)
+    # Priority: startup_file from DB (if set), else detect
+    startup_file_from_db = website['startup_file']
+    startup_file = None
+    runtime = None
+    
+    if startup_file_from_db:
+        # Check if the file exists
+        full_path = os.path.join(folder, startup_file_from_db)
+        if os.path.exists(full_path) and os.path.isfile(full_path):
+            startup_file = startup_file_from_db
+            # Detect runtime from filename
+            if startup_file.endswith('.py'):
+                runtime = 'python'
+            elif startup_file.endswith('.html'):
+                runtime = 'static'
+            elif startup_file == 'package.json':
+                runtime = 'node'
+            else:
+                # Try to detect by scanning
+                startup_file, runtime = find_startup_file(folder)
+        else:
+            # File not found, scan
+            startup_file, runtime = find_startup_file(folder)
+    else:
+        startup_file, runtime = find_startup_file(folder)
+    
     if not startup_file:
         if log_callback: log_callback("❌ No startup file found")
         return False, "No startup file detected.", []
@@ -344,7 +381,7 @@ def start_website_process(website_id, log_callback=None):
         cmd = [sys.executable, startup_file]
     elif runtime == 'node':
         cmd = ['npm', 'start']
-    else:
+    else:  # static
         cmd = [sys.executable, '-m', 'http.server', str(port)]
     
     log(f"🚀 Starting with command: {' '.join(cmd)}")
@@ -595,7 +632,7 @@ def dashboard():
                                   base_url=base_url,
                                   user_obj=user)
 
-# ---------- अपलोड ZIP ----------
+# ---------- अपलोड (ZIP + Single File) ----------
 @app.route('/upload', methods=['POST'])
 def upload_website():
     if 'user_id' not in session:
@@ -613,15 +650,17 @@ def upload_website():
     if file.filename == '':
         return jsonify({'success': False, 'error': 'Empty filename'}), 400
     
+    # Size check (100MB)
     file.seek(0, os.SEEK_END)
     size = file.tell()
     file.seek(0)
     if size > MAX_UPLOAD_SIZE:
         return jsonify({'success': False, 'error': f'File too large (max {MAX_UPLOAD_SIZE//1024//1024} MB)'}), 400
     
-    if not file.filename.lower().endswith('.zip'):
-        return jsonify({'success': False, 'error': 'Only ZIP files allowed'}), 400
+    filename = file.filename
+    is_zip = filename.lower().endswith('.zip')
     
+    # Generate slug and create website record
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
     
@@ -645,37 +684,56 @@ def upload_website():
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': 'Permission denied'}), 500
     
-    zip_path = os.path.join(folder, 'upload.zip')
-    try:
-        file.save(zip_path)
-    except Exception as e:
-        rollback_upload(website_id, folder)
-        return jsonify({'success': False, 'error': f'Failed to save: {str(e)}'}), 500
+    if is_zip:
+        # ZIP handling
+        zip_path = os.path.join(folder, 'upload.zip')
+        try:
+            file.save(zip_path)
+        except Exception as e:
+            rollback_upload(website_id, folder)
+            return jsonify({'success': False, 'error': f'Failed to save: {str(e)}'}), 500
+        
+        valid, msg = validate_zip(zip_path)
+        if not valid:
+            rollback_upload(website_id, folder)
+            return jsonify({'success': False, 'error': msg}), 400
+        
+        ok, msg = extract_zip(zip_path, folder)
+        if not ok:
+            rollback_upload(website_id, folder)
+            return jsonify({'success': False, 'error': msg}), 400
+        
+        os.remove(zip_path)
+        startup_file = None  # Let detection happen on start
+        website_name = filename[:-4] if '.' in filename else filename
+    else:
+        # Single file upload
+        file_path = os.path.join(folder, filename)
+        try:
+            file.save(file_path)
+        except Exception as e:
+            rollback_upload(website_id, folder)
+            return jsonify({'success': False, 'error': f'Failed to save: {str(e)}'}), 500
+        
+        startup_file = filename
+        website_name = filename
     
-    valid, msg = validate_zip(zip_path)
-    if not valid:
-        rollback_upload(website_id, folder)
-        return jsonify({'success': False, 'error': msg}), 400
-    
-    ok, msg = extract_zip(zip_path, folder)
-    if not ok:
-        rollback_upload(website_id, folder)
-        return jsonify({'success': False, 'error': msg}), 400
-    
-    os.remove(zip_path)
+    # Calculate size
     size_used = calculate_folder_size(folder)
     
+    # Update DB
     with get_db() as conn:
         conn.execute('''UPDATE websites SET 
                         website_name = ?, 
                         website_folder = ?,
                         storage_used = ?,
                         website_size = ?,
+                        startup_file = ?,
                         status = 'uploaded',
                         updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?''',
-                     (file.filename[:-4] if '.' in file.filename else file.filename,
-                      f"website_{website_id}", size_used, size_used, website_id))
+                     (website_name or file.filename,
+                      f"website_{website_id}", size_used, size_used, startup_file, website_id))
         conn.commit()
     
     log_website(website_id, f"Uploaded: {file.filename}")
@@ -683,7 +741,7 @@ def upload_website():
     
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
-# ---------- GitHub Deploy with SSE (Thread + Queue) ----------
+# ---------- GitHub Deploy with SSE ----------
 @app.route('/deploy_github/stream', methods=['POST'])
 def deploy_github_stream():
     if 'user_id' not in session:
@@ -1203,8 +1261,8 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 </div>
 
 <div class="upload-box">
-<h3>📤 Upload Website (ZIP)</h3>
-<input type="file" id="zipFile" accept=".zip">
+<h3>📤 Upload Website (ZIP or Single File)</h3>
+<input type="file" id="zipFile">
 <button class="upload-btn" id="uploadBtn">Upload & Deploy</button>
 <div id="uploadStatus"></div>
 </div>
@@ -1283,7 +1341,7 @@ alert('Error: '+d.error);
 
 document.getElementById('uploadBtn').onclick=function(){
 const file=document.getElementById('zipFile').files[0];
-if(!file)return alert('Select ZIP');
+if(!file)return alert('Select a file');
 const fd=new FormData();fd.append('file',file);
 const st=document.getElementById('uploadStatus');
 st.innerHTML='⏳ Uploading...';
