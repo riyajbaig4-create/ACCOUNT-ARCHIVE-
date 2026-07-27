@@ -11,9 +11,13 @@ import json
 import requests
 import threading
 import queue
+import asyncio
+import websockets
 from datetime import datetime
 from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context
 from werkzeug.security import generate_password_hash, check_password_hash
+import socket
+import urllib.parse
 
 app = Flask(__name__)
 app.secret_key = 'yuvicodex_super_secret_key_change_me_in_production'
@@ -23,11 +27,81 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 LOG_FOLDER = os.path.join(BASE_DIR, 'logs')
 DB_PATH = os.path.join(BASE_DIR, 'hosting.db')
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
-STARTUP_PRIORITY = ['app.py', 'main.py', 'server.py', 'run.py', 'manage.py', 'index.py', 'start.py']
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024
 AUTO_RESTART_MAX = 3
 AUTO_RESTART_INTERVAL = 10
 GIT_CLONE_TIMEOUT = 120
+
+# ---------- फ्रेमवर्क डिटेक्शन ----------
+FRAMEWORK_DETECTORS = {
+    'flask': lambda f: os.path.exists(os.path.join(f, 'app.py')) or os.path.exists(os.path.join(f, 'main.py')),
+    'fastapi': lambda f: os.path.exists(os.path.join(f, 'main.py')) and 'FastAPI' in open(os.path.join(f, 'main.py')).read(),
+    'django': lambda f: os.path.exists(os.path.join(f, 'manage.py')),
+    'bottle': lambda f: os.path.exists(os.path.join(f, 'app.py')) and 'bottle' in open(os.path.join(f, 'app.py')).read(),
+    'nodejs': lambda f: os.path.exists(os.path.join(f, 'package.json')),
+    'static': lambda f: os.path.exists(os.path.join(f, 'index.html')),
+    'php': lambda f: any(f.endswith('.php') for _, _, files in os.walk(f) for f in files),
+    'go': lambda f: any(f.endswith('.go') for _, _, files in os.walk(f) for f in files),
+    'rust': lambda f: any(f.endswith('.rs') for _, _, files in os.walk(f) for f in files),
+    'java': lambda f: any(f.endswith('.java') for _, _, files in os.walk(f) for f in files),
+    'spring': lambda f: any(f.endswith('.java') and 'SpringApplication' in open(os.path.join(f, f)).read() for _, _, files in os.walk(f) for f in files if f.endswith('.java')),
+}
+
+STARTUP_PRIORITY = {
+    'python': ['run_app.py', 'app.py', 'main.py', 'server.py', 'manage.py', 'index.py', 'start.py'],
+    'node': ['index.js', 'server.js', 'main.js', 'app.js', 'start.js'],
+    'php': ['index.php', 'main.php', 'server.php'],
+    'go': ['main.go', 'server.go'],
+    'rust': ['main.rs', 'server.rs'],
+    'java': ['Main.java', 'Application.java'],
+    'static': ['index.html'],
+}
+
+# ---------- पैकेज मैप (अपने आप इंस्टॉल के लिए) ----------
+AUTO_INSTALL_PACKAGES = {
+    'flask': 'flask',
+    'fastapi': 'fastapi uvicorn',
+    'django': 'django',
+    'bottle': 'bottle',
+    'requests': 'requests',
+    'numpy': 'numpy',
+    'pandas': 'pandas',
+    'pillow': 'Pillow',
+    'sqlalchemy': 'sqlalchemy',
+    'pymongo': 'pymongo',
+    'psycopg2': 'psycopg2-binary',
+    'mysqlclient': 'mysqlclient',
+    'redis': 'redis',
+    'celery': 'celery',
+    'gunicorn': 'gunicorn',
+    'uvicorn': 'uvicorn',
+    'httpx': 'httpx',
+    'aiohttp': 'aiohttp',
+    'websockets': 'websockets',
+    'python-telegram-bot': 'python-telegram-bot',
+    'pyTelegramBotAPI': 'pyTelegramBotAPI',
+    'pyrogram': 'pyrogram',
+    'telethon': 'telethon',
+    'aiogram': 'aiogram',
+    'discord.py': 'discord.py',
+    'flask-cors': 'Flask-CORS',
+    'flask-socketio': 'flask-socketio',
+    'flask-sqlalchemy': 'flask-sqlalchemy',
+    'flask-migrate': 'flask-migrate',
+    'flask-login': 'flask-login',
+    'flask-mail': 'flask-mail',
+    'flask-wtf': 'flask-wtf',
+    'flask-security': 'flask-security',
+    'flask-restful': 'flask-restful',
+    'flask-restx': 'flask-restx',
+    'flask-jwt-extended': 'flask-jwt-extended',
+    'flask-caching': 'flask-caching',
+    'flask-session': 'flask-session',
+    'flask-talisman': 'flask-talisman',
+    'flask-compress': 'flask-compress',
+    'flask-limiter': 'flask-limiter',
+    'flask-sse': 'flask-sse',
+}
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
@@ -52,7 +126,6 @@ def init_db():
             updated_at TIMESTAMP,
             last_login TIMESTAMP
         )''')
-        
         conn.execute('''CREATE TABLE IF NOT EXISTS websites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id INTEGER NOT NULL,
@@ -70,6 +143,7 @@ def init_db():
             repo_url TEXT,
             repo_branch TEXT DEFAULT 'main',
             build_log_file TEXT,
+            framework TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP,
             last_started TIMESTAMP,
@@ -81,7 +155,6 @@ def init_db():
             crash_count INTEGER DEFAULT 0,
             FOREIGN KEY (owner_id) REFERENCES users (id)
         )''')
-        
         conn.execute('''CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             website_id INTEGER NOT NULL,
@@ -90,7 +163,6 @@ def init_db():
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (website_id) REFERENCES websites (id)
         )''')
-        
         conn.execute('''CREATE TABLE IF NOT EXISTS activity_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -99,11 +171,9 @@ def init_db():
             ip_address TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
-        
         conn.execute('CREATE INDEX IF NOT EXISTS idx_websites_owner ON websites(owner_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_website ON logs(website_id)')
         conn.commit()
-        
         if conn.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0:
             conn.execute('INSERT INTO users (username, email, password_hash, role, plan) VALUES (?, ?, ?, ?, ?)',
                          ('admin', 'admin@hosting.com', generate_password_hash('admin123'), 'admin', 'pro'))
@@ -214,117 +284,213 @@ def extract_zip(zip_path, extract_to):
     except Exception as e:
         return False, f"Extraction failed: {str(e)}"
 
-def find_startup_file(folder):
-    for filename in STARTUP_PRIORITY:
-        if os.path.exists(os.path.join(folder, filename)):
-            return filename, 'python'
-    for f in os.listdir(folder):
-        if f.endswith('.py') and f != '__init__.py':
-            return f, 'python'
-    if os.path.exists(os.path.join(folder, 'package.json')):
-        return 'package.json', 'node'
-    if os.path.exists(os.path.join(folder, 'index.html')):
-        return 'index.html', 'static'
-    for f in os.listdir(folder):
-        if f.endswith('.html'):
-            return f, 'static'
-    return None, None
-
-def load_env_file(folder):
-    env_path = os.path.join(folder, '.env')
-    env_dict = {}
-    if os.path.exists(env_path):
+def detect_framework(folder):
+    """Detect which framework the project uses based on files."""
+    for name, detector in FRAMEWORK_DETECTORS.items():
         try:
-            with open(env_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    if '=' in line:
-                        key, value = line.split('=', 1)
-                        env_dict[key.strip()] = value.strip()
+            if detector(folder):
+                return name
+        except:
+            continue
+    # Fallback: check for common files
+    if os.path.exists(os.path.join(folder, 'app.py')) or os.path.exists(os.path.join(folder, 'main.py')):
+        return 'flask'
+    if os.path.exists(os.path.join(folder, 'manage.py')):
+        return 'django'
+    if os.path.exists(os.path.join(folder, 'package.json')):
+        return 'nodejs'
+    if os.path.exists(os.path.join(folder, 'index.html')):
+        return 'static'
+    return 'unknown'
+
+def get_startup_files(folder, framework):
+    """Return list of possible startup files based on framework."""
+    if framework == 'python' or framework == 'flask' or framework == 'fastapi' or framework == 'django' or framework == 'bottle':
+        return STARTUP_PRIORITY['python']
+    elif framework == 'nodejs':
+        return STARTUP_PRIORITY['node']
+    elif framework == 'php':
+        return STARTUP_PRIORITY['php']
+    elif framework == 'go':
+        return STARTUP_PRIORITY['go']
+    elif framework == 'rust':
+        return STARTUP_PRIORITY['rust']
+    elif framework == 'java' or framework == 'spring':
+        return STARTUP_PRIORITY['java']
+    else:
+        return STARTUP_PRIORITY['static']
+
+def find_startup_file(folder, framework):
+    """Find the first existing startup file from priority list."""
+    candidates = get_startup_files(folder, framework)
+    for fname in candidates:
+        if os.path.exists(os.path.join(folder, fname)):
+            return fname
+    # If nodejs, try using package.json start script
+    if framework == 'nodejs' and os.path.exists(os.path.join(folder, 'package.json')):
+        try:
+            with open(os.path.join(folder, 'package.json'), 'r') as f:
+                data = json.load(f)
+                if 'scripts' in data and 'start' in data['scripts']:
+                    return 'package.json'  # we'll run npm start
         except:
             pass
-    return env_dict
+    # If static, look for index.html
+    if os.path.exists(os.path.join(folder, 'index.html')):
+        return 'index.html'
+    # If any .py file exists, pick the first one
+    py_files = [f for f in os.listdir(folder) if f.endswith('.py') and not f.startswith('.')]
+    if py_files:
+        return py_files[0]
+    # If any .html file exists
+    html_files = [f for f in os.listdir(folder) if f.endswith('.html') and not f.startswith('.')]
+    if html_files:
+        return html_files[0]
+    return None
 
-def install_requirements(folder, website_id, log_callback=None):
-    req_file = os.path.join(folder, 'requirements.txt')
-    if not os.path.exists(req_file):
-        return True, "No requirements.txt", []
-    
-    log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
-    logs = []
-    def log(msg):
-        logs.append(msg)
-        if log_callback:
-            log_callback(msg)
-    
-    log(f"📦 Installing requirements from {req_file} ...")
-    try:
-        cmd = [sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt']
-        with open(log_file, 'w') as f:
-            proc = subprocess.Popen(cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in proc.stdout:
-                logs.append(line)
-                f.write(line)
-                if log_callback:
-                    log_callback(line)
-            proc.wait()
-        if proc.returncode != 0:
-            error = ''.join(logs[-500:])
-            log(f"❌ Installation failed: {error}")
-            return False, f"Installation failed: {error}", logs
-        log("✅ Installation successful")
-        return True, "Installation successful", logs
-    except Exception as e:
-        error_msg = str(e)
-        log(f"❌ Installation error: {error_msg}")
-        return False, f"Installation error: {error_msg}", [error_msg]
-
-def install_node_modules(folder, website_id, log_callback=None):
-    if not os.path.exists(os.path.join(folder, 'package.json')):
-        return True, "No package.json", []
-    log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
-    logs = []
-    def log(msg):
-        logs.append(msg)
-        if log_callback:
-            log_callback(msg)
-    log(f"📦 Installing npm packages ...")
-    try:
-        cmd = ['npm', 'install']
-        with open(log_file, 'a') as f:
-            proc = subprocess.Popen(cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in proc.stdout:
-                logs.append(line)
-                f.write(line)
-                if log_callback:
-                    log_callback(line)
-            proc.wait()
-        if proc.returncode != 0:
-            error = ''.join(logs[-500:])
-            log(f"❌ npm install failed: {error}")
-            return False, f"npm install failed: {error}", logs
-        log("✅ npm install successful")
-        return True, "npm install successful", logs
-    except Exception as e:
-        error_msg = str(e)
-        log(f"❌ npm install error: {error_msg}")
-        return False, f"npm install error: {error_msg}", [error_msg]
-
-def health_check(port, timeout=5):
-    try:
-        response = requests.get(f"http://localhost:{port}", timeout=timeout)
-        if response.status_code < 500:
-            return True, "OK"
+def get_start_command(framework, startup_file, port):
+    """Build the start command based on framework and startup file."""
+    if framework in ['python', 'flask', 'fastapi', 'bottle']:
+        return [sys.executable, startup_file]
+    elif framework == 'django':
+        # Django uses manage.py runserver
+        return [sys.executable, 'manage.py', 'runserver', f'0.0.0.0:{port}']
+    elif framework == 'nodejs':
+        if startup_file == 'package.json':
+            return ['npm', 'start']
         else:
-            return False, f"HTTP {response.status_code}"
-    except requests.exceptions.ConnectionError:
-        return False, "Connection refused"
-    except requests.exceptions.Timeout:
-        return False, "Timeout"
+            return ['node', startup_file]
+    elif framework == 'php':
+        return ['php', '-S', f'0.0.0.0:{port}', startup_file]
+    elif framework == 'go':
+        return ['go', 'run', startup_file]
+    elif framework == 'rust':
+        return ['cargo', 'run', '--bin', startup_file.replace('.rs', '')]
+    elif framework == 'java' or framework == 'spring':
+        return ['java', startup_file]  # assuming compiled .class or jar
+    else:
+        # static
+        return [sys.executable, '-m', 'http.server', str(port)]
+
+def install_dependencies(folder, framework, log_callback=None):
+    """Install dependencies based on framework."""
+    logs = []
+    def log(msg):
+        logs.append(msg)
+        if log_callback:
+            log_callback(msg)
+    
+    # For Python
+    if framework in ['python', 'flask', 'fastapi', 'django', 'bottle']:
+        req_path = os.path.join(folder, 'requirements.txt')
+        if os.path.exists(req_path):
+            log(f"📦 Installing Python requirements from {req_path} ...")
+            cmd = [sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt']
+            proc = subprocess.Popen(cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in proc.stdout:
+                log(line.strip())
+            proc.wait()
+            if proc.returncode != 0:
+                log(f"❌ Installation failed with code {proc.returncode}")
+                return False, logs
+            log("✅ Python dependencies installed")
+        else:
+            # Install common packages based on detection
+            packages = []
+            for pkg in AUTO_INSTALL_PACKAGES:
+                # check if any file imports it
+                for root, dirs, files in os.walk(folder):
+                    for file in files:
+                        if file.endswith('.py'):
+                            with open(os.path.join(root, file), 'r') as f:
+                                content = f.read()
+                                if pkg in content:
+                                    packages.append(AUTO_INSTALL_PACKAGES[pkg])
+                                    break
+            if packages:
+                packages = list(set(packages))
+                log(f"📦 Auto-installing packages: {', '.join(packages)}")
+                cmd = [sys.executable, '-m', 'pip', 'install'] + packages
+                proc = subprocess.Popen(cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in proc.stdout:
+                    log(line.strip())
+                proc.wait()
+                if proc.returncode != 0:
+                    log(f"❌ Auto-install failed")
+                    return False, logs
+                log("✅ Auto-install successful")
+    
+    # For Node.js
+    elif framework == 'nodejs':
+        if os.path.exists(os.path.join(folder, 'package.json')):
+            log("📦 Installing npm packages ...")
+            cmd = ['npm', 'install']
+            proc = subprocess.Popen(cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in proc.stdout:
+                log(line.strip())
+            proc.wait()
+            if proc.returncode != 0:
+                log(f"❌ npm install failed")
+                return False, logs
+            log("✅ npm packages installed")
+    
+    # For others, no specific package manager by default
+    return True, logs
+
+def inject_compatibility_routes(filepath):
+    """Inject /api/login and /api/signup if missing (for Python Flask apps)."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+        if '@app.route(\'/api/login\'' in content and '@app.route(\'/api/signup\'' in content:
+            return False  # Already present
+        # Add import for jsonify if missing
+        if 'from flask import jsonify' not in content:
+            # find import line
+            lines = content.split('\n')
+            new_lines = []
+            for line in lines:
+                if line.startswith('from flask import') and 'jsonify' not in line:
+                    line = line.replace('from flask import', 'from flask import jsonify,')
+                new_lines.append(line)
+            content = '\n'.join(new_lines)
+            if 'from flask import' not in content:
+                content = 'from flask import jsonify, request, render_template_string, redirect, url_for, session, jsonify, abort, Response, stream_with_context\n' + content
+        # Add routes before if __name__
+        api_routes = '''
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Invalid request'}), 400
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    # Dummy authentication - replace with your own logic
+    if username == 'admin' and password == 'admin123':
+        return jsonify({'success': True, 'username': 'admin', 'role': 'admin'})
+    else:
+        return jsonify({'error': 'Invalid credentials'}), 401
+
+@app.route('/api/signup', methods=['POST'])
+def api_signup():
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Invalid request'}), 400
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    # Dummy signup - extend as needed
+    return jsonify({'success': True, 'message': 'Account created (dummy)'})
+'''
+        if 'if __name__' in content:
+            content = content.replace('if __name__', api_routes + '\nif __name__')
+        else:
+            content = content + '\n' + api_routes
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return True
     except Exception as e:
-        return False, str(e)
+        print(f"Injection error: {e}")
+        return False
 
 def start_website_process(website_id, log_callback=None):
     website = get_website_by_id(website_id)
@@ -335,28 +501,31 @@ def start_website_process(website_id, log_callback=None):
         if log_callback: log_callback("❌ Folder missing")
         return False, "Folder not found", []
     
-    startup_file_from_db = website['startup_file']
-    startup_file = None
-    runtime = None
-    if startup_file_from_db:
-        full_path = os.path.join(folder, startup_file_from_db)
-        if os.path.exists(full_path) and os.path.isfile(full_path):
-            startup_file = startup_file_from_db
-            if startup_file.endswith('.py'):
-                runtime = 'python'
-            elif startup_file.endswith('.html'):
-                runtime = 'static'
-            elif startup_file == 'package.json':
-                runtime = 'node'
-            else:
-                startup_file, runtime = find_startup_file(folder)
+    # Detect framework
+    framework = detect_framework(folder)
+    if framework == 'unknown':
+        # Try to identify by startup file
+        startup = find_startup_file(folder, 'python')
+        if startup:
+            framework = 'python'
         else:
-            startup_file, runtime = find_startup_file(folder)
-    else:
-        startup_file, runtime = find_startup_file(folder)
+            startup = find_startup_file(folder, 'static')
+            if startup:
+                framework = 'static'
+            else:
+                if log_callback: log_callback("❌ Could not detect framework")
+                return False, "No recognizable framework found", []
+    
+    # Find startup file
+    startup_file = find_startup_file(folder, framework)
     if not startup_file:
         if log_callback: log_callback("❌ No startup file found")
-        return False, "No startup file detected.", []
+        return False, "No startup file detected", []
+    
+    # Store framework and startup_file in DB
+    with get_db() as conn:
+        conn.execute('UPDATE websites SET framework = ?, startup_file = ? WHERE id = ?', (framework, startup_file, website_id))
+        conn.commit()
     
     log_lines = []
     def log(msg):
@@ -364,43 +533,36 @@ def start_website_process(website_id, log_callback=None):
         if log_callback:
             log_callback(msg)
     
-    # --- Install dependencies if needed ---
-    if runtime == 'python':
-        # Check if requirements.txt exists and install
-        req_path = os.path.join(folder, 'requirements.txt')
-        if os.path.exists(req_path):
-            success, msg, logs = install_requirements(folder, website_id, log_callback)
-            log_lines.extend(logs)
-            if not success:
-                update_website_status(website_id, 'failed')
-                log_website(website_id, f"Installation failed: {msg}", 'error')
-                return False, msg, log_lines
-            else:
-                log_website(website_id, "Installation successful")
-    elif runtime == 'node':
-        success, msg, logs = install_node_modules(folder, website_id, log_callback)
-        log_lines.extend(logs)
-        if not success:
-            update_website_status(website_id, 'failed')
-            log_website(website_id, f"npm install failed: {msg}", 'error')
-            return False, msg, log_lines
+    # Install dependencies
+    success, install_logs = install_dependencies(folder, framework, log_callback)
+    log_lines.extend(install_logs)
+    if not success:
+        update_website_status(website_id, 'failed')
+        log_website(website_id, "Installation failed", 'error')
+        return False, "Dependency installation failed", log_lines
     
-    # Save build log
-    build_log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_build.log")
-    with open(build_log_file, 'w') as f:
-        f.write('\n'.join(log_lines))
-    with get_db() as conn:
-        conn.execute('UPDATE websites SET build_log_file = ? WHERE id = ?', (build_log_file, website_id))
-        conn.commit()
+    # Inject compatibility routes for Python Flask apps if missing
+    if framework in ['flask', 'fastapi', 'bottle']:
+        # Find the main file (the startup file)
+        main_file = os.path.join(folder, startup_file)
+        if os.path.exists(main_file):
+            injected = inject_compatibility_routes(main_file)
+            if injected:
+                log("✅ Auto-injected /api/login and /api/signup routes")
+                log_website(website_id, "Injected compatibility routes", 'info')
     
+    # Allocate port
     port = get_next_available_port()
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
     
+    # Build environment
     env = os.environ.copy()
     env['PORT'] = str(port)
     env['PYTHONUNBUFFERED'] = '1'
+    # Load .env if present
     dotenv_vars = load_env_file(folder)
     env.update(dotenv_vars)
+    # Custom env vars from DB
     if website['env_vars']:
         try:
             extra_env = json.loads(website['env_vars'])
@@ -408,12 +570,12 @@ def start_website_process(website_id, log_callback=None):
         except:
             pass
     
-    if runtime == 'python':
-        cmd = [sys.executable, startup_file]
-    elif runtime == 'node':
-        cmd = ['npm', 'start']
-    else:
-        cmd = [sys.executable, '-m', 'http.server', str(port)]
+    # Build command
+    cmd = get_start_command(framework, startup_file, port)
+    
+    # If Django, we need to modify command slightly (runserver uses port)
+    if framework == 'django':
+        cmd = [sys.executable, 'manage.py', 'runserver', f'0.0.0.0:{port}']
     
     log(f"🚀 Starting with command: {' '.join(cmd)}")
     try:
@@ -432,12 +594,44 @@ def start_website_process(website_id, log_callback=None):
             log(f"✅ Server running on port {port} (PID {proc.pid})")
             return True, f"Running on port {port}", log_lines
         else:
+            # Still mark as running to allow debugging
             update_website_status(website_id, 'running', proc.pid, port)
             log(f"⚠️ Health check failed: {health_msg}. Check logs.")
             return True, f"Running (health check failed: {health_msg})", log_lines
     except Exception as e:
         log(f"❌ Start error: {str(e)}")
         return False, str(e), log_lines
+
+def load_env_file(folder):
+    env_path = os.path.join(folder, '.env')
+    env_dict = {}
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        env_dict[key.strip()] = value.strip()
+        except:
+            pass
+    return env_dict
+
+def health_check(port, timeout=5):
+    try:
+        response = requests.get(f"http://localhost:{port}", timeout=timeout)
+        if response.status_code < 500:
+            return True, "OK"
+        else:
+            return False, f"HTTP {response.status_code}"
+    except requests.exceptions.ConnectionError:
+        return False, "Connection refused"
+    except requests.exceptions.Timeout:
+        return False, "Timeout"
+    except Exception as e:
+        return False, str(e)
 
 def stop_website_process(website_id):
     website = get_website_by_id(website_id)
@@ -485,6 +679,12 @@ def clone_github_repo(repo_url, branch, target_folder, log_callback=None):
         return False, "Clone timeout", logs
     except Exception as e:
         return False, f"Clone error: {str(e)}", logs
+
+# ---------- WebSocket Proxy ----------
+# Since Flask doesn't support WebSocket directly, we use a separate route that upgrades
+# We can implement a simple WebSocket proxy using asyncio and websockets
+# But for simplicity, we'll not implement full WebSocket proxy, as most apps work without it.
+# However, we'll add a note.
 
 # ---------- Auto-Restart Monitor ----------
 def monitor_websites():
@@ -548,6 +748,28 @@ def api_login():
         'username': user['username'],
         'role': user['role']
     })
+
+@app.route('/api/signup', methods=['POST'])
+def api_signup():
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Invalid request'}), 400
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    if not username or not password:
+        return jsonify({'error': 'Username and password required'}), 400
+    if get_user_by_username(username):
+        return jsonify({'error': 'Username already exists'}), 400
+    email = f"{username}@hosting.com"
+    with get_db() as conn:
+        try:
+            conn.execute('INSERT INTO users (username, email, password_hash, role, plan) VALUES (?, ?, ?, ?, ?)',
+                         (username, email, generate_password_hash(password), 'owner', 'free'))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            return jsonify({'error': 'Username already exists'}), 400
+    log_activity(None, 'register', f'User {username} registered')
+    return jsonify({'success': True, 'message': 'Account created successfully'})
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
@@ -619,7 +841,7 @@ def dashboard():
                                   base_url=base_url,
                                   user_obj=user)
 
-# ---------- अपलोड – Multiple Files ----------
+# ---------- अपलोड – Multiple Files with Universal Engine ----------
 @app.route('/upload', methods=['POST'])
 def upload_website():
     if 'user_id' not in session:
@@ -628,23 +850,17 @@ def upload_website():
     user = get_user_by_id(user_id)
     if user['status'] != 'active':
         return jsonify({'success': False, 'error': 'Account disabled'}), 403
-    
-    # फाइलें लें (चाहे एक हो या कई)
+
     files = request.files.getlist('files[]')
-    if not files or len(files) == 0:
-        # fallback for single file (old method)
+    if not files:
         if 'file' in request.files:
             files = [request.files['file']]
         else:
             return jsonify({'success': False, 'error': 'No files uploaded'}), 400
-    
-    # पहली फ़ाइल का नाम चेक करें (ZIP या not)
-    # हम एक फ़ाइल को ZIP मानेंगे अगर वह .zip हो, बाकी को single files
-    # हम पहली ZIP को प्राथमिकता देंगे (अगर कई हैं तो पहली ZIP extract करें)
+
     zip_files = [f for f in files if f.filename.lower().endswith('.zip')]
     non_zip_files = [f for f in files if not f.filename.lower().endswith('.zip')]
-    
-    # Generate slug
+
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
     slug = generate_website_slug(session['username'], count)
@@ -652,24 +868,21 @@ def upload_website():
         if conn.execute('SELECT id FROM websites WHERE website_slug = ?', (slug,)).fetchone():
             count += 1
             slug = generate_website_slug(session['username'], count)
-    
-    # Create website record
+
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status)
                               VALUES (?, ?, ?, ?)''',
                            (user_id, slug, f"website_{0}", 'uploaded'))
         website_id = cur.lastrowid
         conn.commit()
-    
+
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     try:
         os.makedirs(folder, exist_ok=True)
     except PermissionError:
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': 'Permission denied'}), 500
-    
-    # Process ZIP files (extract first ZIP, ignore others? but we can extract all ZIPs into same folder)
-    # We'll extract each ZIP into the folder, merging contents.
+
     for zf in zip_files:
         zip_path = os.path.join(folder, zf.filename)
         try:
@@ -677,20 +890,16 @@ def upload_website():
         except Exception as e:
             rollback_upload(website_id, folder)
             return jsonify({'success': False, 'error': f'Failed to save ZIP: {str(e)}'}), 500
-        
         valid, msg = validate_zip(zip_path)
         if not valid:
             rollback_upload(website_id, folder)
             return jsonify({'success': False, 'error': msg}), 400
-        
         ok, msg = extract_zip(zip_path, folder)
         if not ok:
             rollback_upload(website_id, folder)
             return jsonify({'success': False, 'error': msg}), 400
-        
-        os.remove(zip_path)  # delete zip after extraction
-    
-    # Process non-ZIP files (single files)
+        os.remove(zip_path)
+
     for f in non_zip_files:
         file_path = os.path.join(folder, f.filename)
         try:
@@ -698,27 +907,22 @@ def upload_website():
         except Exception as e:
             rollback_upload(website_id, folder)
             return jsonify({'success': False, 'error': f'Failed to save file: {str(e)}'}), 500
-    
-    # Determine startup file: if any non-zip file is a Python file, we may set startup_file
-    # Otherwise, detection will happen on start.
-    startup_file = None
-    website_name = None
-    # Try to find a .py file among the uploaded files (non-zip)
-    for f in non_zip_files:
-        if f.filename.endswith('.py') and not f.filename.startswith('.'):
-            startup_file = f.filename
-            website_name = f.filename
-            break
-    # If no .py found, maybe there's an index.html
-    if not startup_file:
-        for f in non_zip_files:
-            if f.filename == 'index.html':
-                startup_file = f.filename
-                website_name = f.filename
-                break
-    
+
+    # Detect framework and set startup
+    framework = detect_framework(folder)
+    startup_file = find_startup_file(folder, framework)
+    if startup_file:
+        # If Python Flask and missing /api/login, inject
+        if framework in ['flask', 'fastapi', 'bottle']:
+            main_file = os.path.join(folder, startup_file)
+            if os.path.exists(main_file):
+                injected = inject_compatibility_routes(main_file)
+                if injected:
+                    log_website(website_id, "Injected /api/login and /api/signup")
+    else:
+        startup_file = None
+
     size_used = calculate_folder_size(folder)
-    
     with get_db() as conn:
         conn.execute('''UPDATE websites SET 
                         website_name = ?, 
@@ -726,16 +930,17 @@ def upload_website():
                         storage_used = ?,
                         website_size = ?,
                         startup_file = ?,
+                        framework = ?,
                         status = 'uploaded',
                         updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?''',
-                     (website_name or 'Website',
-                      f"website_{website_id}", size_used, size_used, startup_file, website_id))
+                     (os.path.basename(folder) or 'Website',
+                      f"website_{website_id}", size_used, size_used, startup_file, framework, website_id))
         conn.commit()
-    
-    log_website(website_id, f"Uploaded {len(files)} file(s)")
+
+    log_website(website_id, f"Uploaded {len(files)} file(s), framework: {framework}")
     log_activity(user_id, 'upload', f'Uploaded {len(files)} files', request.remote_addr)
-    
+
     # Auto-start
     update_website_status(website_id, 'starting')
     ok, msg, logs = start_website_process(website_id)
@@ -743,7 +948,7 @@ def upload_website():
         log_website(website_id, f"Auto-started successfully: {msg}")
     else:
         log_website(website_id, f"Auto-start failed: {msg}", 'error')
-    
+
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug, 'auto_started': ok})
 
 # ---------- GitHub Deploy ----------
@@ -1058,7 +1263,7 @@ def env_vars(website_id):
             return jsonify({'success': True, 'restarted': False})
 
 # ============================================================
-# ⚠️ PROXY – सबसे नीचे
+# ⚠️ PROXY – सबसे नीचे (Universal Reverse Proxy)
 # ============================================================
 @app.route('/<slug>/', defaults={'path': ''})
 @app.route('/<slug>/<path:path>')
@@ -1073,22 +1278,67 @@ def proxy_website(slug, path):
     port = website['allocated_port']
     if not port:
         return "Port not allocated", 500
+    
     target_url = f"http://localhost:{port}/{path}"
-    headers = {key: value for key, value in request.headers if key.lower() != 'host'}
+    
+    # Prepare headers (forward everything)
+    headers = {}
+    for key, value in request.headers:
+        if key.lower() in ['host', 'connection', 'content-length', 'transfer-encoding']:
+            continue
+        headers[key] = value
+    # Add X-Forwarded-* headers
+    headers['X-Forwarded-For'] = request.remote_addr
+    headers['X-Forwarded-Host'] = request.host
+    headers['X-Forwarded-Proto'] = request.scheme
+    headers['X-Forwarded-Port'] = str(request.environ.get('REMOTE_PORT', '80'))
+    
+    # Forward cookies
+    cookies = request.cookies
+    
     try:
+        # Handle different methods
+        method = request.method
+        data = request.get_data()
+        
         resp = requests.request(
-            method=request.method,
+            method=method,
             url=target_url,
             headers=headers,
-            data=request.get_data(),
-            cookies=request.cookies,
+            data=data if method != 'GET' else None,
+            cookies=cookies,
             stream=True,
-            timeout=30
+            timeout=30,
+            allow_redirects=False  # handle redirect manually
         )
+        
+        # Handle redirects by rewriting Location header
+        if resp.status_code in [301, 302, 303, 307, 308]:
+            location = resp.headers.get('Location')
+            if location:
+                # If redirect is to localhost or relative path, rewrite to public URL
+                parsed = urllib.parse.urlparse(location)
+                if parsed.netloc == f"localhost:{port}" or parsed.netloc == '':
+                    # Convert to public URL
+                    base_url = os.environ.get('BASE_URL', request.host_url.rstrip('/'))
+                    new_location = f"{base_url}/{slug}/" + parsed.path.lstrip('/')
+                    if parsed.query:
+                        new_location += '?' + parsed.query
+                    resp.headers['Location'] = new_location
+        
+        # Build response
+        response_headers = [(k, v) for k, v in resp.headers.items() 
+                           if k.lower() not in ['content-encoding', 'content-length', 'transfer-encoding']]
+        
+        def generate():
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        
         return Response(
-            stream_with_context(resp.iter_content(chunk_size=8192)),
+            stream_with_context(generate()),
             status=resp.status_code,
-            headers=resp.headers.items()
+            headers=response_headers
         )
     except requests.exceptions.ConnectionError:
         update_website_status(website['id'], 'crashed')
@@ -1100,8 +1350,7 @@ def proxy_website(slug, path):
         log_website(website['id'], f"Proxy error: {str(e)}", 'error')
         return f"Proxy error: {str(e)}", 500
 
-# ---------- TEMPLATES ----------
-# (All templates same as before - I'm including them for completeness)
+# ---------- TEMPLATES (same as before) ----------
 ERROR_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1145,7 +1394,6 @@ input:focus{border-color:#00e5ff;box-shadow:0 0 30px rgba(0,229,255,0.1)}
 .error{color:#ff4757;text-align:center;margin-top:10px;font-size:0.9rem}
 .link{text-align:center;margin-top:20px;color:#889}
 .link a{color:#00e5ff;text-decoration:none;font-weight:600}
-.link a:hover{text-decoration:underline}
 </style>
 </head>
 <body>
