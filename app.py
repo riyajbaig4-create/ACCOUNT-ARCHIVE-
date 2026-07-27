@@ -8,6 +8,7 @@ import signal
 import time
 import re
 import requests
+import threading
 from datetime import datetime
 from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -34,6 +35,7 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
+        # Users table
         conn.execute('''CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -47,13 +49,13 @@ def init_db():
             last_login TIMESTAMP
         )''')
         
+        # Websites table – custom_domain हटा दिया
         conn.execute('''CREATE TABLE IF NOT EXISTS websites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id INTEGER NOT NULL,
             website_name TEXT,
             website_slug TEXT UNIQUE NOT NULL,
             default_domain TEXT,
-            custom_domain TEXT,
             website_folder TEXT NOT NULL,
             startup_file TEXT,
             python_version TEXT DEFAULT '3',
@@ -94,6 +96,7 @@ def init_db():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_website ON logs(website_id)')
         conn.commit()
         
+        # Default admin
         if conn.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0:
             conn.execute('INSERT INTO users (username, email, password_hash, role, plan) VALUES (?, ?, ?, ?, ?)',
                          ('admin', 'admin@hosting.com', generate_password_hash('admin123'), 'admin', 'pro'))
@@ -225,6 +228,8 @@ def install_requirements(folder, website_id):
             with open(log_file, 'r') as f:
                 error = f.read()[-500:]
             return False, f"Installation failed: {error}"
+        # ✅ इंस्टॉल सफल होने पर requirements.txt डिलीट करें
+        os.remove(req_file)
         return True, "Installation successful"
     except Exception as e:
         return False, f"Installation error: {str(e)}"
@@ -344,6 +349,40 @@ def stop_website_process(website_id):
     update_website_status(website_id, 'stopped', None, None)
     log_website(website_id, f"Stopped (PID {pid})")
     return True, "Stopped"
+
+# ---------- प्रोसेस मॉनिटर (Crash Detection) ----------
+def monitor_websites():
+    """बैकग्राउंड थ्रेड: हर 10 सेकंड में running वेबसाइटों की PID जाँच करता है"""
+    with app.app_context():
+        while True:
+            try:
+                with get_db() as conn:
+                    running_sites = conn.execute(
+                        "SELECT id, pid FROM websites WHERE status = 'running' AND pid IS NOT NULL"
+                    ).fetchall()
+                
+                for site in running_sites:
+                    pid = site['pid']
+                    try:
+                        # UNIX: signal 0 से PID की मौजूदगी चेक करें
+                        if os.name == 'posix':
+                            os.kill(pid, 0)
+                        else:
+                            # Windows: tasklist का उपयोग करें
+                            result = subprocess.run(['tasklist', '/FI', f'PID eq {pid}'], capture_output=True, text=True)
+                            if str(pid) not in result.stdout:
+                                raise ProcessLookupError()
+                    except (ProcessLookupError, OSError):
+                        # प्रोसेस मर चुकी है
+                        update_website_status(site['id'], 'crashed', None, None)
+                        log_website(site['id'], f"Monitor detected crash (PID {pid})", 'error')
+                        with get_db() as conn:
+                            conn.execute('UPDATE websites SET crash_count = crash_count + 1 WHERE id = ?', (site['id'],))
+                            conn.commit()
+            except Exception as e:
+                # मॉनिटर में कोई त्रुटि हो तो उसे लॉग करें
+                print(f"Monitor error: {e}")
+            time.sleep(10)
 
 # ---------- प्रॉक्सी रूट ----------
 @app.route('/<slug>/', defaults={'path': ''})
@@ -768,27 +807,7 @@ def change_subdomain(website_id):
     log_website(website_id, f"Changed slug to {new_slug}")
     return jsonify({'success': True, 'new_slug': new_slug})
 
-@app.route('/website/<int:website_id>/custom_domain', methods=['POST'])
-def set_custom_domain(website_id):
-    if 'user_id' not in session:
-        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
-    website = get_website_by_id(website_id)
-    if not website or website['owner_id'] != session['user_id']:
-        if session.get('role') != 'admin':
-            return jsonify({'success': False, 'error': 'Not found'}), 404
-    
-    domain = request.form.get('domain', '').strip()
-    if not domain or not re.match(r'^([a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}$', domain):
-        return jsonify({'success': False, 'error': 'Invalid domain'}), 400
-    
-    with get_db() as conn:
-        conn.execute('UPDATE websites SET custom_domain = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-                     (domain, website_id))
-        conn.commit()
-    
-    log_website(website_id, f"Custom domain set: {domain}")
-    return jsonify({'success': True, 'domain': domain})
+# ---------- (custom_domain रूट हटा दिया) ----------
 
 # ---------- प्रीमियम UI टेम्प्लेट्स ----------
 ERROR_TEMPLATE = """
@@ -944,11 +963,7 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 .url-edit input:focus{border-color:#00e5ff}
 .url-edit button{padding:8px 16px;background:#00e5ff;border:none;border-radius:12px;color:#000;font-weight:600;cursor:pointer;transition:.2s}
 .url-edit button:hover{transform:scale(1.05)}
-.domain-edit{display:flex;gap:8px;margin-top:8px}
-.domain-edit input{flex:1;padding:8px 12px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;color:#fff;outline:none;font-size:0.85rem}
-.domain-edit input:focus{border-color:#ffaa00}
-.domain-edit button{padding:8px 16px;background:#ffaa00;border:none;border-radius:12px;color:#000;font-weight:600;cursor:pointer;transition:.2s}
-.domain-edit button:hover{transform:scale(1.05)}
+/* custom domain वाला भाग हटा दिया */
 .plan-badge{background:linear-gradient(135deg,#7a00ff,#00e5ff);padding:2px 12px;border-radius:50px;font-size:0.7rem;font-weight:700}
 @media(max-width:600px){.header{flex-direction:column;gap:10px;text-align:center}.grid{grid-template-columns:1fr}}
 </style>
@@ -997,10 +1012,6 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 <input type="text" id="slug_input_{{ w.id }}" value="{{ w.website_slug }}" placeholder="new-slug">
 <button onclick="changeSlug({{ w.id }})">Change</button>
 </div>
-<div class="domain-edit">
-<input type="text" id="domain_input_{{ w.id }}" value="{{ w.custom_domain or '' }}" placeholder="custom.domain.com">
-<button onclick="setDomain({{ w.id }})">Set Domain</button>
-</div>
 </div>
 {% endfor %}
 </div>
@@ -1020,18 +1031,6 @@ fetch('/website/'+id+'/change_url',{
 method:'POST',
 headers:{'Content-Type':'application/x-www-form-urlencoded'},
 body:'slug='+encodeURIComponent(val)
-})
-.then(r=>r.json())
-.then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
-.catch(()=>alert('Network error'));
-}
-function setDomain(id){
-const val=document.getElementById('domain_input_'+id).value.trim();
-if(!val)return alert('Enter domain');
-fetch('/website/'+id+'/custom_domain',{
-method:'POST',
-headers:{'Content-Type':'application/x-www-form-urlencoded'},
-body:'domain='+encodeURIComponent(val)
 })
 .then(r=>r.json())
 .then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
@@ -1162,7 +1161,11 @@ No logs yet.
 </html>
 """
 
-# ---------- सर्वर स्टार्ट ----------
+# ---------- सर्वर स्टार्ट और मॉनिटर थ्रेड ----------
 if __name__ == '__main__':
+    # मॉनिटर थ्रेड को डेमॉन के रूप में शुरू करें
+    monitor_thread = threading.Thread(target=monitor_websites, daemon=True)
+    monitor_thread.start()
+    
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
