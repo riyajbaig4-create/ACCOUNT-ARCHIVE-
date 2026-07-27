@@ -282,39 +282,43 @@ def health_check(port, timeout=5):
     except Exception as e:
         return False, str(e)
 
-def start_website_process(website_id):
+def start_website_process(website_id, log_callback=None):
+    """Start website and send build logs via callback."""
     website = get_website_by_id(website_id)
     if not website:
         return False, "Website not found", []
     
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     if not os.path.exists(folder):
-        log_website(website_id, "Folder missing", 'error')
-        update_website_status(website_id, 'failed')
+        if log_callback: log_callback("❌ Folder missing")
         return False, "Folder not found", []
     
     startup_file, runtime = find_startup_file(folder)
     if not startup_file:
-        log_website(website_id, "No startup file or index.html or package.json", 'error')
-        update_website_status(website_id, 'failed')
-        return False, "No startup file detected. Please upload a valid Python project, Node.js project, or static site with index.html.", []
+        if log_callback: log_callback("❌ No startup file found")
+        return False, "No startup file detected.", []
     
     log_lines = []
+    def log(msg):
+        log_lines.append(msg)
+        if log_callback:
+            log_callback(msg)
+    
+    # Install dependencies
     if runtime == 'python':
         success, msg, logs = install_requirements(folder, website_id)
         log_lines.extend(logs)
+        for l in logs: log(l)
         if not success:
-            log_website(website_id, f"Requirements failed: {msg}", 'error')
-            update_website_status(website_id, 'failed')
             return False, msg, log_lines
     elif runtime == 'node':
         success, msg, logs = install_node_modules(folder, website_id)
         log_lines.extend(logs)
+        for l in logs: log(l)
         if not success:
-            log_website(website_id, f"npm install failed: {msg}", 'error')
-            update_website_status(website_id, 'failed')
             return False, msg, log_lines
     
+    # Save build log
     build_log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_build.log")
     with open(build_log_file, 'w') as f:
         f.write('\n'.join(log_lines))
@@ -322,9 +326,9 @@ def start_website_process(website_id):
         conn.execute('UPDATE websites SET build_log_file = ? WHERE id = ?', (build_log_file, website_id))
         conn.commit()
     
+    # Port and env
     port = get_next_available_port()
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
-    
     env = os.environ.copy()
     env['PORT'] = str(port)
     env['PYTHONUNBUFFERED'] = '1'
@@ -342,6 +346,7 @@ def start_website_process(website_id):
     else:
         cmd = [sys.executable, '-m', 'http.server', str(port)]
     
+    log(f"🚀 Starting with command: {' '.join(cmd)}")
     try:
         if os.name == 'nt':
             proc = subprocess.Popen(cmd, cwd=folder, env=env,
@@ -354,16 +359,12 @@ def start_website_process(website_id):
         
         time.sleep(3)
         healthy, health_msg = health_check(port, timeout=5)
-        
         if healthy:
             update_website_status(website_id, 'running', proc.pid, port)
-            log_website(website_id, f"Started on port {port} (PID {proc.pid})")
-            with get_db() as conn:
-                conn.execute('UPDATE websites SET startup_file = ?, last_started = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-                             (startup_file, website_id))
-                conn.commit()
+            log(f"✅ Server running on port {port} (PID {proc.pid})")
             return True, f"Running on port {port}", log_lines
         else:
+            log(f"❌ Health check failed: {health_msg}")
             try:
                 if os.name == 'nt':
                     subprocess.run(['taskkill', '/PID', str(proc.pid), '/F'], capture_output=True)
@@ -372,12 +373,9 @@ def start_website_process(website_id):
             except:
                 pass
             update_website_status(website_id, 'crashed')
-            log_website(website_id, f"Health check failed: {health_msg}", 'error')
             return False, f"Health check failed: {health_msg}", log_lines
-            
     except Exception as e:
-        log_website(website_id, f"Start error: {str(e)}", 'error')
-        update_website_status(website_id, 'failed')
+        log(f"❌ Start error: {str(e)}")
         return False, str(e), log_lines
 
 def stop_website_process(website_id):
@@ -403,28 +401,28 @@ def stop_website_process(website_id):
     log_website(website_id, f"Stopped (PID {pid})")
     return True, "Stopped"
 
-def clone_github_repo(repo_url, branch, target_folder, token=None):
+def clone_github_repo(repo_url, branch, target_folder, log_callback=None):
+    """Clone repo and call log_callback with each line of output."""
     logs = []
-    safe_url = repo_url.replace(token+'@', '') if token else repo_url
-    logs.append(f"Cloning {safe_url} (branch: {branch})")
+    def log(msg):
+        logs.append(msg)
+        if log_callback:
+            log_callback(msg)
+    safe_url = repo_url.replace('https://', '').replace('http://', '')
+    log(f"Cloning {safe_url} (branch: {branch})")
     
     cmd = ['git', 'clone', '--branch', branch, '--depth', '1', repo_url, target_folder]
-    if token:
-        import urllib.parse
-        parsed = urllib.parse.urlparse(repo_url)
-        if parsed.scheme == 'https':
-            netloc = f"{parsed.username}:{token}@{parsed.hostname}" if parsed.username else f"{token}@{parsed.hostname}"
-            auth_url = parsed._replace(netloc=netloc).geturl()
-            cmd = ['git', 'clone', '--branch', branch, '--depth', '1', auth_url, target_folder]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in proc.stdout:
-            logs.append(line.strip())
+            line = line.strip()
+            if line:
+                log(line)
         proc.wait(timeout=GIT_CLONE_TIMEOUT)
         if proc.returncode != 0:
             error = ''.join(logs[-100:])
             return False, f"Git clone failed: {error}", logs
-        logs.append("✅ Clone successful")
+        log("✅ Clone successful")
         return True, "Clone successful", logs
     except subprocess.TimeoutExpired:
         proc.kill()
@@ -432,6 +430,7 @@ def clone_github_repo(repo_url, branch, target_folder, token=None):
     except Exception as e:
         return False, f"Clone error: {str(e)}", logs
 
+# ---------- Auto-Restart Monitor ----------
 def monitor_websites():
     while True:
         try:
@@ -683,30 +682,25 @@ def upload_website():
     
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
-# ---------- GitHub Deploy ----------
-@app.route('/deploy_github', methods=['POST'])
-def deploy_github():
+# ---------- GitHub Deploy with SSE ----------
+@app.route('/deploy_github/stream', methods=['POST'])
+def deploy_github_stream():
     if 'user_id' not in session:
-        return jsonify({'success': False, 'error': 'Not logged in'}), 401
-    
-    user_id = session['user_id']
-    user = get_user_by_id(user_id)
-    if user['status'] != 'active':
-        return jsonify({'success': False, 'error': 'Account disabled'}), 403
+        return jsonify({'error': 'Unauthorized'}), 401
     
     data = request.get_json()
     if not data:
-        return jsonify({'success': False, 'error': 'Invalid JSON'}), 400
+        return jsonify({'error': 'Invalid JSON'}), 400
     
     repo_url = data.get('repo_url', '').strip()
     branch = data.get('branch', 'main').strip()
-    token = data.get('token', '').strip()
     if not repo_url:
-        return jsonify({'success': False, 'error': 'Repo URL required'}), 400
-    
+        return jsonify({'error': 'Repo URL required'}), 400
     if not repo_url.endswith('.git'):
         repo_url += '.git'
     
+    # Create website record
+    user_id = session['user_id']
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
     slug = generate_website_slug(session['username'], count)
@@ -725,32 +719,33 @@ def deploy_github():
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     os.makedirs(folder, exist_ok=True)
     
-    success, msg, logs = clone_github_repo(repo_url, branch, folder, token)
+    def generate():
+        def log_callback(msg):
+            yield f"data: {json.dumps({'type': 'log', 'message': msg})}\n\n"
+        
+        # Clone
+        success, msg, logs = clone_github_repo(repo_url, branch, folder, log_callback)
+        if not success:
+            yield f"data: {json.dumps({'type': 'error', 'message': msg})}\n\n"
+            shutil.rmtree(folder, ignore_errors=True)
+            with get_db() as conn:
+                conn.execute('DELETE FROM websites WHERE id = ?', (website_id,))
+                conn.execute('DELETE FROM logs WHERE website_id = ?', (website_id,))
+                conn.commit()
+            return
+        
+        # Build and start
+        def start_callback(msg):
+            yield f"data: {json.dumps({'type': 'build', 'message': msg})}\n\n"
+        
+        update_website_status(website_id, 'starting')
+        ok, start_msg, start_logs = start_website_process(website_id, start_callback)
+        if ok:
+            yield f"data: {json.dumps({'type': 'done', 'website_id': website_id, 'slug': slug})}\n\n"
+        else:
+            yield f"data: {json.dumps({'type': 'error', 'message': start_msg})}\n\n"
     
-    if not success:
-        shutil.rmtree(folder, ignore_errors=True)
-        with get_db() as conn:
-            conn.execute('DELETE FROM websites WHERE id = ?', (website_id,))
-            conn.execute('DELETE FROM logs WHERE website_id = ?', (website_id,))
-            conn.commit()
-        return jsonify({'success': False, 'error': msg, 'logs': logs}), 400
-    
-    build_log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_build.log")
-    with open(build_log_file, 'w') as f:
-        f.write('\n'.join(logs))
-    with get_db() as conn:
-        conn.execute('UPDATE websites SET build_log_file = ? WHERE id = ?', (build_log_file, website_id))
-        conn.commit()
-    
-    update_website_status(website_id, 'starting')
-    ok, msg, start_logs = start_website_process(website_id)
-    
-    if ok:
-        with open(build_log_file, 'a') as f:
-            f.write('\n'.join(start_logs))
-        return jsonify({'success': True, 'website_id': website_id, 'slug': slug, 'message': msg})
-    else:
-        return jsonify({'success': False, 'error': msg, 'logs': logs + start_logs}), 500
+    return Response(generate(), mimetype='text/event-stream')
 
 # ---------- वेबसाइट मैनेजमेंट API ----------
 @app.route('/website/<int:website_id>/start', methods=['POST'])
@@ -1132,6 +1127,7 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 .github-box input:focus{border-color:#00e5ff}
 .github-btn{background:linear-gradient(135deg,#f0f0f0,#ccc);border:none;padding:10px 30px;border-radius:50px;color:#000;font-weight:700;cursor:pointer;transition:.3s;margin-top:10px}
 .github-btn:hover{transform:scale(1.05);box-shadow:0 0 30px rgba(255,255,255,0.1)}
+.github-logs{background:#05070d;padding:10px;border-radius:10px;max-height:250px;overflow-y:auto;font-family:monospace;font-size:12px;color:#aab;display:none;white-space:pre-wrap;margin-top:10px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:25px;margin-top:20px}
 .card{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.07);border-radius:20px;padding:25px;transition:.3s}
 .card:hover{transform:translateY(-5px);border-color:rgba(0,229,255,0.2);box-shadow:0 20px 60px rgba(0,0,0,0.3)}
@@ -1190,9 +1186,9 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 <h3>🐙 Deploy from GitHub</h3>
 <input type="text" id="repoUrl" placeholder="https://github.com/username/repo.git">
 <input type="text" id="repoBranch" placeholder="branch (default: main)" value="main">
-<input type="password" id="githubToken" placeholder="GitHub Token (for private repos, optional)">
 <button class="github-btn" id="deployGitHubBtn">Deploy from GitHub</button>
 <div id="githubStatus" style="margin-top:10px;"></div>
+<div id="githubLogs" class="github-logs"></div>
 </div>
 
 <h2 style="margin-bottom:15px;">Your Websites</h2>
@@ -1273,21 +1269,48 @@ fetch('/upload',{method:'POST',body:fd})
 document.getElementById('deployGitHubBtn').onclick=function(){
 const repo=document.getElementById('repoUrl').value.trim();
 const branch=document.getElementById('repoBranch').value.trim() || 'main';
-const token=document.getElementById('githubToken').value.trim();
 if(!repo)return alert('Enter GitHub repo URL');
 const st=document.getElementById('githubStatus');
-st.innerHTML='⏳ Cloning from GitHub...';
-fetch('/deploy_github',{
+const logBox=document.getElementById('githubLogs');
+logBox.style.display='block';
+logBox.innerHTML='';
+st.innerHTML='⏳ Deploying...';
+
+fetch('/deploy_github/stream', {
 method:'POST',
 headers:{'Content-Type':'application/json'},
-body:JSON.stringify({repo_url:repo,branch:branch,token:token})
-})
-.then(r=>r.json())
-.then(d=>{
-if(d.success){st.innerHTML='✅ Deployed! Website ID: '+d.website_id;location.reload();}
-else{st.innerHTML='❌ '+d.error;if(d.logs)console.log(d.logs);}
-})
-.catch(()=>st.innerHTML='❌ Network error');
+body:JSON.stringify({repo_url:repo, branch:branch})
+}).then(response => {
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+function read() {
+reader.read().then(({done, value}) => {
+if (done) return;
+const chunk = decoder.decode(value);
+const lines = chunk.split('\\n');
+for (let line of lines) {
+if (line.startsWith('data: ')) {
+try {
+const data = JSON.parse(line.slice(6));
+if (data.type === 'log' || data.type === 'build') {
+logBox.innerHTML += data.message + '\\n';
+logBox.scrollTop = logBox.scrollHeight;
+} else if (data.type === 'done') {
+st.innerHTML = '✅ Deployed! Website ID: ' + data.website_id;
+setTimeout(() => location.reload(), 2000);
+} else if (data.type === 'error') {
+st.innerHTML = '❌ ' + data.message;
+}
+} catch(e) {}
+}
+}
+read();
+});
+}
+read();
+}).catch(() => {
+st.innerHTML = '❌ Network error';
+});
 };
 </script>
 </body>
