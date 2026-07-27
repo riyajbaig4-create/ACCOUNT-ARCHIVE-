@@ -215,28 +215,22 @@ def extract_zip(zip_path, extract_to):
         return False, f"Extraction failed: {str(e)}"
 
 def find_startup_file(folder):
-    # Python priority
     for filename in STARTUP_PRIORITY:
         if os.path.exists(os.path.join(folder, filename)):
             return filename, 'python'
-    # Any .py file (except __init__.py)
     for f in os.listdir(folder):
         if f.endswith('.py') and f != '__init__.py':
             return f, 'python'
-    # Node.js
     if os.path.exists(os.path.join(folder, 'package.json')):
         return 'package.json', 'node'
-    # Static
     if os.path.exists(os.path.join(folder, 'index.html')):
         return 'index.html', 'static'
-    # Any .html file
     for f in os.listdir(folder):
         if f.endswith('.html'):
             return f, 'static'
     return None, None
 
 def load_env_file(folder):
-    """Read .env file from folder and return dict of env vars."""
     env_path = os.path.join(folder, '.env')
     env_dict = {}
     if os.path.exists(env_path):
@@ -257,7 +251,6 @@ def install_requirements(folder, website_id, log_file=None):
     req_file = os.path.join(folder, 'requirements.txt')
     if not os.path.exists(req_file):
         return True, "No requirements.txt", []
-    
     if log_file is None:
         log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
     logs = []
@@ -279,7 +272,6 @@ def install_requirements(folder, website_id, log_file=None):
 def install_node_modules(folder, website_id, log_file=None):
     if not os.path.exists(os.path.join(folder, 'package.json')):
         return True, "No package.json", []
-    
     if log_file is None:
         log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
     logs = []
@@ -316,17 +308,13 @@ def start_website_process(website_id, log_callback=None):
     website = get_website_by_id(website_id)
     if not website:
         return False, "Website not found", []
-    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     if not os.path.exists(folder):
         if log_callback: log_callback("❌ Folder missing")
         return False, "Folder not found", []
-    
-    # DB में सेव startup_file को प्रायोरिटी दें
     startup_file_from_db = website['startup_file']
     startup_file = None
     runtime = None
-    
     if startup_file_from_db:
         full_path = os.path.join(folder, startup_file_from_db)
         if os.path.exists(full_path) and os.path.isfile(full_path):
@@ -343,18 +331,14 @@ def start_website_process(website_id, log_callback=None):
             startup_file, runtime = find_startup_file(folder)
     else:
         startup_file, runtime = find_startup_file(folder)
-    
     if not startup_file:
         if log_callback: log_callback("❌ No startup file found")
         return False, "No startup file detected.", []
-    
     log_lines = []
     def log(msg):
         log_lines.append(msg)
         if log_callback:
             log_callback(msg)
-    
-    # Install deps
     if runtime == 'python':
         success, msg, logs = install_requirements(folder, website_id)
         log_lines.extend(logs)
@@ -367,41 +351,31 @@ def start_website_process(website_id, log_callback=None):
         for l in logs: log(l)
         if not success:
             return False, msg, log_lines
-    
     build_log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_build.log")
     with open(build_log_file, 'w') as f:
         f.write('\n'.join(log_lines))
     with get_db() as conn:
         conn.execute('UPDATE websites SET build_log_file = ? WHERE id = ?', (build_log_file, website_id))
         conn.commit()
-    
     port = get_next_available_port()
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
-    
-    # Base environment
     env = os.environ.copy()
     env['PORT'] = str(port)
     env['PYTHONUNBUFFERED'] = '1'
-    
-    # Load .env file if present
     dotenv_vars = load_env_file(folder)
     env.update(dotenv_vars)
-    
-    # DB env vars (from button) override .env
     if website['env_vars']:
         try:
             extra_env = json.loads(website['env_vars'])
             env.update(extra_env)
         except:
             pass
-    
     if runtime == 'python':
         cmd = [sys.executable, startup_file]
     elif runtime == 'node':
         cmd = ['npm', 'start']
     else:
         cmd = [sys.executable, '-m', 'http.server', str(port)]
-    
     log(f"🚀 Starting with command: {' '.join(cmd)}")
     try:
         if os.name == 'nt':
@@ -412,7 +386,6 @@ def start_website_process(website_id, log_callback=None):
             proc = subprocess.Popen(cmd, cwd=folder, env=env,
                                     stdout=open(log_file, 'a'), stderr=subprocess.STDOUT,
                                     preexec_fn=os.setsid)
-        
         time.sleep(3)
         healthy, health_msg = health_check(port, timeout=5)
         if healthy:
@@ -420,9 +393,8 @@ def start_website_process(website_id, log_callback=None):
             log(f"✅ Server running on port {port} (PID {proc.pid})")
             return True, f"Running on port {port}", log_lines
         else:
-            # नया: हेल्थ चेक फेल होने पर भी रनिंग मार्क करें, लेकिन वार्निंग दें
             update_website_status(website_id, 'running', proc.pid, port)
-            log(f"⚠️ Health check failed: {health_msg}. Website might not be a web app or may be using wrong port. Check logs.")
+            log(f"⚠️ Health check failed: {health_msg}. Check logs.")
             return True, f"Running (health check failed: {health_msg})", log_lines
     except Exception as e:
         log(f"❌ Start error: {str(e)}")
@@ -432,11 +404,9 @@ def stop_website_process(website_id):
     website = get_website_by_id(website_id)
     if not website:
         return False, "Website not found"
-    
     pid = website['pid']
     if not pid:
         return False, "No running process"
-    
     try:
         if os.name == 'nt':
             subprocess.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True)
@@ -446,7 +416,6 @@ def stop_website_process(website_id):
             os.killpg(os.getpgid(pid), signal.SIGKILL)
     except:
         pass
-    
     update_website_status(website_id, 'stopped', None, None)
     log_website(website_id, f"Stopped (PID {pid})")
     return True, "Stopped"
@@ -459,7 +428,6 @@ def clone_github_repo(repo_url, branch, target_folder, log_callback=None):
             log_callback(msg)
     safe_url = repo_url.replace('https://', '').replace('http://', '')
     log(f"Cloning {safe_url} (branch: {branch})")
-    
     cmd = ['git', 'clone', '--branch', branch, '--depth', '1', repo_url, target_folder]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -508,52 +476,11 @@ def monitor_websites():
 monitor_thread = threading.Thread(target=monitor_websites, daemon=True)
 monitor_thread.start()
 
-# ---------- प्रॉक्सी रूट ----------
-@app.route('/<slug>/', defaults={'path': ''})
-@app.route('/<slug>/<path:path>')
-def proxy_website(slug, path):
-    website = get_website_by_slug(slug)
-    if not website:
-        return render_template_string(ERROR_TEMPLATE, message="Website not found", slug=slug), 404
-    
-    if website['status'] != 'running':
-        return render_template_string(ERROR_TEMPLATE, 
-                                      message="This website is not running. Please start it from the dashboard.",
-                                      slug=slug), 503
-    
-    port = website['allocated_port']
-    if not port:
-        return "Port not allocated", 500
-    
-    target_url = f"http://localhost:{port}/{path}"
-    headers = {key: value for key, value in request.headers if key.lower() != 'host'}
-    
-    try:
-        resp = requests.request(
-            method=request.method,
-            url=target_url,
-            headers=headers,
-            data=request.get_data(),
-            cookies=request.cookies,
-            stream=True,
-            timeout=30
-        )
-        return Response(
-            stream_with_context(resp.iter_content(chunk_size=8192)),
-            status=resp.status_code,
-            headers=resp.headers.items()
-        )
-    except requests.exceptions.ConnectionError:
-        update_website_status(website['id'], 'crashed')
-        log_website(website['id'], "Proxy connection failed - website crashed", 'error')
-        return render_template_string(ERROR_TEMPLATE, 
-                                      message="Website crashed. Please restart from dashboard.",
-                                      slug=slug), 503
-    except Exception as e:
-        log_website(website['id'], f"Proxy error: {str(e)}", 'error')
-        return f"Proxy error: {str(e)}", 500
+# ============================================================
+# ⚠️ सारे स्पेसिफिक रूट्स पहले डिफाइन करो – प्रॉक्सी को सबसे नीचे रखो
+# ============================================================
 
-# ---------- फ्लास्क रूट्स ----------
+# ---------- फ्लास्क रूट्स (स्पेसिफिक) ----------
 @app.route('/')
 def index():
     if 'user_id' in session:
@@ -594,17 +521,13 @@ def api_login():
 def register():
     if request.method == 'GET':
         return render_template_string(REGISTER_TEMPLATE)
-    
     username = request.form.get('username', '').strip()
     email = request.form.get('email', '').strip()
     password = request.form.get('password', '').strip()
-    
     if not username or not email or not password:
         return render_template_string(REGISTER_TEMPLATE, error='All fields required')
-    
     if get_user_by_username(username):
         return render_template_string(REGISTER_TEMPLATE, error='Username already taken')
-    
     with get_db() as conn:
         try:
             conn.execute('INSERT INTO users (username, email, password_hash, role, plan) VALUES (?, ?, ?, ?, ?)',
@@ -612,7 +535,6 @@ def register():
             conn.commit()
         except sqlite3.IntegrityError:
             return render_template_string(REGISTER_TEMPLATE, error='Email or username already exists')
-    
     log_activity(None, 'register', f'User {username} registered')
     return redirect(url_for('index'))
 
@@ -620,27 +542,21 @@ def register():
 def login():
     username = request.form.get('username', '').strip()
     password = request.form.get('password', '').strip()
-    
     if not username or not password:
         return render_template_string(LOGIN_TEMPLATE, error='Please fill all fields')
-    
     user = get_user_by_username(username)
     if not user or not check_password_hash(user['password_hash'], password):
         return render_template_string(LOGIN_TEMPLATE, error='Invalid credentials')
-    
     if user['status'] != 'active':
         return render_template_string(LOGIN_TEMPLATE, error='Account is disabled')
-    
     session['user_id'] = user['id']
     session['username'] = user['username']
     session['role'] = user['role']
     session['plan'] = user['plan']
-    
     with get_db() as conn:
         conn.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                      (user['id'],))
         conn.commit()
-    
     log_activity(user['id'], 'login', 'User logged in')
     return redirect(url_for('dashboard'))
 
@@ -655,7 +571,6 @@ def logout():
 def dashboard():
     if 'user_id' not in session:
         return redirect(url_for('index'))
-    
     rows = get_websites_by_user(session['user_id'])
     base_url = os.environ.get('BASE_URL', request.host_url.rstrip('/'))
     websites = []
@@ -663,7 +578,6 @@ def dashboard():
         site = dict(w)
         site['url'] = f"{base_url}/{site['website_slug']}/"
         websites.append(site)
-    
     user = get_user_by_id(session['user_id'])
     return render_template_string(DASHBOARD_TEMPLATE, 
                                   user=session['username'], 
@@ -673,59 +587,45 @@ def dashboard():
                                   base_url=base_url,
                                   user_obj=user)
 
-# ---------- अपलोड (ZIP + Single File) ----------
 @app.route('/upload', methods=['POST'])
 def upload_website():
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Not logged in'}), 401
-    
     user_id = session['user_id']
     user = get_user_by_id(user_id)
     if user['status'] != 'active':
         return jsonify({'success': False, 'error': 'Account disabled'}), 403
-    
     if 'file' not in request.files:
         return jsonify({'success': False, 'error': 'No file uploaded'}), 400
-    
     file = request.files['file']
     if file.filename == '':
         return jsonify({'success': False, 'error': 'Empty filename'}), 400
-    
-    # Size check
     file.seek(0, os.SEEK_END)
     size = file.tell()
     file.seek(0)
     if size > MAX_UPLOAD_SIZE:
         return jsonify({'success': False, 'error': f'File too large (max {MAX_UPLOAD_SIZE//1024//1024} MB)'}), 400
-    
     filename = file.filename
     is_zip = filename.lower().endswith('.zip')
-    
-    # Generate slug
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
-    
     slug = generate_website_slug(session['username'], count)
     with get_db() as conn:
         if conn.execute('SELECT id FROM websites WHERE website_slug = ?', (slug,)).fetchone():
             count += 1
             slug = generate_website_slug(session['username'], count)
-    
-    # Create website record
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status)
                               VALUES (?, ?, ?, ?)''',
                            (user_id, slug, f"website_{0}", 'uploaded'))
         website_id = cur.lastrowid
         conn.commit()
-    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     try:
         os.makedirs(folder, exist_ok=True)
     except PermissionError:
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': 'Permission denied'}), 500
-    
     if is_zip:
         zip_path = os.path.join(folder, 'upload.zip')
         try:
@@ -733,34 +633,27 @@ def upload_website():
         except Exception as e:
             rollback_upload(website_id, folder)
             return jsonify({'success': False, 'error': f'Failed to save: {str(e)}'}), 500
-        
         valid, msg = validate_zip(zip_path)
         if not valid:
             rollback_upload(website_id, folder)
             return jsonify({'success': False, 'error': msg}), 400
-        
         ok, msg = extract_zip(zip_path, folder)
         if not ok:
             rollback_upload(website_id, folder)
             return jsonify({'success': False, 'error': msg}), 400
-        
         os.remove(zip_path)
-        startup_file = None  # Let detection happen on start
+        startup_file = None
         website_name = filename[:-4] if '.' in filename else filename
     else:
-        # Single file
         file_path = os.path.join(folder, filename)
         try:
             file.save(file_path)
         except Exception as e:
             rollback_upload(website_id, folder)
             return jsonify({'success': False, 'error': f'Failed to save: {str(e)}'}), 500
-        
         startup_file = filename
         website_name = filename
-    
     size_used = calculate_folder_size(folder)
-    
     with get_db() as conn:
         conn.execute('''UPDATE websites SET 
                         website_name = ?, 
@@ -774,38 +667,29 @@ def upload_website():
                      (website_name or file.filename,
                       f"website_{website_id}", size_used, size_used, startup_file, website_id))
         conn.commit()
-    
     log_website(website_id, f"Uploaded: {file.filename}")
     log_activity(user_id, 'upload', f'Uploaded {file.filename}', request.remote_addr)
-    
-    # 🚀 Auto-start after upload
     update_website_status(website_id, 'starting')
     ok, msg, logs = start_website_process(website_id)
     if ok:
         log_website(website_id, f"Auto-started successfully: {msg}")
     else:
         log_website(website_id, f"Auto-start failed: {msg}", 'error')
-    
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug, 'auto_started': ok})
 
-# ---------- GitHub Deploy with SSE ----------
 @app.route('/deploy_github/stream', methods=['POST'])
 def deploy_github_stream():
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    
     data = request.get_json()
     if not data:
         return jsonify({'error': 'Invalid JSON'}), 400
-    
     repo_url = data.get('repo_url', '').strip()
     branch = data.get('branch', 'main').strip()
     if not repo_url:
         return jsonify({'error': 'Repo URL required'}), 400
     if not repo_url.endswith('.git'):
         repo_url += '.git'
-    
-    # Create website record
     user_id = session['user_id']
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
@@ -814,24 +698,18 @@ def deploy_github_stream():
         if conn.execute('SELECT id FROM websites WHERE website_slug = ?', (slug,)).fetchone():
             count += 1
             slug = generate_website_slug(session['username'], count)
-    
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, repo_url, repo_branch)
                               VALUES (?, ?, ?, ?, ?, ?)''',
                            (user_id, slug, f"website_{0}", 'cloning', repo_url, branch))
         website_id = cur.lastrowid
         conn.commit()
-    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     os.makedirs(folder, exist_ok=True)
-    
     log_queue = queue.Queue()
-    
     def log_callback(msg):
         log_queue.put(('log', msg))
-    
     def do_work():
-        # Clone
         success, msg, logs = clone_github_repo(repo_url, branch, folder, log_callback)
         if not success:
             log_queue.put(('error', msg))
@@ -841,21 +719,16 @@ def deploy_github_stream():
                 conn.execute('DELETE FROM logs WHERE website_id = ?', (website_id,))
                 conn.commit()
             return
-        
-        # Build and start
         def start_callback(msg):
             log_queue.put(('build', msg))
-        
         update_website_status(website_id, 'starting')
         ok, start_msg, start_logs = start_website_process(website_id, start_callback)
         if ok:
             log_queue.put(('done', {'website_id': website_id, 'slug': slug}))
         else:
             log_queue.put(('error', start_msg))
-    
     thread = threading.Thread(target=do_work, daemon=True)
     thread.start()
-    
     def generate():
         while True:
             try:
@@ -876,7 +749,6 @@ def deploy_github_stream():
                 continue
             except GeneratorExit:
                 break
-    
     return Response(generate(), mimetype='text/event-stream')
 
 # ---------- वेबसाइट मैनेजमेंट API ----------
@@ -884,18 +756,14 @@ def deploy_github_stream():
 def start_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     if website['status'] in ['running', 'starting']:
         return jsonify({'success': False, 'error': 'Already running'}), 400
-    
     update_website_status(website_id, 'starting')
     ok, msg, logs = start_website_process(website_id)
-    
     if ok:
         return jsonify({'success': True, 'message': msg})
     return jsonify({'success': False, 'error': msg}), 500
@@ -904,15 +772,12 @@ def start_website(website_id):
 def stop_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     if website['status'] not in ['running', 'starting']:
         return jsonify({'success': False, 'error': 'Not running'}), 400
-    
     ok, msg = stop_website_process(website_id)
     if ok:
         return jsonify({'success': True, 'message': msg})
@@ -922,22 +787,17 @@ def stop_website(website_id):
 def restart_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     with get_db() as conn:
         conn.execute('UPDATE websites SET restart_count = restart_count + 1 WHERE id = ?', (website_id,))
         conn.commit()
-    
     if website['status'] == 'running':
         stop_website_process(website_id)
-    
     update_website_status(website_id, 'starting')
     ok, msg, logs = start_website_process(website_id)
-    
     if ok:
         return jsonify({'success': True, 'message': msg})
     return jsonify({'success': False, 'error': msg}), 500
@@ -946,28 +806,22 @@ def restart_website(website_id):
 def delete_website(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     if website['status'] in ['running', 'starting']:
         stop_website_process(website_id)
-    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     shutil.rmtree(folder, ignore_errors=True)
-    
     for f in [f"website_{website_id}.log", f"website_{website_id}_install.log", f"website_{website_id}_build.log"]:
         fp = os.path.join(LOG_FOLDER, f)
         if os.path.exists(fp):
             os.remove(fp)
-    
     with get_db() as conn:
         conn.execute('DELETE FROM websites WHERE id = ?', (website_id,))
         conn.execute('DELETE FROM logs WHERE website_id = ?', (website_id,))
         conn.commit()
-    
     log_activity(session['user_id'], 'delete', f'Deleted website {website_id}', request.remote_addr)
     return jsonify({'success': True})
 
@@ -975,16 +829,13 @@ def delete_website(website_id):
 def files(website_id):
     if 'user_id' not in session:
         return redirect(url_for('index'))
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
-    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     if not os.path.exists(folder):
         abort(404)
-    
     items = []
     for root, dirs, files in os.walk(folder):
         rel = os.path.relpath(root, folder)
@@ -994,31 +845,25 @@ def files(website_id):
             items.append({'name': f, 'path': os.path.join(rel, f).replace('\\', '/'), 'is_dir': False})
         for d in dirs:
             items.append({'name': d, 'path': os.path.join(rel, d).replace('\\', '/'), 'is_dir': True})
-    
     return render_template_string(FILES_TEMPLATE, website=website, items=items)
 
 @app.route('/website/<int:website_id>/edit', methods=['GET', 'POST'])
 def edit_file(website_id):
     if 'user_id' not in session:
         return redirect(url_for('index'))
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
-    
     file_path = request.args.get('path', '').strip()
     if not file_path:
         return "No file path", 400
-    
     full = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", file_path)
     if not os.path.exists(full) or not os.path.isfile(full):
         abort(404)
-    
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in {'.py', '.html', '.css', '.js', '.txt', '.json', '.md', '.yml', '.yaml', '.sh', '.bat', '.xml', '.conf'}:
         return "Cannot edit binary files", 403
-    
     if request.method == 'GET':
         with open(full, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
@@ -1034,49 +879,40 @@ def edit_file(website_id):
 def view_logs(website_id):
     if 'user_id' not in session:
         return redirect(url_for('index'))
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
-    
     with get_db() as conn:
         logs = conn.execute('SELECT * FROM logs WHERE website_id = ? ORDER BY timestamp DESC LIMIT 200', (website_id,)).fetchall()
-    
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
     file_log = ''
     if os.path.exists(log_file):
         with open(log_file, 'r', errors='ignore') as f:
             file_log = f.read()
-    
     install_log = ''
     install_log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
     if os.path.exists(install_log_file):
         with open(install_log_file, 'r', errors='ignore') as f:
             install_log = f.read()
-    
     build_log = ''
     build_log_file = website['build_log_file']
     if build_log_file and os.path.exists(build_log_file):
         with open(build_log_file, 'r', errors='ignore') as f:
             build_log = f.read()
-    
     return render_template_string(LOGS_TEMPLATE, website=website, logs=logs, file_log=file_log, install_log=install_log, build_log=build_log)
 
 @app.route('/website/<int:website_id>/change_url', methods=['POST'])
 def change_subdomain(website_id):
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    
     new_slug = request.form.get('slug', '').strip()
     if not new_slug or not re.match(r'^[a-zA-Z0-9\-]+$', new_slug):
         return jsonify({'success': False, 'error': 'Invalid slug'}), 400
-    
     with get_db() as conn:
         existing = conn.execute('SELECT id FROM websites WHERE website_slug = ? AND id != ?', (new_slug, website_id)).fetchone()
         if existing:
@@ -1091,11 +927,9 @@ def change_subdomain(website_id):
                 'error': f'Slug "{new_slug}" is already taken.',
                 'suggestions': suggestions
             }), 400
-        
         conn.execute('UPDATE websites SET website_slug = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                      (new_slug, website_id))
         conn.commit()
-    
     log_website(website_id, f"Changed slug to {new_slug}")
     return jsonify({'success': True, 'new_slug': new_slug})
 
@@ -1103,12 +937,10 @@ def change_subdomain(website_id):
 def env_vars(website_id):
     if 'user_id' not in session:
         return redirect(url_for('index'))
-    
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
-    
     if request.method == 'GET':
         env_dict = {}
         if website['env_vars']:
@@ -1126,7 +958,6 @@ def env_vars(website_id):
                 conn.commit()
             log_website(website_id, "Cleared environment variables")
             return jsonify({'success': True})
-        
         env_dict = {}
         lines = env_raw.split('\n')
         for line in lines:
@@ -1140,14 +971,11 @@ def env_vars(website_id):
             if not key:
                 return jsonify({'success': False, 'error': 'Empty key not allowed'}), 400
             env_dict[key] = value.strip()
-        
         with get_db() as conn:
             conn.execute('UPDATE websites SET env_vars = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                          (json.dumps(env_dict), website_id))
             conn.commit()
         log_website(website_id, f"Updated environment variables: {list(env_dict.keys())}")
-        
-        # Auto-restart if website is running
         if website['status'] == 'running':
             stop_website_process(website_id)
             time.sleep(1)
@@ -1159,8 +987,53 @@ def env_vars(website_id):
         else:
             return jsonify({'success': True, 'restarted': False})
 
-# ---------- टेम्प्लेट्स ----------
-# (सभी टेम्प्लेट्स पहले की तरह ही हैं, बस ENV_TEMPLATE को KEY=VALUE फॉर्मेट में बदला गया है)
+# ============================================================
+# ⚠️ प्रॉक्सी रूट्स – सबसे नीचे (ताकि अन्य रूट्स पहले मैच हों)
+# ============================================================
+@app.route('/<slug>/', defaults={'path': ''})
+@app.route('/<slug>/<path:path>')
+def proxy_website(slug, path):
+    website = get_website_by_slug(slug)
+    if not website:
+        return render_template_string(ERROR_TEMPLATE, message="Website not found", slug=slug), 404
+    if website['status'] != 'running':
+        return render_template_string(ERROR_TEMPLATE, 
+                                      message="This website is not running. Please start it from the dashboard.",
+                                      slug=slug), 503
+    port = website['allocated_port']
+    if not port:
+        return "Port not allocated", 500
+    target_url = f"http://localhost:{port}/{path}"
+    headers = {key: value for key, value in request.headers if key.lower() != 'host'}
+    try:
+        resp = requests.request(
+            method=request.method,
+            url=target_url,
+            headers=headers,
+            data=request.get_data(),
+            cookies=request.cookies,
+            stream=True,
+            timeout=30
+        )
+        return Response(
+            stream_with_context(resp.iter_content(chunk_size=8192)),
+            status=resp.status_code,
+            headers=resp.headers.items()
+        )
+    except requests.exceptions.ConnectionError:
+        update_website_status(website['id'], 'crashed')
+        log_website(website['id'], "Proxy connection failed - website crashed", 'error')
+        return render_template_string(ERROR_TEMPLATE, 
+                                      message="Website crashed. Please restart from dashboard.",
+                                      slug=slug), 503
+    except Exception as e:
+        log_website(website['id'], f"Proxy error: {str(e)}", 'error')
+        return f"Proxy error: {str(e)}", 500
+
+# ---------- टेम्प्लेट्स (सभी पहले जैसे) ----------
+# (ERROR_TEMPLATE, LOGIN_TEMPLATE, REGISTER_TEMPLATE, DASHBOARD_TEMPLATE, FILES_TEMPLATE, EDIT_TEMPLATE, LOGS_TEMPLATE, ENV_TEMPLATE)
+# मैंने यहाँ सिर्फ जगह बचाने के लिए नहीं डाला है, लेकिन आप अपनी पुरानी फाइल से कॉपी कर सकते हैं।
+# मैं उन्हें पूरा नीचे दे रहा हूँ।
 
 ERROR_TEMPLATE = """
 <!DOCTYPE html>
