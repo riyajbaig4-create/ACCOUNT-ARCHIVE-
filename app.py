@@ -215,22 +215,21 @@ def extract_zip(zip_path, extract_to):
         return False, f"Extraction failed: {str(e)}"
 
 def find_startup_file(folder):
-    """Detect startup file from folder. Returns (filename, runtime_type)"""
-    # 1. Python files (priority)
+    # Python priority
     for filename in STARTUP_PRIORITY:
         if os.path.exists(os.path.join(folder, filename)):
             return filename, 'python'
-    # 2. Any .py file (except __init__.py)
+    # Any .py file (except __init__.py)
     for f in os.listdir(folder):
         if f.endswith('.py') and f != '__init__.py':
             return f, 'python'
-    # 3. Node.js
+    # Node.js
     if os.path.exists(os.path.join(folder, 'package.json')):
         return 'package.json', 'node'
-    # 4. Static (index.html)
+    # Static
     if os.path.exists(os.path.join(folder, 'index.html')):
         return 'index.html', 'static'
-    # 5. Any .html file
+    # Any .html file
     for f in os.listdir(folder):
         if f.endswith('.html'):
             return f, 'static'
@@ -306,17 +305,15 @@ def start_website_process(website_id, log_callback=None):
         if log_callback: log_callback("❌ Folder missing")
         return False, "Folder not found", []
     
-    # Priority: startup_file from DB (if set), else detect
+    # DB में सेव startup_file को प्रायोरिटी दें
     startup_file_from_db = website['startup_file']
     startup_file = None
     runtime = None
     
     if startup_file_from_db:
-        # Check if the file exists
         full_path = os.path.join(folder, startup_file_from_db)
         if os.path.exists(full_path) and os.path.isfile(full_path):
             startup_file = startup_file_from_db
-            # Detect runtime from filename
             if startup_file.endswith('.py'):
                 runtime = 'python'
             elif startup_file.endswith('.html'):
@@ -324,10 +321,8 @@ def start_website_process(website_id, log_callback=None):
             elif startup_file == 'package.json':
                 runtime = 'node'
             else:
-                # Try to detect by scanning
                 startup_file, runtime = find_startup_file(folder)
         else:
-            # File not found, scan
             startup_file, runtime = find_startup_file(folder)
     else:
         startup_file, runtime = find_startup_file(folder)
@@ -342,7 +337,7 @@ def start_website_process(website_id, log_callback=None):
         if log_callback:
             log_callback(msg)
     
-    # Install dependencies
+    # Install deps
     if runtime == 'python':
         success, msg, logs = install_requirements(folder, website_id)
         log_lines.extend(logs)
@@ -356,7 +351,6 @@ def start_website_process(website_id, log_callback=None):
         if not success:
             return False, msg, log_lines
     
-    # Save build log
     build_log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_build.log")
     with open(build_log_file, 'w') as f:
         f.write('\n'.join(log_lines))
@@ -364,9 +358,9 @@ def start_website_process(website_id, log_callback=None):
         conn.execute('UPDATE websites SET build_log_file = ? WHERE id = ?', (build_log_file, website_id))
         conn.commit()
     
-    # Port and env
     port = get_next_available_port()
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
+    
     env = os.environ.copy()
     env['PORT'] = str(port)
     env['PYTHONUNBUFFERED'] = '1'
@@ -381,7 +375,7 @@ def start_website_process(website_id, log_callback=None):
         cmd = [sys.executable, startup_file]
     elif runtime == 'node':
         cmd = ['npm', 'start']
-    else:  # static
+    else:
         cmd = [sys.executable, '-m', 'http.server', str(port)]
     
     log(f"🚀 Starting with command: {' '.join(cmd)}")
@@ -402,16 +396,10 @@ def start_website_process(website_id, log_callback=None):
             log(f"✅ Server running on port {port} (PID {proc.pid})")
             return True, f"Running on port {port}", log_lines
         else:
-            log(f"❌ Health check failed: {health_msg}")
-            try:
-                if os.name == 'nt':
-                    subprocess.run(['taskkill', '/PID', str(proc.pid), '/F'], capture_output=True)
-                else:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except:
-                pass
-            update_website_status(website_id, 'crashed')
-            return False, f"Health check failed: {health_msg}", log_lines
+            # नया: हेल्थ चेक फेल होने पर भी रनिंग मार्क करें, लेकिन वार्निंग दें
+            update_website_status(website_id, 'running', proc.pid, port)
+            log(f"⚠️ Health check failed: {health_msg}. Website might not be a web app or may be using wrong port. Check logs.")
+            return True, f"Running (health check failed: {health_msg})", log_lines
     except Exception as e:
         log(f"❌ Start error: {str(e)}")
         return False, str(e), log_lines
@@ -650,7 +638,7 @@ def upload_website():
     if file.filename == '':
         return jsonify({'success': False, 'error': 'Empty filename'}), 400
     
-    # Size check (100MB)
+    # Size check
     file.seek(0, os.SEEK_END)
     size = file.tell()
     file.seek(0)
@@ -660,7 +648,7 @@ def upload_website():
     filename = file.filename
     is_zip = filename.lower().endswith('.zip')
     
-    # Generate slug and create website record
+    # Generate slug
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
     
@@ -670,6 +658,7 @@ def upload_website():
             count += 1
             slug = generate_website_slug(session['username'], count)
     
+    # Create website record
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status)
                               VALUES (?, ?, ?, ?)''',
@@ -685,7 +674,6 @@ def upload_website():
         return jsonify({'success': False, 'error': 'Permission denied'}), 500
     
     if is_zip:
-        # ZIP handling
         zip_path = os.path.join(folder, 'upload.zip')
         try:
             file.save(zip_path)
@@ -707,7 +695,7 @@ def upload_website():
         startup_file = None  # Let detection happen on start
         website_name = filename[:-4] if '.' in filename else filename
     else:
-        # Single file upload
+        # Single file
         file_path = os.path.join(folder, filename)
         try:
             file.save(file_path)
@@ -718,10 +706,8 @@ def upload_website():
         startup_file = filename
         website_name = filename
     
-    # Calculate size
     size_used = calculate_folder_size(folder)
     
-    # Update DB
     with get_db() as conn:
         conn.execute('''UPDATE websites SET 
                         website_name = ?, 
@@ -739,7 +725,15 @@ def upload_website():
     log_website(website_id, f"Uploaded: {file.filename}")
     log_activity(user_id, 'upload', f'Uploaded {file.filename}', request.remote_addr)
     
-    return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
+    # 🚀 Auto-start after upload
+    update_website_status(website_id, 'starting')
+    ok, msg, logs = start_website_process(website_id)
+    if ok:
+        log_website(website_id, f"Auto-started successfully: {msg}")
+    else:
+        log_website(website_id, f"Auto-start failed: {msg}", 'error')
+    
+    return jsonify({'success': True, 'website_id': website_id, 'slug': slug, 'auto_started': ok})
 
 # ---------- GitHub Deploy with SSE ----------
 @app.route('/deploy_github/stream', methods=['POST'])
