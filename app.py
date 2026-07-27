@@ -13,7 +13,7 @@ import queue
 import json
 import tempfile
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
@@ -39,7 +39,6 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        # Users table (existing)
         conn.execute('''CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -53,7 +52,6 @@ def init_db():
             last_login TIMESTAMP
         )''')
         
-        # Websites table (extended)
         conn.execute('''CREATE TABLE IF NOT EXISTS websites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id INTEGER NOT NULL,
@@ -82,7 +80,6 @@ def init_db():
             FOREIGN KEY (owner_id) REFERENCES users (id)
         )''')
         
-        # Logs table (existing)
         conn.execute('''CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             website_id INTEGER NOT NULL,
@@ -92,7 +89,6 @@ def init_db():
             FOREIGN KEY (website_id) REFERENCES websites (id)
         )''')
         
-        # Activity logs (existing)
         conn.execute('''CREATE TABLE IF NOT EXISTS activity_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -102,7 +98,6 @@ def init_db():
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         
-        # New: Deployments table
         conn.execute('''CREATE TABLE IF NOT EXISTS deployments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             website_id INTEGER NOT NULL,
@@ -122,7 +117,6 @@ def init_db():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_deployments_website ON deployments(website_id)')
         conn.commit()
         
-        # Create admin if none
         if conn.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0:
             conn.execute('INSERT INTO users (username, email, password_hash, role, plan) VALUES (?, ?, ?, ?, ?)',
                          ('admin', 'admin@hosting.com', generate_password_hash('admin123'), 'admin', 'pro'))
@@ -131,7 +125,7 @@ def init_db():
 
 init_db()
 
-# ---------- Helpers (existing + new) ----------
+# ---------- Helpers ----------
 def get_user_by_id(user_id):
     with get_db() as conn:
         return conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
@@ -242,7 +236,6 @@ def find_startup_file(folder):
     return None
 
 def detect_framework(folder):
-    """Return a dict with framework and run command."""
     if os.path.exists(os.path.join(folder, 'manage.py')):
         return {'framework': 'django', 'cmd': [sys.executable, 'manage.py', 'runserver', '0.0.0.0:$PORT']}
     elif os.path.exists(os.path.join(folder, 'app.py')):
@@ -402,17 +395,14 @@ def stop_website_process(website_id):
 
 # ---------- GitHub Deployment Core ----------
 def run_deployment_step(step, message):
-    """Return formatted log line with timestamp and step."""
     ts = datetime.now().strftime("%H:%M:%S")
     return f"[{ts}] [{step}] {message}\n"
 
 def deploy_github(website_id, repo_url, branch):
-    """Perform GitHub deployment and write logs to a file, updating status."""
     website = get_website_by_id(website_id)
     if not website:
         return
     
-    # Create deployment record
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO deployments (website_id, repo_url, branch, status, started_at)
                               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)''',
@@ -424,17 +414,14 @@ def deploy_github(website_id, repo_url, branch):
     with open(log_file, 'w') as f:
         f.write(run_deployment_step("SYSTEM", f"Deployment started for {repo_url} (branch {branch})"))
     
-    # Update status
     with get_db() as conn:
         conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('preparing', deployment_id))
         conn.commit()
     
-    # Define a function to write log and also update DB if needed
     def write_log(step, msg):
         line = run_deployment_step(step, msg)
         with open(log_file, 'a') as f:
             f.write(line)
-        # Also store in website logs
         log_website(website_id, f"[{step}] {msg}", 'info')
     
     try:
@@ -443,13 +430,11 @@ def deploy_github(website_id, repo_url, branch):
             conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('cloning', deployment_id))
             conn.commit()
         
-        # Clone repo
         folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
         if os.path.exists(folder):
             shutil.rmtree(folder)
         os.makedirs(folder, exist_ok=True)
         
-        # Use git clone with depth=1 for speed
         clone_cmd = ['git', 'clone', '--depth', '1', '--branch', branch, repo_url, folder]
         proc = subprocess.Popen(clone_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         for line in iter(proc.stdout.readline, ''):
@@ -464,13 +449,10 @@ def deploy_github(website_id, repo_url, branch):
             return
         
         write_log("SYSTEM", "Repository cloned successfully")
-        
         write_log("SYSTEM", "==> Checking Branch...")
-        # Already checked
         write_log("SYSTEM", f"Branch: {branch}")
         
         write_log("SYSTEM", "==> Detecting Python Version...")
-        # Check for runtime.txt or .python-version
         runtime_file = os.path.join(folder, 'runtime.txt')
         if os.path.exists(runtime_file):
             with open(runtime_file, 'r') as rf:
@@ -489,7 +471,6 @@ def deploy_github(website_id, repo_url, branch):
                 conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('installing', deployment_id))
                 conn.commit()
             
-            # Install with pip and capture output
             pip_cmd = [sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt']
             proc = subprocess.Popen(pip_cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             for line in iter(proc.stdout.readline, ''):
@@ -531,16 +512,11 @@ def deploy_github(website_id, repo_url, branch):
             conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('starting', deployment_id))
             conn.commit()
         
-        # Update website record with repo info
         with get_db() as conn:
             conn.execute('UPDATE websites SET repo_url = ?, branch = ?, deployment_type = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                          (repo_url, branch, 'github', 'starting', website_id))
             conn.commit()
         
-        # Start process (reuse existing function but ensure we use the correct folder)
-        # We'll call start_website_process, but it expects website record.
-        # It will install requirements again, but we already did. We can skip that.
-        # So we'll directly start with the found startup file.
         env = os.environ.copy()
         env['PORT'] = str(port)
         env['PYTHONUNBUFFERED'] = '1'
@@ -736,7 +712,7 @@ def dashboard():
                                   base_url=base_url,
                                   user_obj=user)
 
-# ---------- Upload System (Enhanced) ----------
+# ---------- Upload System ----------
 @app.route('/upload', methods=['POST'])
 def upload_website():
     if 'user_id' not in session:
@@ -836,7 +812,6 @@ def github_deploy():
     if not repo_url:
         return jsonify({'success': False, 'error': 'Repository URL is required'}), 400
     
-    # Create website entry
     user_id = session['user_id']
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
@@ -852,7 +827,6 @@ def github_deploy():
         website_id = cur.lastrowid
         conn.commit()
     
-    # Start deployment in background thread (to not block)
     def bg_deploy():
         deploy_github(website_id, repo_url, branch)
     
@@ -873,7 +847,6 @@ def deploy_logs(website_id):
         if session.get('role') != 'admin':
             abort(404)
     
-    # Get latest deployment for this website
     with get_db() as conn:
         dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
     if not dep:
@@ -882,13 +855,10 @@ def deploy_logs(website_id):
     log_file = os.path.join(LOG_FOLDER, f"deploy_{dep['id']}.log")
     
     def generate():
-        # If file exists, send existing logs first
         if os.path.exists(log_file):
             with open(log_file, 'r') as f:
                 for line in f:
                     yield f"data: {line.strip()}\n\n"
-        # Then wait for new lines (tail -f style)
-        # We'll use a simple polling approach
         last_size = os.path.getsize(log_file) if os.path.exists(log_file) else 0
         while True:
             time.sleep(0.5)
@@ -901,11 +871,9 @@ def deploy_logs(website_id):
                         for line in new_lines.splitlines():
                             yield f"data: {line}\n\n"
                     last_size = current_size
-            # Check if deployment status is terminal
             with get_db() as conn:
                 dep_status = conn.execute('SELECT status FROM deployments WHERE id = ?', (dep['id'],)).fetchone()
             if dep_status and dep_status['status'] in ('success', 'failed', 'stopped'):
-                # Send a final message and close
                 yield f"data: [SYSTEM] Deployment completed with status: {dep_status['status']}\n\n"
                 break
     
@@ -1050,7 +1018,7 @@ def set_custom_domain(website_id):
     log_website(website_id, f"Custom domain set: {domain}")
     return jsonify({'success': True, 'domain': domain})
 
-# ---------- Enhanced File Manager ----------
+# ---------- Enhanced File Manager Routes ----------
 @app.route('/website/<int:website_id>/files')
 def files(website_id):
     if 'user_id' not in session:
@@ -1065,7 +1033,6 @@ def files(website_id):
     if not os.path.exists(folder):
         abort(404)
     
-    # Build file tree
     items = []
     for root, dirs, files_list in os.walk(folder):
         rel = os.path.relpath(root, folder)
@@ -1113,7 +1080,7 @@ def edit_file(website_id):
         log_website(website_id, f"Edited: {file_path}")
         return redirect(url_for('files', website_id=website_id))
 
-# ---------- File Manager API Routes ----------
+# File Manager API Routes
 @app.route('/website/<int:website_id>/file/upload', methods=['POST'])
 def upload_file_to_website(website_id):
     if 'user_id' not in session:
@@ -1133,7 +1100,6 @@ def upload_file_to_website(website_id):
     if file.filename == '':
         return jsonify({'success': False, 'error': 'Empty filename'}), 400
     
-    # Optional relative path
     rel_path = request.form.get('path', '')
     target_dir = os.path.join(folder, rel_path) if rel_path else folder
     os.makedirs(target_dir, exist_ok=True)
@@ -1142,7 +1108,6 @@ def upload_file_to_website(website_id):
     save_path = os.path.join(target_dir, filename)
     file.save(save_path)
     
-    # Update storage size
     size = os.path.getsize(save_path)
     with get_db() as conn:
         conn.execute('UPDATE websites SET storage_used = storage_used + ?, website_size = website_size + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
@@ -1167,7 +1132,6 @@ def delete_file_website(website_id):
     if not os.path.exists(full):
         return jsonify({'success': False, 'error': 'File not found'}), 404
     
-    # Prevent deleting root folder
     if os.path.abspath(full) == os.path.abspath(os.path.join(UPLOAD_FOLDER, f"website_{website_id}")):
         return jsonify({'success': False, 'error': 'Cannot delete root'}), 400
     
@@ -1176,7 +1140,6 @@ def delete_file_website(website_id):
     else:
         os.remove(full)
     
-    # Update size
     new_size = calculate_folder_size(os.path.join(UPLOAD_FOLDER, f"website_{website_id}"))
     with get_db() as conn:
         conn.execute('UPDATE websites SET storage_used = ?, website_size = ? WHERE id = ?',
@@ -1233,7 +1196,6 @@ def create_file_website(website_id):
     if is_folder:
         os.makedirs(full, exist_ok=True)
     else:
-        # Create parent dirs if needed
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, 'w') as f:
             f.write('')
@@ -1343,23 +1305,108 @@ def deployment_history(website_id):
         deployments = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY started_at DESC', (website_id,)).fetchall()
     return render_template_string(DEPLOYMENTS_TEMPLATE, website=website, deployments=deployments)
 
-# ---------- Templates (Updated) ----------
-# (We'll include full templates here, but for brevity, we show only the key changes.
-# The final code will have the complete templates.)
+# ========== TEMPLATES ==========
+# All templates are defined here.
 
-# For space, I'll include the updated DASHBOARD_TEMPLATE with GitHub card and enhanced UI.
-# The full code download will contain all templates.
+ERROR_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Website Unavailable</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
+.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:50px;text-align:center;max-width:500px;box-shadow:0 0 80px rgba(0,229,255,0.05)}
+h1{font-size:2.5rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:15px}
+p{color:#aab;font-size:1.1rem;margin:15px 0}
+a{color:#00e5ff;text-decoration:none;padding:12px 30px;border:2px solid #00e5ff;border-radius:50px;display:inline-block;margin-top:20px;transition:.3s}
+a:hover{background:#00e5ff;color:#000;transform:scale(1.05)}
+</style>
+</head>
+<body>
+<div class="glass">
+<h1>⚠️ {{ message }}</h1>
+<p>Slug: <strong>{{ slug }}</strong></p>
+<a href="/dashboard">← Go to Dashboard</a>
+</div>
+</body>
+</html>
+"""
 
-# Since the code is very long, I'll provide the complete file as a downloadable link or in the response.
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Yuvicodex Host</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+@keyframes zoomIn{0%{opacity:0;transform:scale(0.9)}100%{opacity:1;transform:scale(1)}}
+@keyframes float{0%{transform:translateY(0px)}50%{transform:translateY(-10px)}100%{transform:translateY(0px)}}
+body{background:linear-gradient(135deg,#0a0e1a 0%,#1a1040 50%,#0a1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
+.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:40px;width:100%;max-width:400px;animation:zoomIn 0.6s ease;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
+.logo{text-align:center;font-size:2.5rem;font-weight:900;background:linear-gradient(135deg,#00e5ff,#7a00ff,#00e5ff);background-size:300% 300%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:float 3s ease-in-out infinite;margin-bottom:10px}
+.sub{text-align:center;color:#889;font-size:0.9rem;margin-bottom:30px}
+input{width:100%;padding:14px 18px;margin:10px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;font-size:1rem;outline:none;transition:.3s}
+input:focus{border-color:#00e5ff;box-shadow:0 0 30px rgba(0,229,255,0.1)}
+.btn{width:100%;padding:14px;background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;border-radius:15px;color:#fff;font-size:1.1rem;font-weight:700;cursor:pointer;transition:.3s;margin-top:15px}
+.btn:hover{transform:scale(1.02);box-shadow:0 0 40px rgba(0,229,255,0.2)}
+.error{color:#ff4757;text-align:center;margin-top:10px;font-size:0.9rem}
+.link{text-align:center;margin-top:20px;color:#889}
+.link a{color:#00e5ff;text-decoration:none;font-weight:600}
+.link a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="glass">
+<div class="logo">🚀 Yuvicodex</div>
+<div class="sub">Premium Cloud Hosting</div>
+<form method="POST" action="/login">
+<input type="text" name="username" placeholder="Username" required>
+<input type="password" name="password" placeholder="Password" required>
+<button class="btn" type="submit">Access Dashboard</button>
+</form>
+<div class="error">{{ error if error else '' }}</div>
+<div class="link">New here? <a href="/register">Create Account</a></div>
+</div>
+</body>
+</html>
+"""
 
-# But for the response, I'll include the full code in a code block.
+REGISTER_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Register - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+@keyframes zoomIn{0%{opacity:0;transform:scale(0.9)}100%{opacity:1;transform:scale(1)}}
+body{background:linear-gradient(135deg,#0a0e1a 0%,#1a1040 50%,#0a1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:20px}
+.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:40px;width:100%;max-width:400px;animation:zoomIn 0.6s ease;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
+.logo{text-align:center;font-size:2rem;font-weight:900;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:5px}
+.sub{text-align:center;color:#889;font-size:0.9rem;margin-bottom:30px}
+input{width:100%;padding:14px 18px;margin:10px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;font-size:1rem;outline:none;transition:.3s}
+input:focus{border-color:#00e5ff;box-shadow:0 0 30px rgba(0,229,255,0.1)}
+.btn{width:100%;padding:14px;background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;border-radius:15px;color:#fff;font-size:1.1rem;font-weight:700;cursor:pointer;transition:.3s;margin-top:15px}
+.btn:hover{transform:scale(1.02);box-shadow:0 0 40px rgba(0,229,255,0.2)}
+.error{color:#ff4757;text-align:center;margin-top:10px;font-size:0.9rem}
+.link{text-align:center;margin-top:20px;color:#889}
+.link a{color:#00e5ff;text-decoration:none;font-weight:600}
+</style>
+</head>
+<body>
+<div class="glass">
+<div class="logo">✨ Create Account</div>
+<div class="sub">Start hosting in minutes</div>
+<form method="POST" action="/register">
+<input type="text" name="username" placeholder="Username" required>
+<input type="email" name="email" placeholder="Email" required>
+<input type="password" name="password" placeholder="Password" required>
+<button class="btn" type="submit">Register</button>
+</form>
+<div class="error">{{ error if error else '' }}</div>
+<div class="link">Already have account? <a href="/">Login</a></div>
+</div>
+</body>
+</html>
+"""
 
-# Let's write the rest of the templates below.
-
-# ---------- ERROR_TEMPLATE, LOGIN_TEMPLATE, REGISTER_TEMPLATE remain same as before ----------
-# (They are unchanged)
-
-# ---------- DASHBOARD_TEMPLATE with new features ----------
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1551,9 +1598,7 @@ body:'repo_url='+encodeURIComponent(repo)+'&branch='+encodeURIComponent(branch)
 .then(r=>r.json())
 .then(d=>{
 if(d.success){
-st.innerHTML='✅ Deployment started! <a href="/dashboard" style="color:#00e5ff;">Refresh</a>';
-// Optionally redirect to the deployment logs page
-window.location.href='/deploy/'+d.website_id+'/logs';
+st.innerHTML='✅ Deployment started! <a href="/deploy/'+d.website_id+'/logs" target="_blank" style="color:#00e5ff;">View Logs</a>';
 }else st.innerHTML='❌ '+d.error;
 })
 .catch(()=>st.innerHTML='❌ Network error');
@@ -1563,7 +1608,6 @@ window.location.href='/deploy/'+d.website_id+'/logs';
 </html>
 """
 
-# ---------- FILES_TEMPLATE (enhanced) ----------
 FILES_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1617,7 +1661,6 @@ const files=document.getElementById('fileUpload').files;
 if(!files.length)return alert('Select files');
 const fd=new FormData();
 for(let f of files) fd.append('file', f);
-// Optional path: current directory from URL
 const params=new URLSearchParams(window.location.search);
 const path=params.get('path')||'';
 fd.append('path', path);
@@ -1662,7 +1705,6 @@ li.style.display=name.includes(q)?'flex':'none';
 </html>
 """
 
-# ---------- EDIT_TEMPLATE (unchanged) ----------
 EDIT_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1698,7 +1740,6 @@ textarea:focus{border-color:#00e5ff}
 </html>
 """
 
-# ---------- LOGS_TEMPLATE (unchanged) ----------
 LOGS_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1739,7 +1780,6 @@ No logs yet.
 </html>
 """
 
-# ---------- DEPLOYMENTS_TEMPLATE ----------
 DEPLOYMENTS_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1786,9 +1826,6 @@ th{background:rgba(255,255,255,0.05)}
 </body>
 </html>
 """
-
-# ---------- ERROR_TEMPLATE, LOGIN_TEMPLATE, REGISTER_TEMPLATE (unchanged) ----------
-# (They are the same as before, so we omit them for brevity)
 
 # ---------- Server Start ----------
 if __name__ == '__main__':
