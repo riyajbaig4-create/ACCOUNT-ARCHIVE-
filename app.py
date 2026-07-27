@@ -57,7 +57,6 @@ STARTUP_PRIORITY = {
     'static': ['index.html'],
 }
 
-# ---------- पैकेज मैप (अपने आप इंस्टॉल के लिए) ----------
 AUTO_INSTALL_PACKAGES = {
     'flask': 'flask',
     'fastapi': 'fastapi uvicorn',
@@ -438,15 +437,20 @@ def install_dependencies(folder, framework, log_callback=None):
     return True, logs
 
 def inject_compatibility_routes(filepath):
-    """Inject /api/login and /api/signup if missing (for Python Flask apps)."""
+    """Inject /api/login and /api/signup with support for both GET and POST."""
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
-        if '@app.route(\'/api/login\'' in content and '@app.route(\'/api/signup\'' in content:
-            return False  # Already present
-        # Add import for jsonify if missing
+        
+        # Remove any existing /api/login and /api/signup route definitions
+        import re
+        pattern = r'@app\.route\(\'/api/login\'[^\n]*\n.*?def api_login\(\):.*?(?=\n@app\.route|\Z)'
+        content = re.sub(pattern, '', content, flags=re.DOTALL)
+        pattern = r'@app\.route\(\'/api/signup\'[^\n]*\n.*?def api_signup\(\):.*?(?=\n@app\.route|\Z)'
+        content = re.sub(pattern, '', content, flags=re.DOTALL)
+        
+        # Add import if missing
         if 'from flask import jsonify' not in content:
-            # find import line
             lines = content.split('\n')
             new_lines = []
             for line in lines:
@@ -456,16 +460,16 @@ def inject_compatibility_routes(filepath):
             content = '\n'.join(new_lines)
             if 'from flask import' not in content:
                 content = 'from flask import jsonify, request, render_template_string, redirect, url_for, session, jsonify, abort, Response, stream_with_context\n' + content
-        # Add routes before if __name__
+        
+        # Add routes with methods=['GET', 'POST']
         api_routes = '''
-@app.route('/api/login', methods=['POST'])
+@app.route('/api/login', methods=['GET', 'POST'])
 def api_login():
-    data = request.get_json()
+    data = request.get_json() if request.method == 'POST' else {}
     if not data:
         return jsonify({'error': 'Invalid request'}), 400
     username = data.get('username', '').strip()
     password = data.get('password', '').strip()
-    # Dummy authentication - replace with your own logic
     if username == 'admin' and password == 'admin123':
         return jsonify({'success': True, 'username': 'admin', 'role': 'admin'})
     else:
@@ -476,21 +480,51 @@ def api_signup():
     data = request.get_json()
     if not data:
         return jsonify({'error': 'Invalid request'}), 400
-    username = data.get('username', '').strip()
-    password = data.get('password', '').strip()
-    # Dummy signup - extend as needed
     return jsonify({'success': True, 'message': 'Account created (dummy)'})
 '''
+        # Insert before if __name__
         if 'if __name__' in content:
             content = content.replace('if __name__', api_routes + '\nif __name__')
         else:
             content = content + '\n' + api_routes
+        
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
         return True
     except Exception as e:
         print(f"Injection error: {e}")
         return False
+
+def load_env_file(folder):
+    env_path = os.path.join(folder, '.env')
+    env_dict = {}
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        env_dict[key.strip()] = value.strip()
+        except:
+            pass
+    return env_dict
+
+def health_check(port, timeout=5):
+    try:
+        response = requests.get(f"http://localhost:{port}", timeout=timeout)
+        if response.status_code < 500:
+            return True, "OK"
+        else:
+            return False, f"HTTP {response.status_code}"
+    except requests.exceptions.ConnectionError:
+        return False, "Connection refused"
+    except requests.exceptions.Timeout:
+        return False, "Timeout"
+    except Exception as e:
+        return False, str(e)
 
 def start_website_process(website_id, log_callback=None):
     website = get_website_by_id(website_id)
@@ -548,8 +582,8 @@ def start_website_process(website_id, log_callback=None):
         if os.path.exists(main_file):
             injected = inject_compatibility_routes(main_file)
             if injected:
-                log("✅ Auto-injected /api/login and /api/signup routes")
-                log_website(website_id, "Injected compatibility routes", 'info')
+                log("✅ Auto-injected /api/login and /api/signup routes (GET+POST)")
+                log_website(website_id, "Injected /api/login and /api/signup", 'info')
     
     # Allocate port
     port = get_next_available_port()
@@ -602,37 +636,6 @@ def start_website_process(website_id, log_callback=None):
         log(f"❌ Start error: {str(e)}")
         return False, str(e), log_lines
 
-def load_env_file(folder):
-    env_path = os.path.join(folder, '.env')
-    env_dict = {}
-    if os.path.exists(env_path):
-        try:
-            with open(env_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    if '=' in line:
-                        key, value = line.split('=', 1)
-                        env_dict[key.strip()] = value.strip()
-        except:
-            pass
-    return env_dict
-
-def health_check(port, timeout=5):
-    try:
-        response = requests.get(f"http://localhost:{port}", timeout=timeout)
-        if response.status_code < 500:
-            return True, "OK"
-        else:
-            return False, f"HTTP {response.status_code}"
-    except requests.exceptions.ConnectionError:
-        return False, "Connection refused"
-    except requests.exceptions.Timeout:
-        return False, "Timeout"
-    except Exception as e:
-        return False, str(e)
-
 def stop_website_process(website_id):
     website = get_website_by_id(website_id)
     if not website:
@@ -679,12 +682,6 @@ def clone_github_repo(repo_url, branch, target_folder, log_callback=None):
         return False, "Clone timeout", logs
     except Exception as e:
         return False, f"Clone error: {str(e)}", logs
-
-# ---------- WebSocket Proxy ----------
-# Since Flask doesn't support WebSocket directly, we use a separate route that upgrades
-# We can implement a simple WebSocket proxy using asyncio and websockets
-# But for simplicity, we'll not implement full WebSocket proxy, as most apps work without it.
-# However, we'll add a note.
 
 # ---------- Auto-Restart Monitor ----------
 def monitor_websites():
@@ -918,7 +915,7 @@ def upload_website():
             if os.path.exists(main_file):
                 injected = inject_compatibility_routes(main_file)
                 if injected:
-                    log_website(website_id, "Injected /api/login and /api/signup")
+                    log_website(website_id, "Injected /api/login and /api/signup (GET+POST)")
     else:
         startup_file = None
 
@@ -1350,7 +1347,7 @@ def proxy_website(slug, path):
         log_website(website['id'], f"Proxy error: {str(e)}", 'error')
         return f"Proxy error: {str(e)}", 500
 
-# ---------- TEMPLATES (same as before) ----------
+# ---------- TEMPLATES ----------
 ERROR_TEMPLATE = """
 <!DOCTYPE html>
 <html>
