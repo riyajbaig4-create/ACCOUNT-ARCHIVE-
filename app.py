@@ -218,7 +218,7 @@ def find_startup_file(folder):
 
 def detect_runtime_and_get_cmd(folder, port):
     """Detect runtime and return (cmd, runtime, env)."""
-    # ----- Node.js -----
+    # ----- Node.js (with package.json) -----
     if os.path.exists(os.path.join(folder, 'package.json')):
         try:
             with open(os.path.join(folder, 'package.json'), 'r') as f:
@@ -241,6 +241,21 @@ def detect_runtime_and_get_cmd(folder, port):
                     return cmd, 'nodejs', {'NODE_ENV': 'production', 'PORT': str(port)}
         except:
             pass
+    
+    # ----- Node.js (without package.json) – look for common JS files -----
+    js_files = ['server.js', 'index.js', 'app.js', 'main.js']
+    for fname in js_files:
+        if os.path.exists(os.path.join(folder, fname)):
+            return ['node', fname], 'nodejs', {'PORT': str(port)}
+    
+    # ----- If still no JS found, scan for any .js file in root (fallback) -----
+    try:
+        for f in os.listdir(folder):
+            if f.endswith('.js') and os.path.isfile(os.path.join(folder, f)):
+                # Avoid node_modules, but this is a fallback
+                return ['node', f], 'nodejs', {'PORT': str(port)}
+    except:
+        pass
     
     # ----- PHP -----
     if os.path.exists(os.path.join(folder, 'index.php')):
@@ -319,6 +334,8 @@ def install_dependencies(folder, runtime, log_callback=None):
             except:
                 pass
             return True, "Dependencies installed"
+        # If no package.json, nothing to install
+        return True, "No dependencies to install (no package.json)"
     elif runtime == 'php':
         if os.path.exists(os.path.join(folder, 'composer.json')):
             cmd = ['composer', 'install']
@@ -988,12 +1005,6 @@ def runtime_logs_sse(website_id):
                         for line in new_lines.splitlines():
                             yield f"data: {line}\n\n"
                     last_size = current_size
-            # Check if website is running; if not, we can still keep streaming but maybe stop after some time?
-            website = get_website_by_id(website_id)
-            if website and website['status'] == 'stopped':
-                # Keep streaming existing logs but stop waiting for new ones after a while?
-                # We'll just keep streaming forever, but we could break if desired.
-                pass
             time.sleep(0.3)
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
@@ -1352,112 +1363,254 @@ def deployment_history(website_id):
     return render_template_string(DEPLOYMENTS_TEMPLATE, website=website, deployments=deployments)
 
 # ========== TEMPLATES ==========
-# (All templates are kept as previously defined; LOGS_TEMPLATE is updated to include a live runtime log tab)
-# For brevity, I include only the LOGS_TEMPLATE and the DASHBOARD_TEMPLATE (which now has no custom domain field).
-# The other templates (ERROR, LOGIN, REGISTER, FILES, EDIT, DEPLOYMENTS, BUILD_LOGS) remain the same as earlier.
+ERROR_TEMPLATE = """<!DOCTYPE html>
+<html><head><title>Website Unavailable</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:50px;text-align:center;max-width:500px;box-shadow:0 0 80px rgba(0,229,255,0.05)}h1{font-size:2.5rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:15px}p{color:#aab;font-size:1.1rem;margin:15px 0}a{color:#00e5ff;text-decoration:none;padding:12px 30px;border:2px solid #00e5ff;border-radius:50px;display:inline-block;margin-top:20px;transition:.3s}a:hover{background:#00e5ff;color:#000;transform:scale(1.05)}
+</style></head>
+<body><div class="glass"><h1>⚠️ {{ message }}</h1><p>Slug: <strong>{{ slug }}</strong></p><a href="/dashboard">← Go to Dashboard</a></div></body></html>"""
 
-LOGS_TEMPLATE = """
+LOGIN_TEMPLATE = """
 <!DOCTYPE html>
-<html>
-<head><title>Logs - Yuvicodex</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
-.container{max-width:1000px;margin:auto}
-.back{color:#00e5ff;text-decoration:none;font-weight:600}
-h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.tabs{display:flex;gap:10px;margin:15px 0;flex-wrap:wrap}
-.tab{background:rgba(255,255,255,0.05);padding:8px 18px;border-radius:50px;cursor:pointer;transition:.3s;font-size:0.9rem}
-.tab.active{background:rgba(0,229,255,0.2);color:#00e5ff}
-.tab:hover{background:rgba(255,255,255,0.1)}
-.tab-content{display:none}
-.tab-content.active{display:block}
-pre{background:rgba(0,0,0,0.4);padding:15px;border-radius:15px;max-height:400px;overflow-y:auto;border:1px solid rgba(255,255,255,0.05);font-family:'Courier New',monospace;font-size:12px;white-space:pre-wrap;color:#aab}
-</style>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Login - Yuvicodex</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; font-family:'Arial',sans-serif; }
+        body {
+            background:#05070d;
+            color:#fff;
+            min-height:100vh;
+            display:flex;
+            justify-content:center;
+            align-items:center;
+            padding:20px;
+        }
+        .login-card {
+            position:relative;
+            width:100%;
+            max-width:400px;
+            padding:30px 20px;
+            background:#0c1018;
+            border-radius:25px;
+            overflow:hidden;
+            box-shadow:0 0 20px rgba(0,0,0,.5);
+        }
+        .login-card::before {
+            content:"";
+            position:absolute;
+            inset:-3px;
+            background:conic-gradient(#00e5ff, transparent, transparent, transparent, #00e5ff);
+            animation:spin 4s linear infinite;
+        }
+        .login-card::after {
+            content:"";
+            position:absolute;
+            inset:3px;
+            background:#0c1018;
+            border-radius:22px;
+        }
+        .login-content { position:relative; z-index:2; }
+        .login-icon {
+            width:110px; height:110px; margin:auto;
+            border:3px solid #00e5ff; border-radius:50%;
+            display:flex; justify-content:center; align-items:center;
+            font-size:45px; color:#00e5ff;
+            box-shadow:0 0 20px #00e5ff;
+            background:#0c1018;
+            transition:transform 0.1s;
+            user-select:none;
+        }
+        .login-title {
+            margin:25px 0;
+            text-align:center;
+            color:#cfffff;
+            letter-spacing:4px;
+            font-size:1.3rem;
+        }
+        .login-card input {
+            width:100%;
+            margin:12px 0;
+            padding:16px;
+            background:#161b25;
+            border:1px solid #2b3240;
+            border-radius:15px;
+            color:white;
+            font-size:16px;
+            outline:none;
+        }
+        .login-card input:focus {
+            border-color:#00e5ff;
+        }
+        .login-btn {
+            width:100%;
+            margin-top:20px;
+            padding:16px;
+            border:none;
+            border-radius:15px;
+            font-size:18px;
+            font-weight:bold;
+            color:white;
+            cursor:pointer;
+            background:linear-gradient(90deg, #7a00ff, #00d9ff);
+            transition:opacity 0.2s;
+        }
+        .login-btn:hover { opacity:.9; }
+        .login-error {
+            color:#ff4d4d;
+            text-align:center;
+            font-size:14px;
+            margin-top:10px;
+            min-height:22px;
+        }
+        .register-link {
+            text-align:center;
+            margin-top:15px;
+            color:#889;
+        }
+        .register-link a {
+            color:#00e5ff;
+            text-decoration:none;
+        }
+        @keyframes spin { 100% { transform:rotate(360deg); } }
+    </style>
 </head>
 <body>
-<div class="container">
-<a href="/dashboard" class="back">← Dashboard</a>
-<h2>📜 Logs for {{ website.website_name or website.website_slug }}</h2>
-
-<div class="tabs">
-    <div class="tab active" data-target="deploy">Deployment</div>
-    <div class="tab" data-target="build">Build</div>
-    <div class="tab" data-target="runtime">Runtime (Live)</div>
-    <div class="tab" data-target="error">Errors</div>
-</div>
-
-<div id="deploy" class="tab-content active">
-    <h3>📋 Deployment Log</h3>
-    <pre>{{ deploy_log if deploy_log else 'No deployment logs yet.' }}</pre>
-</div>
-<div id="build" class="tab-content">
-    <h3>🔧 Build Log</h3>
-    <pre>{{ install_log if install_log else 'No build logs.' }}</pre>
-</div>
-<div id="runtime" class="tab-content">
-    <h3>🖥️ Runtime Log (Live)</h3>
-    <div id="runtimeLogContainer" style="background:rgba(0,0,0,0.4);padding:15px;border-radius:15px;max-height:400px;overflow-y:auto;border:1px solid rgba(255,255,255,0.05);font-family:'Courier New',monospace;font-size:12px;white-space:pre-wrap;color:#aab;"></div>
-</div>
-<div id="error" class="tab-content">
-    <h3>❌ Error Log</h3>
-    <pre>{{ error_log_text if error_log_text else 'No errors logged.' }}</pre>
-</div>
-</div>
-
-<script>
-document.querySelectorAll('.tab').forEach(tab => {
-    tab.addEventListener('click', function() {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        this.classList.add('active');
-        document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
-        document.getElementById(this.dataset.target).classList.add('active');
-        // If runtime tab is clicked, start SSE
-        if (this.dataset.target === 'runtime') {
-            startRuntimeLogs();
-        }
-    });
-});
-
-let runtimeEventSource = null;
-function startRuntimeLogs() {
-    if (runtimeEventSource) {
-        runtimeEventSource.close();
-        runtimeEventSource = null;
-    }
-    const container = document.getElementById('runtimeLogContainer');
-    container.innerHTML = 'Connecting to runtime logs...';
-    runtimeEventSource = new EventSource('/runtime/{{ website.id }}/logs');
-    let autoScroll = true;
-    runtimeEventSource.onmessage = function(event) {
-        const data = event.data;
-        if (!data) return;
-        const lineDiv = document.createElement('div');
-        lineDiv.textContent = data;
-        container.appendChild(lineDiv);
-        if (autoScroll) {
-            container.scrollTop = container.scrollHeight;
-        }
-    };
-    runtimeEventSource.onerror = function() {
-        // keep trying
-    };
-    container.addEventListener('scroll', function() {
-        if (container.scrollTop < container.scrollHeight - container.clientHeight - 10) {
-            autoScroll = false;
-        } else {
-            autoScroll = true;
-        }
-    });
-}
-// Auto-start runtime logs if that tab is active by default (it's not, but we can preload)
-// We'll start when tab is clicked.
-</script>
+    <div class="login-card">
+        <div class="login-content">
+            <div class="login-icon"><i class="fa-solid fa-user"></i></div>
+            <h1 class="login-title">YUVICODEX</h1>
+            <form method="POST" action="/login">
+                <input type="text" name="username" placeholder="Username" required />
+                <input type="password" name="password" placeholder="Password" required />
+                <button class="login-btn" type="submit">ACCESS SYSTEM</button>
+            </form>
+            <div class="login-error">{{ error if error else '' }}</div>
+            <div class="register-link">New user? <a href="/register">Create Account</a></div>
+        </div>
+    </div>
 </body>
 </html>
 """
 
-# For DASHBOARD_TEMPLATE, we remove custom domain field and keep only rename.
+REGISTER_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Register - Yuvicodex</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; font-family:'Arial',sans-serif; }
+        body {
+            background:#05070d;
+            color:#fff;
+            min-height:100vh;
+            display:flex;
+            justify-content:center;
+            align-items:center;
+            padding:20px;
+        }
+        .login-card {
+            position:relative;
+            width:100%;
+            max-width:400px;
+            padding:30px 20px;
+            background:#0c1018;
+            border-radius:25px;
+            overflow:hidden;
+            box-shadow:0 0 20px rgba(0,0,0,.5);
+        }
+        .login-card::before {
+            content:"";
+            position:absolute;
+            inset:-3px;
+            background:conic-gradient(#00e5ff, transparent, transparent, transparent, #00e5ff);
+            animation:spin 4s linear infinite;
+        }
+        .login-card::after {
+            content:"";
+            position:absolute;
+            inset:3px;
+            background:#0c1018;
+            border-radius:22px;
+        }
+        .login-content { position:relative; z-index:2; }
+        .login-title {
+            margin:25px 0;
+            text-align:center;
+            color:#cfffff;
+            letter-spacing:4px;
+            font-size:1.3rem;
+        }
+        .login-card input {
+            width:100%;
+            margin:12px 0;
+            padding:16px;
+            background:#161b25;
+            border:1px solid #2b3240;
+            border-radius:15px;
+            color:white;
+            font-size:16px;
+            outline:none;
+        }
+        .login-card input:focus {
+            border-color:#00e5ff;
+        }
+        .login-btn {
+            width:100%;
+            margin-top:20px;
+            padding:16px;
+            border:none;
+            border-radius:15px;
+            font-size:18px;
+            font-weight:bold;
+            color:white;
+            cursor:pointer;
+            background:linear-gradient(90deg, #7a00ff, #00d9ff);
+            transition:opacity 0.2s;
+        }
+        .login-btn:hover { opacity:.9; }
+        .login-error {
+            color:#ff4d4d;
+            text-align:center;
+            font-size:14px;
+            margin-top:10px;
+            min-height:22px;
+        }
+        .register-link {
+            text-align:center;
+            margin-top:15px;
+            color:#889;
+        }
+        .register-link a {
+            color:#00e5ff;
+            text-decoration:none;
+        }
+        @keyframes spin { 100% { transform:rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="login-content">
+            <h1 class="login-title">CREATE ACCOUNT</h1>
+            <form method="POST" action="/register">
+                <input type="text" name="username" placeholder="Username" required />
+                <input type="email" name="email" placeholder="Email" required />
+                <input type="password" name="password" placeholder="Password" required />
+                <button class="login-btn" type="submit">REGISTER</button>
+            </form>
+            <div class="login-error">{{ error if error else '' }}</div>
+            <div class="register-link">Already have account? <a href="/">Login</a></div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1723,7 +1876,6 @@ function showLogs(websiteId) {
         const data = event.data;
         if (!data) return;
         if (data === '[REFRESH]') {
-            // Refresh the page after a small delay
             setTimeout(() => { location.reload(); }, 2000);
             return;
         }
@@ -1754,257 +1906,6 @@ function showLogs(websiteId) {
     });
 }
 </script>
-</body>
-</html>
-"""
-
-# Other templates (ERROR, LOGIN, REGISTER, FILES, EDIT, DEPLOYMENTS, BUILD_LOGS) are kept as previously defined.
-# For brevity, I'll include them in the final code (they are the same as before).
-
-ERROR_TEMPLATE = """<!DOCTYPE html>
-<html><head><title>Website Unavailable</title>
-<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:50px;text-align:center;max-width:500px;box-shadow:0 0 80px rgba(0,229,255,0.05)}h1{font-size:2.5rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:15px}p{color:#aab;font-size:1.1rem;margin:15px 0}a{color:#00e5ff;text-decoration:none;padding:12px 30px;border:2px solid #00e5ff;border-radius:50px;display:inline-block;margin-top:20px;transition:.3s}a:hover{background:#00e5ff;color:#000;transform:scale(1.05)}
-</style></head>
-<body><div class="glass"><h1>⚠️ {{ message }}</h1><p>Slug: <strong>{{ slug }}</strong></p><a href="/dashboard">← Go to Dashboard</a></div></body></html>"""
-
-LOGIN_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Login - Yuvicodex</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
-    <style>
-        * { margin:0; padding:0; box-sizing:border-box; font-family:'Arial',sans-serif; }
-        body {
-            background:#05070d;
-            color:#fff;
-            min-height:100vh;
-            display:flex;
-            justify-content:center;
-            align-items:center;
-            padding:20px;
-        }
-        .login-card {
-            position:relative;
-            width:100%;
-            max-width:400px;
-            padding:30px 20px;
-            background:#0c1018;
-            border-radius:25px;
-            overflow:hidden;
-            box-shadow:0 0 20px rgba(0,0,0,.5);
-        }
-        .login-card::before {
-            content:"";
-            position:absolute;
-            inset:-3px;
-            background:conic-gradient(#00e5ff, transparent, transparent, transparent, #00e5ff);
-            animation:spin 4s linear infinite;
-        }
-        .login-card::after {
-            content:"";
-            position:absolute;
-            inset:3px;
-            background:#0c1018;
-            border-radius:22px;
-        }
-        .login-content { position:relative; z-index:2; }
-        .login-icon {
-            width:110px; height:110px; margin:auto;
-            border:3px solid #00e5ff; border-radius:50%;
-            display:flex; justify-content:center; align-items:center;
-            font-size:45px; color:#00e5ff;
-            box-shadow:0 0 20px #00e5ff;
-            background:#0c1018;
-            transition:transform 0.1s;
-            user-select:none;
-        }
-        .login-title {
-            margin:25px 0;
-            text-align:center;
-            color:#cfffff;
-            letter-spacing:4px;
-            font-size:1.3rem;
-        }
-        .login-card input {
-            width:100%;
-            margin:12px 0;
-            padding:16px;
-            background:#161b25;
-            border:1px solid #2b3240;
-            border-radius:15px;
-            color:white;
-            font-size:16px;
-            outline:none;
-        }
-        .login-card input:focus {
-            border-color:#00e5ff;
-        }
-        .login-btn {
-            width:100%;
-            margin-top:20px;
-            padding:16px;
-            border:none;
-            border-radius:15px;
-            font-size:18px;
-            font-weight:bold;
-            color:white;
-            cursor:pointer;
-            background:linear-gradient(90deg, #7a00ff, #00d9ff);
-            transition:opacity 0.2s;
-        }
-        .login-btn:hover { opacity:.9; }
-        .login-error {
-            color:#ff4d4d;
-            text-align:center;
-            font-size:14px;
-            margin-top:10px;
-            min-height:22px;
-        }
-        .register-link {
-            text-align:center;
-            margin-top:15px;
-            color:#889;
-        }
-        .register-link a {
-            color:#00e5ff;
-            text-decoration:none;
-        }
-        @keyframes spin { 100% { transform:rotate(360deg); } }
-    </style>
-</head>
-<body>
-    <div class="login-card">
-        <div class="login-content">
-            <div class="login-icon"><i class="fa-solid fa-user"></i></div>
-            <h1 class="login-title">YUVICODEX</h1>
-            <form method="POST" action="/login">
-                <input type="text" name="username" placeholder="Username" required />
-                <input type="password" name="password" placeholder="Password" required />
-                <button class="login-btn" type="submit">ACCESS SYSTEM</button>
-            </form>
-            <div class="login-error">{{ error if error else '' }}</div>
-            <div class="register-link">New user? <a href="/register">Create Account</a></div>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-REGISTER_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Register - Yuvicodex</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
-    <style>
-        * { margin:0; padding:0; box-sizing:border-box; font-family:'Arial',sans-serif; }
-        body {
-            background:#05070d;
-            color:#fff;
-            min-height:100vh;
-            display:flex;
-            justify-content:center;
-            align-items:center;
-            padding:20px;
-        }
-        .login-card {
-            position:relative;
-            width:100%;
-            max-width:400px;
-            padding:30px 20px;
-            background:#0c1018;
-            border-radius:25px;
-            overflow:hidden;
-            box-shadow:0 0 20px rgba(0,0,0,.5);
-        }
-        .login-card::before {
-            content:"";
-            position:absolute;
-            inset:-3px;
-            background:conic-gradient(#00e5ff, transparent, transparent, transparent, #00e5ff);
-            animation:spin 4s linear infinite;
-        }
-        .login-card::after {
-            content:"";
-            position:absolute;
-            inset:3px;
-            background:#0c1018;
-            border-radius:22px;
-        }
-        .login-content { position:relative; z-index:2; }
-        .login-title {
-            margin:25px 0;
-            text-align:center;
-            color:#cfffff;
-            letter-spacing:4px;
-            font-size:1.3rem;
-        }
-        .login-card input {
-            width:100%;
-            margin:12px 0;
-            padding:16px;
-            background:#161b25;
-            border:1px solid #2b3240;
-            border-radius:15px;
-            color:white;
-            font-size:16px;
-            outline:none;
-        }
-        .login-card input:focus {
-            border-color:#00e5ff;
-        }
-        .login-btn {
-            width:100%;
-            margin-top:20px;
-            padding:16px;
-            border:none;
-            border-radius:15px;
-            font-size:18px;
-            font-weight:bold;
-            color:white;
-            cursor:pointer;
-            background:linear-gradient(90deg, #7a00ff, #00d9ff);
-            transition:opacity 0.2s;
-        }
-        .login-btn:hover { opacity:.9; }
-        .login-error {
-            color:#ff4d4d;
-            text-align:center;
-            font-size:14px;
-            margin-top:10px;
-            min-height:22px;
-        }
-        .register-link {
-            text-align:center;
-            margin-top:15px;
-            color:#889;
-        }
-        .register-link a {
-            color:#00e5ff;
-            text-decoration:none;
-        }
-        @keyframes spin { 100% { transform:rotate(360deg); } }
-    </style>
-</head>
-<body>
-    <div class="login-card">
-        <div class="login-content">
-            <h1 class="login-title">CREATE ACCOUNT</h1>
-            <form method="POST" action="/register">
-                <input type="text" name="username" placeholder="Username" required />
-                <input type="email" name="email" placeholder="Email" required />
-                <input type="password" name="password" placeholder="Password" required />
-                <button class="login-btn" type="submit">REGISTER</button>
-            </form>
-            <div class="login-error">{{ error if error else '' }}</div>
-            <div class="register-link">Already have account? <a href="/">Login</a></div>
-        </div>
-    </div>
 </body>
 </html>
 """
@@ -2137,6 +2038,102 @@ textarea:focus{border-color:#00e5ff}
 </div>
 </form>
 </div>
+</body>
+</html>
+"""
+
+LOGS_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Logs - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:1000px;margin:auto}
+.back{color:#00e5ff;text-decoration:none;font-weight:600}
+h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.tabs{display:flex;gap:10px;margin:15px 0;flex-wrap:wrap}
+.tab{background:rgba(255,255,255,0.05);padding:8px 18px;border-radius:50px;cursor:pointer;transition:.3s;font-size:0.9rem}
+.tab.active{background:rgba(0,229,255,0.2);color:#00e5ff}
+.tab:hover{background:rgba(255,255,255,0.1)}
+.tab-content{display:none}
+.tab-content.active{display:block}
+pre{background:rgba(0,0,0,0.4);padding:15px;border-radius:15px;max-height:400px;overflow-y:auto;border:1px solid rgba(255,255,255,0.05);font-family:'Courier New',monospace;font-size:12px;white-space:pre-wrap;color:#aab}
+</style>
+</head>
+<body>
+<div class="container">
+<a href="/dashboard" class="back">← Dashboard</a>
+<h2>📜 Logs for {{ website.website_name or website.website_slug }}</h2>
+
+<div class="tabs">
+    <div class="tab active" data-target="deploy">Deployment</div>
+    <div class="tab" data-target="build">Build</div>
+    <div class="tab" data-target="runtime">Runtime (Live)</div>
+    <div class="tab" data-target="error">Errors</div>
+</div>
+
+<div id="deploy" class="tab-content active">
+    <h3>📋 Deployment Log</h3>
+    <pre>{{ deploy_log if deploy_log else 'No deployment logs yet.' }}</pre>
+</div>
+<div id="build" class="tab-content">
+    <h3>🔧 Build Log</h3>
+    <pre>{{ install_log if install_log else 'No build logs.' }}</pre>
+</div>
+<div id="runtime" class="tab-content">
+    <h3>🖥️ Runtime Log (Live)</h3>
+    <div id="runtimeLogContainer" style="background:rgba(0,0,0,0.4);padding:15px;border-radius:15px;max-height:400px;overflow-y:auto;border:1px solid rgba(255,255,255,0.05);font-family:'Courier New',monospace;font-size:12px;white-space:pre-wrap;color:#aab;"></div>
+</div>
+<div id="error" class="tab-content">
+    <h3>❌ Error Log</h3>
+    <pre>{{ error_log_text if error_log_text else 'No errors logged.' }}</pre>
+</div>
+</div>
+
+<script>
+document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', function() {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        this.classList.add('active');
+        document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
+        document.getElementById(this.dataset.target).classList.add('active');
+        if (this.dataset.target === 'runtime') {
+            startRuntimeLogs();
+        }
+    });
+});
+
+let runtimeEventSource = null;
+function startRuntimeLogs() {
+    if (runtimeEventSource) {
+        runtimeEventSource.close();
+        runtimeEventSource = null;
+    }
+    const container = document.getElementById('runtimeLogContainer');
+    container.innerHTML = 'Connecting to runtime logs...';
+    runtimeEventSource = new EventSource('/runtime/{{ website.id }}/logs');
+    let autoScroll = true;
+    runtimeEventSource.onmessage = function(event) {
+        const data = event.data;
+        if (!data) return;
+        const lineDiv = document.createElement('div');
+        lineDiv.textContent = data;
+        container.appendChild(lineDiv);
+        if (autoScroll) {
+            container.scrollTop = container.scrollHeight;
+        }
+    };
+    runtimeEventSource.onerror = function() {};
+    container.addEventListener('scroll', function() {
+        if (container.scrollTop < container.scrollHeight - container.clientHeight - 10) {
+            autoScroll = false;
+        } else {
+            autoScroll = true;
+        }
+    });
+}
+</script>
 </body>
 </html>
 """
@@ -2289,7 +2286,6 @@ evtSource.onmessage = function(event) {
 evtSource.onerror = function() {
     setTimeout(() => {
         if (evtSource.readyState === EventSource.CLOSED) {
-            // Maybe reopen if not done
         }
     }, 2000);
 };
