@@ -247,34 +247,50 @@ def load_env_file(folder):
             pass
     return env_dict
 
-def install_requirements(folder, website_id, log_file=None):
+def install_requirements(folder, website_id, log_callback=None):
     req_file = os.path.join(folder, 'requirements.txt')
     if not os.path.exists(req_file):
         return True, "No requirements.txt", []
-    if log_file is None:
-        log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
+    
+    log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
     logs = []
+    def log(msg):
+        logs.append(msg)
+        if log_callback:
+            log_callback(msg)
+    
+    log(f"📦 Installing requirements from {req_file} ...")
     try:
         cmd = [sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt']
-        with open(log_file, 'a') as f:
+        with open(log_file, 'w') as f:
             proc = subprocess.Popen(cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             for line in proc.stdout:
                 logs.append(line)
                 f.write(line)
+                if log_callback:
+                    log_callback(line)
             proc.wait()
         if proc.returncode != 0:
             error = ''.join(logs[-500:])
+            log(f"❌ Installation failed: {error}")
             return False, f"Installation failed: {error}", logs
+        log("✅ Installation successful")
         return True, "Installation successful", logs
     except Exception as e:
-        return False, f"Installation error: {str(e)}", [str(e)]
+        error_msg = str(e)
+        log(f"❌ Installation error: {error_msg}")
+        return False, f"Installation error: {error_msg}", [error_msg]
 
-def install_node_modules(folder, website_id, log_file=None):
+def install_node_modules(folder, website_id, log_callback=None):
     if not os.path.exists(os.path.join(folder, 'package.json')):
         return True, "No package.json", []
-    if log_file is None:
-        log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
+    log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
     logs = []
+    def log(msg):
+        logs.append(msg)
+        if log_callback:
+            log_callback(msg)
+    log(f"📦 Installing npm packages ...")
     try:
         cmd = ['npm', 'install']
         with open(log_file, 'a') as f:
@@ -282,13 +298,19 @@ def install_node_modules(folder, website_id, log_file=None):
             for line in proc.stdout:
                 logs.append(line)
                 f.write(line)
+                if log_callback:
+                    log_callback(line)
             proc.wait()
         if proc.returncode != 0:
             error = ''.join(logs[-500:])
+            log(f"❌ npm install failed: {error}")
             return False, f"npm install failed: {error}", logs
+        log("✅ npm install successful")
         return True, "npm install successful", logs
     except Exception as e:
-        return False, f"npm install error: {str(e)}", [str(e)]
+        error_msg = str(e)
+        log(f"❌ npm install error: {error_msg}")
+        return False, f"npm install error: {error_msg}", [error_msg]
 
 def health_check(port, timeout=5):
     try:
@@ -312,6 +334,7 @@ def start_website_process(website_id, log_callback=None):
     if not os.path.exists(folder):
         if log_callback: log_callback("❌ Folder missing")
         return False, "Folder not found", []
+    
     startup_file_from_db = website['startup_file']
     startup_file = None
     runtime = None
@@ -334,31 +357,45 @@ def start_website_process(website_id, log_callback=None):
     if not startup_file:
         if log_callback: log_callback("❌ No startup file found")
         return False, "No startup file detected.", []
+    
     log_lines = []
     def log(msg):
         log_lines.append(msg)
         if log_callback:
             log_callback(msg)
+    
+    # --- Install dependencies if needed ---
     if runtime == 'python':
-        success, msg, logs = install_requirements(folder, website_id)
-        log_lines.extend(logs)
-        for l in logs: log(l)
-        if not success:
-            return False, msg, log_lines
+        # Check if requirements.txt exists and install
+        req_path = os.path.join(folder, 'requirements.txt')
+        if os.path.exists(req_path):
+            success, msg, logs = install_requirements(folder, website_id, log_callback)
+            log_lines.extend(logs)
+            if not success:
+                update_website_status(website_id, 'failed')
+                log_website(website_id, f"Installation failed: {msg}", 'error')
+                return False, msg, log_lines
+            else:
+                log_website(website_id, "Installation successful")
     elif runtime == 'node':
-        success, msg, logs = install_node_modules(folder, website_id)
+        success, msg, logs = install_node_modules(folder, website_id, log_callback)
         log_lines.extend(logs)
-        for l in logs: log(l)
         if not success:
+            update_website_status(website_id, 'failed')
+            log_website(website_id, f"npm install failed: {msg}", 'error')
             return False, msg, log_lines
+    
+    # Save build log
     build_log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_build.log")
     with open(build_log_file, 'w') as f:
         f.write('\n'.join(log_lines))
     with get_db() as conn:
         conn.execute('UPDATE websites SET build_log_file = ? WHERE id = ?', (build_log_file, website_id))
         conn.commit()
+    
     port = get_next_available_port()
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
+    
     env = os.environ.copy()
     env['PORT'] = str(port)
     env['PYTHONUNBUFFERED'] = '1'
@@ -370,12 +407,14 @@ def start_website_process(website_id, log_callback=None):
             env.update(extra_env)
         except:
             pass
+    
     if runtime == 'python':
         cmd = [sys.executable, startup_file]
     elif runtime == 'node':
         cmd = ['npm', 'start']
     else:
         cmd = [sys.executable, '-m', 'http.server', str(port)]
+    
     log(f"🚀 Starting with command: {' '.join(cmd)}")
     try:
         if os.name == 'nt':
@@ -477,10 +516,9 @@ monitor_thread = threading.Thread(target=monitor_websites, daemon=True)
 monitor_thread.start()
 
 # ============================================================
-# ⚠️ सारे स्पेसिफिक रूट्स पहले डिफाइन करो – प्रॉक्सी को सबसे नीचे रखो
+# ⚠️ सारे स्पेसिफिक रूट्स पहले – प्रॉक्सी सबसे नीचे
 # ============================================================
 
-# ---------- फ्लास्क रूट्स (स्पेसिफिक) ----------
 @app.route('/')
 def index():
     if 'user_id' in session:
@@ -489,28 +527,22 @@ def index():
 
 @app.route('/api/login', methods=['POST'])
 def api_login():
-    """JSON login API for frontend (used by JavaScript)"""
     data = request.get_json()
     if not data:
         return jsonify({'error': 'Invalid request'}), 400
     username = data.get('username', '').strip()
     password = data.get('password', '').strip()
-    
     if not username or not password:
         return jsonify({'error': 'Username and password required'}), 400
-    
     user = get_user_by_username(username)
     if not user or not check_password_hash(user['password_hash'], password):
         return jsonify({'error': 'Invalid credentials'}), 401
-    
     if user['status'] != 'active':
         return jsonify({'error': 'Account disabled'}), 403
-    
     session['user_id'] = user['id']
     session['username'] = user['username']
     session['role'] = user['role']
     session['plan'] = user['plan']
-    
     return jsonify({
         'success': True,
         'username': user['username'],
@@ -587,6 +619,7 @@ def dashboard():
                                   base_url=base_url,
                                   user_obj=user)
 
+# ---------- अपलोड – Multiple Files ----------
 @app.route('/upload', methods=['POST'])
 def upload_website():
     if 'user_id' not in session:
@@ -595,18 +628,23 @@ def upload_website():
     user = get_user_by_id(user_id)
     if user['status'] != 'active':
         return jsonify({'success': False, 'error': 'Account disabled'}), 403
-    if 'file' not in request.files:
-        return jsonify({'success': False, 'error': 'No file uploaded'}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'success': False, 'error': 'Empty filename'}), 400
-    file.seek(0, os.SEEK_END)
-    size = file.tell()
-    file.seek(0)
-    if size > MAX_UPLOAD_SIZE:
-        return jsonify({'success': False, 'error': f'File too large (max {MAX_UPLOAD_SIZE//1024//1024} MB)'}), 400
-    filename = file.filename
-    is_zip = filename.lower().endswith('.zip')
+    
+    # फाइलें लें (चाहे एक हो या कई)
+    files = request.files.getlist('files[]')
+    if not files or len(files) == 0:
+        # fallback for single file (old method)
+        if 'file' in request.files:
+            files = [request.files['file']]
+        else:
+            return jsonify({'success': False, 'error': 'No files uploaded'}), 400
+    
+    # पहली फ़ाइल का नाम चेक करें (ZIP या not)
+    # हम एक फ़ाइल को ZIP मानेंगे अगर वह .zip हो, बाकी को single files
+    # हम पहली ZIP को प्राथमिकता देंगे (अगर कई हैं तो पहली ZIP extract करें)
+    zip_files = [f for f in files if f.filename.lower().endswith('.zip')]
+    non_zip_files = [f for f in files if not f.filename.lower().endswith('.zip')]
+    
+    # Generate slug
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
     slug = generate_website_slug(session['username'], count)
@@ -614,46 +652,73 @@ def upload_website():
         if conn.execute('SELECT id FROM websites WHERE website_slug = ?', (slug,)).fetchone():
             count += 1
             slug = generate_website_slug(session['username'], count)
+    
+    # Create website record
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status)
                               VALUES (?, ?, ?, ?)''',
                            (user_id, slug, f"website_{0}", 'uploaded'))
         website_id = cur.lastrowid
         conn.commit()
+    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     try:
         os.makedirs(folder, exist_ok=True)
     except PermissionError:
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': 'Permission denied'}), 500
-    if is_zip:
-        zip_path = os.path.join(folder, 'upload.zip')
+    
+    # Process ZIP files (extract first ZIP, ignore others? but we can extract all ZIPs into same folder)
+    # We'll extract each ZIP into the folder, merging contents.
+    for zf in zip_files:
+        zip_path = os.path.join(folder, zf.filename)
         try:
-            file.save(zip_path)
+            zf.save(zip_path)
         except Exception as e:
             rollback_upload(website_id, folder)
-            return jsonify({'success': False, 'error': f'Failed to save: {str(e)}'}), 500
+            return jsonify({'success': False, 'error': f'Failed to save ZIP: {str(e)}'}), 500
+        
         valid, msg = validate_zip(zip_path)
         if not valid:
             rollback_upload(website_id, folder)
             return jsonify({'success': False, 'error': msg}), 400
+        
         ok, msg = extract_zip(zip_path, folder)
         if not ok:
             rollback_upload(website_id, folder)
             return jsonify({'success': False, 'error': msg}), 400
-        os.remove(zip_path)
-        startup_file = None
-        website_name = filename[:-4] if '.' in filename else filename
-    else:
-        file_path = os.path.join(folder, filename)
+        
+        os.remove(zip_path)  # delete zip after extraction
+    
+    # Process non-ZIP files (single files)
+    for f in non_zip_files:
+        file_path = os.path.join(folder, f.filename)
         try:
-            file.save(file_path)
+            f.save(file_path)
         except Exception as e:
             rollback_upload(website_id, folder)
-            return jsonify({'success': False, 'error': f'Failed to save: {str(e)}'}), 500
-        startup_file = filename
-        website_name = filename
+            return jsonify({'success': False, 'error': f'Failed to save file: {str(e)}'}), 500
+    
+    # Determine startup file: if any non-zip file is a Python file, we may set startup_file
+    # Otherwise, detection will happen on start.
+    startup_file = None
+    website_name = None
+    # Try to find a .py file among the uploaded files (non-zip)
+    for f in non_zip_files:
+        if f.filename.endswith('.py') and not f.filename.startswith('.'):
+            startup_file = f.filename
+            website_name = f.filename
+            break
+    # If no .py found, maybe there's an index.html
+    if not startup_file:
+        for f in non_zip_files:
+            if f.filename == 'index.html':
+                startup_file = f.filename
+                website_name = f.filename
+                break
+    
     size_used = calculate_folder_size(folder)
+    
     with get_db() as conn:
         conn.execute('''UPDATE websites SET 
                         website_name = ?, 
@@ -664,19 +729,24 @@ def upload_website():
                         status = 'uploaded',
                         updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?''',
-                     (website_name or file.filename,
+                     (website_name or 'Website',
                       f"website_{website_id}", size_used, size_used, startup_file, website_id))
         conn.commit()
-    log_website(website_id, f"Uploaded: {file.filename}")
-    log_activity(user_id, 'upload', f'Uploaded {file.filename}', request.remote_addr)
+    
+    log_website(website_id, f"Uploaded {len(files)} file(s)")
+    log_activity(user_id, 'upload', f'Uploaded {len(files)} files', request.remote_addr)
+    
+    # Auto-start
     update_website_status(website_id, 'starting')
     ok, msg, logs = start_website_process(website_id)
     if ok:
         log_website(website_id, f"Auto-started successfully: {msg}")
     else:
         log_website(website_id, f"Auto-start failed: {msg}", 'error')
+    
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug, 'auto_started': ok})
 
+# ---------- GitHub Deploy ----------
 @app.route('/deploy_github/stream', methods=['POST'])
 def deploy_github_stream():
     if 'user_id' not in session:
@@ -988,7 +1058,7 @@ def env_vars(website_id):
             return jsonify({'success': True, 'restarted': False})
 
 # ============================================================
-# ⚠️ प्रॉक्सी रूट्स – सबसे नीचे (ताकि अन्य रूट्स पहले मैच हों)
+# ⚠️ PROXY – सबसे नीचे
 # ============================================================
 @app.route('/<slug>/', defaults={'path': ''})
 @app.route('/<slug>/<path:path>')
@@ -1030,11 +1100,8 @@ def proxy_website(slug, path):
         log_website(website['id'], f"Proxy error: {str(e)}", 'error')
         return f"Proxy error: {str(e)}", 500
 
-# ---------- टेम्प्लेट्स (सभी पहले जैसे) ----------
-# (ERROR_TEMPLATE, LOGIN_TEMPLATE, REGISTER_TEMPLATE, DASHBOARD_TEMPLATE, FILES_TEMPLATE, EDIT_TEMPLATE, LOGS_TEMPLATE, ENV_TEMPLATE)
-# मैंने यहाँ सिर्फ जगह बचाने के लिए नहीं डाला है, लेकिन आप अपनी पुरानी फाइल से कॉपी कर सकते हैं।
-# मैं उन्हें पूरा नीचे दे रहा हूँ।
-
+# ---------- TEMPLATES ----------
+# (All templates same as before - I'm including them for completeness)
 ERROR_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1153,7 +1220,7 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 .upload-box{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:2px dashed rgba(255,255,255,0.1);border-radius:25px;padding:40px;text-align:center;margin-bottom:30px;transition:.3s}
 .upload-box:hover{border-color:#00e5ff;animation:glow 2s ease-in-out infinite}
 .upload-box h3{font-size:1.3rem;margin-bottom:15px;color:#ddd}
-.upload-box input[type="file"]{margin:15px auto;display:block;color:#aaa}
+.upload-box input[type="file"]{margin:15px auto;display:block;color:#aaa;width:100%;padding:8px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.1);border-radius:8px;cursor:pointer}
 .upload-btn{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 40px;border-radius:50px;color:#fff;font-size:1rem;font-weight:700;cursor:pointer;transition:.3s}
 .upload-btn:hover{transform:scale(1.05);box-shadow:0 0 40px rgba(0,229,255,0.2)}
 #uploadStatus{margin-top:15px;font-weight:500}
@@ -1212,8 +1279,8 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 </div>
 
 <div class="upload-box">
-<h3>📤 Upload Website (ZIP or Single File)</h3>
-<input type="file" id="zipFile">
+<h3>📤 Upload Website (ZIP or Multiple Files)</h3>
+<input type="file" id="zipFile" multiple>
 <button class="upload-btn" id="uploadBtn">Upload & Deploy</button>
 <div id="uploadStatus"></div>
 </div>
@@ -1291,9 +1358,13 @@ alert('Error: '+d.error);
 }
 
 document.getElementById('uploadBtn').onclick=function(){
-const file=document.getElementById('zipFile').files[0];
-if(!file)return alert('Select a file');
-const fd=new FormData();fd.append('file',file);
+const input=document.getElementById('zipFile');
+const files=input.files;
+if(!files || files.length===0)return alert('Select at least one file');
+const fd=new FormData();
+for(let i=0;i<files.length;i++){
+fd.append('files[]', files[i]);
+}
 const st=document.getElementById('uploadStatus');
 st.innerHTML='⏳ Uploading...';
 fetch('/upload',{method:'POST',body:fd})
