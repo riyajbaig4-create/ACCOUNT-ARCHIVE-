@@ -49,7 +49,6 @@ def init_db():
             updated_at TIMESTAMP,
             last_login TIMESTAMP
         )''')
-        
         conn.execute('''CREATE TABLE IF NOT EXISTS websites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id INTEGER NOT NULL,
@@ -79,7 +78,6 @@ def init_db():
             auto_start BOOLEAN DEFAULT 0,
             FOREIGN KEY (owner_id) REFERENCES users (id)
         )''')
-        
         conn.execute('''CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             website_id INTEGER NOT NULL,
@@ -88,7 +86,6 @@ def init_db():
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (website_id) REFERENCES websites (id)
         )''')
-        
         conn.execute('''CREATE TABLE IF NOT EXISTS activity_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -97,7 +94,6 @@ def init_db():
             ip_address TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
-        
         conn.execute('''CREATE TABLE IF NOT EXISTS deployments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             website_id INTEGER NOT NULL,
@@ -111,41 +107,33 @@ def init_db():
             log_file TEXT,
             FOREIGN KEY (website_id) REFERENCES websites (id)
         )''')
-        
         conn.execute('CREATE INDEX IF NOT EXISTS idx_websites_owner ON websites(owner_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_website ON logs(website_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_deployments_website ON deployments(website_id)')
         conn.commit()
-        
         if conn.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0:
             conn.execute('INSERT INTO users (username, email, password_hash, role, plan) VALUES (?, ?, ?, ?, ?)',
                          ('admin', 'admin@hosting.com', generate_password_hash('admin123'), 'admin', 'pro'))
             conn.commit()
             print("✅ Default admin: admin / admin123 (Pro plan)")
-
 init_db()
 
 # ---------- Helpers ----------
 def get_user_by_id(user_id):
     with get_db() as conn:
         return conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
-
 def get_user_by_username(username):
     with get_db() as conn:
         return conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
-
 def get_website_by_id(website_id):
     with get_db() as conn:
         return conn.execute('SELECT * FROM websites WHERE id = ?', (website_id,)).fetchone()
-
 def get_website_by_slug(slug):
     with get_db() as conn:
         return conn.execute('SELECT * FROM websites WHERE website_slug = ?', (slug,)).fetchone()
-
 def get_websites_by_user(user_id):
     with get_db() as conn:
         return conn.execute('SELECT * FROM websites WHERE owner_id = ? ORDER BY created_at DESC', (user_id,)).fetchall()
-
 def get_next_available_port(start=5001):
     with get_db() as conn:
         used = [r[0] for r in conn.execute('SELECT allocated_port FROM websites WHERE allocated_port IS NOT NULL').fetchall()]
@@ -153,22 +141,18 @@ def get_next_available_port(start=5001):
     while port in used:
         port += 1
     return port
-
 def generate_website_slug(username, count):
     return username if count == 0 else f"{username}{count}"
-
 def log_website(website_id, message, log_type='info'):
     with get_db() as conn:
         conn.execute('INSERT INTO logs (website_id, log_type, log_text) VALUES (?, ?, ?)',
                      (website_id, log_type, message))
         conn.commit()
-
 def log_activity(user_id, action, details='', ip=''):
     with get_db() as conn:
         conn.execute('INSERT INTO activity_logs (user_id, action, details, ip_address) VALUES (?, ?, ?, ?)',
                      (user_id, action, details, ip))
         conn.commit()
-
 def update_website_status(website_id, status, pid=None, port=None):
     with get_db() as conn:
         if pid is not None and port is not None:
@@ -184,7 +168,6 @@ def update_website_status(website_id, status, pid=None, port=None):
             conn.execute('UPDATE websites SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                          (status, website_id))
         conn.commit()
-
 def calculate_folder_size(folder):
     total = 0
     for dirpath, _, filenames in os.walk(folder):
@@ -212,14 +195,12 @@ def validate_zip(zip_path):
     except Exception as e:
         return False, f"ZIP validation failed: {str(e)}"
     return True, "OK"
-
 def rollback_upload(website_id, folder):
     shutil.rmtree(folder, ignore_errors=True)
     with get_db() as conn:
         conn.execute('DELETE FROM websites WHERE id = ?', (website_id,))
         conn.execute('DELETE FROM logs WHERE website_id = ?', (website_id,))
         conn.commit()
-
 def extract_zip(zip_path, extract_to):
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
@@ -246,7 +227,16 @@ def detect_runtime_and_get_cmd(folder, port):
                 if 'start' in scripts:
                     cmd = ['npm', 'start']
                 else:
-                    cmd = ['node', 'server.js'] if os.path.exists(os.path.join(folder, 'server.js')) else None
+                    # try common entry files
+                    entry = None
+                    for fname in ['server.js', 'index.js', 'app.js', 'main.js']:
+                        if os.path.exists(os.path.join(folder, fname)):
+                            entry = fname
+                            break
+                    if entry:
+                        cmd = ['node', entry]
+                    else:
+                        cmd = None
                 if cmd:
                     return cmd, 'nodejs', {'NODE_ENV': 'production', 'PORT': str(port)}
         except:
@@ -269,7 +259,7 @@ def detect_runtime_and_get_cmd(folder, port):
     if jars:
         return ['java', '-jar', jars[0]], 'java', {}
     
-    # ----- Python (existing logic) -----
+    # ----- Python Flask/Django -----
     flask_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
     for f in flask_files:
         path = os.path.join(folder, f)
@@ -295,9 +285,8 @@ def detect_runtime_and_get_cmd(folder, port):
     
     return None, None, {}
 
-# ---------- Install Dependencies for Language ----------
+# ---------- Install Dependencies ----------
 def install_dependencies(folder, runtime, log_callback=None):
-    """Install dependencies based on runtime."""
     if runtime == 'nodejs':
         if os.path.exists(os.path.join(folder, 'package.json')):
             cmd = ['npm', 'install']
@@ -311,7 +300,6 @@ def install_dependencies(folder, runtime, log_callback=None):
             proc.wait()
             if proc.returncode != 0:
                 return False, "npm install failed"
-            # If there is a build script, run it
             try:
                 with open(os.path.join(folder, 'package.json'), 'r') as f:
                     data = json.load(f)
@@ -345,7 +333,7 @@ def install_dependencies(folder, runtime, log_callback=None):
             if proc.returncode != 0:
                 return False, "composer install failed"
             return True, "Dependencies installed"
-        return True, "No dependencies to install"
+        return True, "No dependencies"
     elif runtime == 'go':
         if os.path.exists(os.path.join(folder, 'go.mod')):
             cmd = ['go', 'mod', 'download']
@@ -423,7 +411,6 @@ def start_website_process(website_id, log_callback=None):
     website = get_website_by_id(website_id)
     if not website:
         return False, "Website not found"
-    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     if not os.path.exists(folder):
         log_website(website_id, "Folder missing", 'error')
@@ -476,7 +463,6 @@ def start_website_process(website_id, log_callback=None):
             proc = subprocess.Popen(cmd, cwd=folder, env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     preexec_fn=os.setsid)
-        
         def read_output():
             for line in iter(proc.stdout.readline, b''):
                 if line:
@@ -486,7 +472,6 @@ def start_website_process(website_id, log_callback=None):
                     if log_callback:
                         log_callback("PROCESS", decoded.strip())
             f_log.close()
-        
         thread = threading.Thread(target=read_output)
         thread.daemon = True
         thread.start()
@@ -532,7 +517,6 @@ def start_website_process(website_id, log_callback=None):
                 if error_log:
                     log_callback("ERROR", f"Last log lines:\n{error_log}")
             return False, f"Health check failed: {health_msg}\n{error_log}"
-    
     except Exception as e:
         log_website(website_id, f"Start error: {str(e)}", 'error')
         update_website_status(website_id, 'failed')
@@ -570,31 +554,26 @@ def write_log_step(log_file, step, message):
     return line
 
 def deploy_zip(website_id, extra_files=None):
-    website = get_website_by_id(website_id)
-    if not website:
-        return
-    
-    with get_db() as conn:
-        cur = conn.execute('''INSERT INTO deployments (website_id, repo_url, branch, status, started_at)
-                              VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)''',
-                           (website_id, 'ZIP Upload', 'main', 'queued'))
-        deployment_id = cur.lastrowid
-        conn.commit()
-    
-    log_file = os.path.join(LOG_FOLDER, f"deploy_{deployment_id}.log")
-    with open(log_file, 'w') as f:
-        f.write(write_log_step(log_file, "SYSTEM", "ZIP Deployment started"))
-    
-    def log_cb(step, msg):
-        write_log_step(log_file, step, msg)
-        log_website(website_id, f"[{step}] {msg}", 'info')
-    
     try:
+        website = get_website_by_id(website_id)
+        if not website:
+            return
+        with get_db() as conn:
+            cur = conn.execute('''INSERT INTO deployments (website_id, repo_url, branch, status, started_at)
+                                  VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)''',
+                               (website_id, 'ZIP Upload', 'main', 'queued'))
+            deployment_id = cur.lastrowid
+            conn.commit()
+        log_file = os.path.join(LOG_FOLDER, f"deploy_{deployment_id}.log")
+        with open(log_file, 'w') as f:
+            f.write(write_log_step(log_file, "SYSTEM", "ZIP Deployment started"))
+        def log_cb(step, msg):
+            write_log_step(log_file, step, msg)
+            log_website(website_id, f"[{step}] {msg}", 'info')
         log_cb("SYSTEM", "==> Extracting ZIP...")
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('extracting', deployment_id))
             conn.commit()
-        
         folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
         zip_path = os.path.join(folder, 'upload.zip')
         if not os.path.exists(zip_path):
@@ -604,7 +583,6 @@ def deploy_zip(website_id, extra_files=None):
                              ('failed', deployment_id))
                 conn.commit()
             return
-        
         ok, msg = extract_zip(zip_path, folder)
         if not ok:
             log_cb("ERROR", f"Extraction failed: {msg}")
@@ -615,7 +593,6 @@ def deploy_zip(website_id, extra_files=None):
             return
         os.remove(zip_path)
         log_cb("SUCCESS", "ZIP extracted successfully")
-        
         if extra_files:
             log_cb("SYSTEM", "Copying extra files...")
             for (filename, content) in extra_files:
@@ -623,18 +600,15 @@ def deploy_zip(website_id, extra_files=None):
                 with open(path, 'wb') as f:
                     f.write(content)
                 log_cb("FILE", f"Added {filename}")
-        
         size_used = calculate_folder_size(folder)
         with get_db() as conn:
             conn.execute('UPDATE websites SET storage_used = ?, website_size = ? WHERE id = ?',
                          (size_used, size_used, website_id))
             conn.commit()
-        
         log_cb("SYSTEM", "==> Detecting runtime and starting application...")
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('starting', deployment_id))
             conn.commit()
-        
         ok, msg = start_website_process(website_id, log_cb)
         if ok:
             with get_db() as conn:
@@ -648,45 +622,38 @@ def deploy_zip(website_id, extra_files=None):
                              ('failed', deployment_id))
                 conn.commit()
             log_cb("ERROR", f"Deployment failed: {msg}")
-    
     except Exception as e:
-        log_cb("ERROR", f"Deployment exception: {str(e)}")
+        log_website(website_id, f"Deployment exception: {str(e)}", 'error')
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
                          ('failed', deployment_id))
             conn.commit()
 
 def deploy_github(website_id, repo_url, branch):
-    website = get_website_by_id(website_id)
-    if not website:
-        return
-    
-    with get_db() as conn:
-        cur = conn.execute('''INSERT INTO deployments (website_id, repo_url, branch, status, started_at)
-                              VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)''',
-                           (website_id, repo_url, branch, 'queued'))
-        deployment_id = cur.lastrowid
-        conn.commit()
-    
-    log_file = os.path.join(LOG_FOLDER, f"deploy_{deployment_id}.log")
-    with open(log_file, 'w') as f:
-        f.write(write_log_step(log_file, "SYSTEM", f"GitHub Deployment started for {repo_url} (branch {branch})"))
-    
-    def log_cb(step, msg):
-        write_log_step(log_file, step, msg)
-        log_website(website_id, f"[{step}] {msg}", 'info')
-    
     try:
+        website = get_website_by_id(website_id)
+        if not website:
+            return
+        with get_db() as conn:
+            cur = conn.execute('''INSERT INTO deployments (website_id, repo_url, branch, status, started_at)
+                                  VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)''',
+                               (website_id, repo_url, branch, 'queued'))
+            deployment_id = cur.lastrowid
+            conn.commit()
+        log_file = os.path.join(LOG_FOLDER, f"deploy_{deployment_id}.log")
+        with open(log_file, 'w') as f:
+            f.write(write_log_step(log_file, "SYSTEM", f"GitHub Deployment started for {repo_url} (branch {branch})"))
+        def log_cb(step, msg):
+            write_log_step(log_file, step, msg)
+            log_website(website_id, f"[{step}] {msg}", 'info')
         log_cb("SYSTEM", "==> Cloning Repository...")
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('cloning', deployment_id))
             conn.commit()
-        
         folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
         if os.path.exists(folder):
             shutil.rmtree(folder)
         os.makedirs(folder, exist_ok=True)
-        
         clone_cmd = ['git', 'clone', '--depth', '1', '--branch', branch, repo_url, folder]
         proc = subprocess.Popen(clone_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         for line in iter(proc.stdout.readline, ''):
@@ -700,7 +667,6 @@ def deploy_github(website_id, repo_url, branch):
                              ('failed', deployment_id))
                 conn.commit()
             return
-        
         log_cb("SYSTEM", "Repository cloned successfully")
         log_cb("SYSTEM", "==> Starting application...")
         with get_db() as conn:
@@ -710,7 +676,6 @@ def deploy_github(website_id, repo_url, branch):
             conn.execute('UPDATE websites SET repo_url = ?, branch = ?, deployment_type = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                          (repo_url, branch, 'github', 'starting', website_id))
             conn.commit()
-        
         ok, msg = start_website_process(website_id, log_cb)
         if ok:
             with get_db() as conn:
@@ -724,9 +689,8 @@ def deploy_github(website_id, repo_url, branch):
                              ('failed', deployment_id))
                 conn.commit()
             log_cb("ERROR", f"Deployment failed: {msg}")
-    
     except Exception as e:
-        log_cb("ERROR", f"Deployment exception: {str(e)}")
+        log_website(website_id, f"Deployment exception: {str(e)}", 'error')
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
                          ('failed', deployment_id))
@@ -859,13 +823,11 @@ def upload_website():
     user = get_user_by_id(user_id)
     if user['status'] != 'active':
         return jsonify({'success': False, 'error': 'Account disabled'}), 403
-    
     if 'files[]' not in request.files:
         return jsonify({'success': False, 'error': 'No files uploaded'}), 400
     files = request.files.getlist('files[]')
     if not files or all(f.filename == '' for f in files):
         return jsonify({'success': False, 'error': 'No valid files'}), 400
-    
     zip_file = None
     extra_files = []
     for f in files:
@@ -875,56 +837,46 @@ def upload_website():
             extra_files.append(f)
     if not zip_file:
         return jsonify({'success': False, 'error': 'A ZIP file is required'}), 400
-    
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
     slug = generate_website_slug(session['username'], count)
     if get_website_by_slug(slug):
         count += 1
         slug = generate_website_slug(session['username'], count)
-    
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, deployment_type)
                               VALUES (?, ?, ?, ?, ?)''',
                            (user_id, slug, f"website_{0}", 'uploaded', 'zip'))
         website_id = cur.lastrowid
         conn.commit()
-    
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     try:
         os.makedirs(folder, exist_ok=True)
     except PermissionError:
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': 'Permission denied'}), 500
-    
     zip_path = os.path.join(folder, 'upload.zip')
     try:
         zip_file.save(zip_path)
     except Exception as e:
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': f'Failed to save zip: {str(e)}'}), 500
-    
     valid, msg = validate_zip(zip_path)
     if not valid:
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': msg}), 400
-    
     extra_data = []
     for f in extra_files:
         f.seek(0)
         data = f.read()
         extra_data.append((f.filename, data))
-    
     def bg_deploy():
         deploy_zip(website_id, extra_data)
-    
     thread = threading.Thread(target=bg_deploy)
     thread.daemon = True
     thread.start()
-    
     log_website(website_id, f"Uploaded: {zip_file.filename} + {len(extra_files)} extra files")
     log_activity(user_id, 'upload', f'Uploaded {zip_file.filename}', request.remote_addr)
-    
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
 # ---------- GitHub Deploy ----------
@@ -956,7 +908,7 @@ def github_deploy():
     thread.start()
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug, 'message': 'Deployment started'})
 
-# ---------- Build Logs Page (Full Screen) ----------
+# ---------- Build Logs Page ----------
 @app.route('/website/<int:website_id>/build')
 def build_logs_page(website_id):
     if 'user_id' not in session:
@@ -965,7 +917,11 @@ def build_logs_page(website_id):
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             abort(404)
-    return render_template_string(BUILD_LOGS_TEMPLATE, website=website)
+    with get_db() as conn:
+        dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
+    if not dep:
+        return render_template_string(BUILD_LOGS_TEMPLATE, website=website, no_logs=True)
+    return render_template_string(BUILD_LOGS_TEMPLATE, website=website, no_logs=False)
 
 @app.route('/deploy/<int:website_id>/logs')
 def deploy_logs_sse(website_id):
@@ -1000,8 +956,45 @@ def deploy_logs_sse(website_id):
             with get_db() as conn:
                 dep_status = conn.execute('SELECT status FROM deployments WHERE id = ?', (dep['id'],)).fetchone()
             if dep_status and dep_status['status'] in ('success', 'failed', 'stopped'):
+                yield f"data: [REFRESH]\n\n"
                 yield f"data: [SYSTEM] Deployment completed with status: {dep_status['status']}\n\n"
                 break
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+# ---------- Runtime Logs SSE (Live) ----------
+@app.route('/runtime/<int:website_id>/logs')
+def runtime_logs_sse(website_id):
+    if 'user_id' not in session:
+        return "Unauthorized", 401
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            abort(404)
+    log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
+    def generate():
+        if os.path.exists(log_file):
+            with open(log_file, 'r') as f:
+                for line in f:
+                    yield f"data: {line.strip()}\n\n"
+        last_size = os.path.getsize(log_file) if os.path.exists(log_file) else 0
+        while True:
+            time.sleep(0.5)
+            if os.path.exists(log_file):
+                current_size = os.path.getsize(log_file)
+                if current_size > last_size:
+                    with open(log_file, 'r') as f:
+                        f.seek(last_size)
+                        new_lines = f.read()
+                        for line in new_lines.splitlines():
+                            yield f"data: {line}\n\n"
+                    last_size = current_size
+            # Check if website is running; if not, we can still keep streaming but maybe stop after some time?
+            website = get_website_by_id(website_id)
+            if website and website['status'] == 'stopped':
+                # Keep streaming existing logs but stop waiting for new ones after a while?
+                # We'll just keep streaming forever, but we could break if desired.
+                pass
+            time.sleep(0.3)
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
 # ---------- Website Management Routes ----------
@@ -1097,25 +1090,6 @@ def rename_website(website_id):
         conn.commit()
     log_website(website_id, f"Renamed to {new_name}")
     return jsonify({'success': True, 'new_name': new_name})
-
-# Custom Domain (keep as is)
-@app.route('/website/<int:website_id>/custom_domain', methods=['POST'])
-def set_custom_domain(website_id):
-    if 'user_id' not in session:
-        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
-    website = get_website_by_id(website_id)
-    if not website or website['owner_id'] != session['user_id']:
-        if session.get('role') != 'admin':
-            return jsonify({'success': False, 'error': 'Not found'}), 404
-    domain = request.form.get('domain', '').strip()
-    if not domain or not re.match(r'^([a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}$', domain):
-        return jsonify({'success': False, 'error': 'Invalid domain'}), 400
-    with get_db() as conn:
-        conn.execute('UPDATE websites SET custom_domain = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-                     (domain, website_id))
-        conn.commit()
-    log_website(website_id, f"Custom domain set: {domain}")
-    return jsonify({'success': True, 'domain': domain})
 
 # ---------- File Manager ----------
 @app.route('/website/<int:website_id>/files')
@@ -1332,7 +1306,7 @@ def unzip_file_website(website_id):
     os.remove(full)
     return jsonify({'success': True})
 
-# ---------- Logs View (Enhanced with tabs) ----------
+# ---------- Logs View (with Live Runtime Logs) ----------
 @app.route('/website/<int:website_id>/logs')
 def view_logs(website_id):
     if 'user_id' not in session:
@@ -1343,19 +1317,16 @@ def view_logs(website_id):
             abort(404)
     with get_db() as conn:
         logs = conn.execute('SELECT * FROM logs WHERE website_id = ? ORDER BY timestamp DESC LIMIT 200', (website_id,)).fetchall()
-    
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
     file_log = ''
     if os.path.exists(log_file):
         with open(log_file, 'r', errors='ignore') as f:
             file_log = f.read()
-    
     install_log = ''
     install_log_file = os.path.join(LOG_FOLDER, f"website_{website_id}_install.log")
     if os.path.exists(install_log_file):
         with open(install_log_file, 'r', errors='ignore') as f:
             install_log = f.read()
-    
     deploy_log = ''
     with get_db() as conn:
         dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
@@ -1364,10 +1335,8 @@ def view_logs(website_id):
         if os.path.exists(dep_log_file):
             with open(dep_log_file, 'r', errors='ignore') as f:
                 deploy_log = f.read()
-    
     error_logs = [log for log in logs if log['log_type'] == 'error']
     error_log_text = '\n'.join([f"{log['timestamp']} {log['log_text']}" for log in error_logs])
-    
     return render_template_string(LOGS_TEMPLATE, website=website, logs=logs, file_log=file_log, install_log=install_log, deploy_log=deploy_log, error_log_text=error_log_text)
 
 @app.route('/website/<int:website_id>/deployments')
@@ -1383,8 +1352,421 @@ def deployment_history(website_id):
     return render_template_string(DEPLOYMENTS_TEMPLATE, website=website, deployments=deployments)
 
 # ========== TEMPLATES ==========
+# (All templates are kept as previously defined; LOGS_TEMPLATE is updated to include a live runtime log tab)
+# For brevity, I include only the LOGS_TEMPLATE and the DASHBOARD_TEMPLATE (which now has no custom domain field).
+# The other templates (ERROR, LOGIN, REGISTER, FILES, EDIT, DEPLOYMENTS, BUILD_LOGS) remain the same as earlier.
 
-# New Login Template (matching index.py style, but with real backend)
+LOGS_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Logs - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:1000px;margin:auto}
+.back{color:#00e5ff;text-decoration:none;font-weight:600}
+h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.tabs{display:flex;gap:10px;margin:15px 0;flex-wrap:wrap}
+.tab{background:rgba(255,255,255,0.05);padding:8px 18px;border-radius:50px;cursor:pointer;transition:.3s;font-size:0.9rem}
+.tab.active{background:rgba(0,229,255,0.2);color:#00e5ff}
+.tab:hover{background:rgba(255,255,255,0.1)}
+.tab-content{display:none}
+.tab-content.active{display:block}
+pre{background:rgba(0,0,0,0.4);padding:15px;border-radius:15px;max-height:400px;overflow-y:auto;border:1px solid rgba(255,255,255,0.05);font-family:'Courier New',monospace;font-size:12px;white-space:pre-wrap;color:#aab}
+</style>
+</head>
+<body>
+<div class="container">
+<a href="/dashboard" class="back">← Dashboard</a>
+<h2>📜 Logs for {{ website.website_name or website.website_slug }}</h2>
+
+<div class="tabs">
+    <div class="tab active" data-target="deploy">Deployment</div>
+    <div class="tab" data-target="build">Build</div>
+    <div class="tab" data-target="runtime">Runtime (Live)</div>
+    <div class="tab" data-target="error">Errors</div>
+</div>
+
+<div id="deploy" class="tab-content active">
+    <h3>📋 Deployment Log</h3>
+    <pre>{{ deploy_log if deploy_log else 'No deployment logs yet.' }}</pre>
+</div>
+<div id="build" class="tab-content">
+    <h3>🔧 Build Log</h3>
+    <pre>{{ install_log if install_log else 'No build logs.' }}</pre>
+</div>
+<div id="runtime" class="tab-content">
+    <h3>🖥️ Runtime Log (Live)</h3>
+    <div id="runtimeLogContainer" style="background:rgba(0,0,0,0.4);padding:15px;border-radius:15px;max-height:400px;overflow-y:auto;border:1px solid rgba(255,255,255,0.05);font-family:'Courier New',monospace;font-size:12px;white-space:pre-wrap;color:#aab;"></div>
+</div>
+<div id="error" class="tab-content">
+    <h3>❌ Error Log</h3>
+    <pre>{{ error_log_text if error_log_text else 'No errors logged.' }}</pre>
+</div>
+</div>
+
+<script>
+document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', function() {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        this.classList.add('active');
+        document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
+        document.getElementById(this.dataset.target).classList.add('active');
+        // If runtime tab is clicked, start SSE
+        if (this.dataset.target === 'runtime') {
+            startRuntimeLogs();
+        }
+    });
+});
+
+let runtimeEventSource = null;
+function startRuntimeLogs() {
+    if (runtimeEventSource) {
+        runtimeEventSource.close();
+        runtimeEventSource = null;
+    }
+    const container = document.getElementById('runtimeLogContainer');
+    container.innerHTML = 'Connecting to runtime logs...';
+    runtimeEventSource = new EventSource('/runtime/{{ website.id }}/logs');
+    let autoScroll = true;
+    runtimeEventSource.onmessage = function(event) {
+        const data = event.data;
+        if (!data) return;
+        const lineDiv = document.createElement('div');
+        lineDiv.textContent = data;
+        container.appendChild(lineDiv);
+        if (autoScroll) {
+            container.scrollTop = container.scrollHeight;
+        }
+    };
+    runtimeEventSource.onerror = function() {
+        // keep trying
+    };
+    container.addEventListener('scroll', function() {
+        if (container.scrollTop < container.scrollHeight - container.clientHeight - 10) {
+            autoScroll = false;
+        } else {
+            autoScroll = true;
+        }
+    });
+}
+// Auto-start runtime logs if that tab is active by default (it's not, but we can preload)
+// We'll start when tab is clicked.
+</script>
+</body>
+</html>
+"""
+
+# For DASHBOARD_TEMPLATE, we remove custom domain field and keep only rename.
+DASHBOARD_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Dashboard - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+@keyframes zoomIn{0%{opacity:0;transform:scale(0.95)}100%{opacity:1;transform:scale(1)}}
+@keyframes glow{0%{box-shadow:0 0 20px rgba(0,229,255,0.1)}50%{box-shadow:0 0 40px rgba(0,229,255,0.2)}100%{box-shadow:0 0 20px rgba(0,229,255,0.1)}}
+body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;padding:20px;min-height:100vh}
+.container{max-width:1300px;margin:auto;animation:zoomIn 0.5s ease}
+.header{display:flex;justify-content:space-between;align-items:center;padding:15px 25px;background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border-radius:20px;border:1px solid rgba(255,255,255,0.08);margin-bottom:30px}
+.header h1{font-size:1.8rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.user-badge{display:flex;align-items:center;gap:15px}
+.badge{background:rgba(0,229,255,0.15);padding:4px 14px;border-radius:50px;font-size:0.8rem;border:1px solid rgba(0,229,255,0.2)}
+.plan-badge{background:linear-gradient(135deg,#7a00ff,#00e5ff);padding:2px 12px;border-radius:50px;font-size:0.7rem;font-weight:700}
+.btn-logout{color:#ff4757;text-decoration:none;font-weight:600;padding:8px 20px;border:1px solid #ff4757;border-radius:50px;transition:.3s}
+.btn-logout:hover{background:#ff4757;color:#fff}
+.upload-box, .github-box{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:2px dashed rgba(255,255,255,0.2);border-radius:25px;padding:30px;margin-bottom:30px;transition:.3s;position:relative}
+.upload-box.dragover{border-color:#00e5ff;background:rgba(0,229,255,0.05);animation:glow 1s ease-in-out infinite}
+.upload-box:hover, .github-box:hover{border-color:#00e5ff}
+.upload-box h3, .github-box h3{font-size:1.3rem;margin-bottom:15px;color:#ddd}
+.upload-box input[type="file"], .github-box input{width:100%;padding:10px;margin:8px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;outline:none}
+.upload-box input:focus, .github-box input:focus{border-color:#00e5ff}
+.btn{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 40px;border-radius:50px;color:#fff;font-size:1rem;font-weight:700;cursor:pointer;transition:.3s}
+.btn:hover{transform:scale(1.05);box-shadow:0 0 40px rgba(0,229,255,0.2)}
+.btn-secondary{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1)}
+.btn-secondary:hover{background:rgba(255,255,255,0.15)}
+#uploadStatus, #githubStatus{margin-top:15px;font-weight:500}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:25px;margin-top:20px}
+.card{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.07);border-radius:20px;padding:25px;transition:.3s}
+.card:hover{transform:translateY(-5px);border-color:rgba(0,229,255,0.2);box-shadow:0 20px 60px rgba(0,0,0,0.3)}
+.card-title{font-size:1.2rem;font-weight:700;color:#fff}
+.card-slug{color:#889;font-size:0.9rem;margin:5px 0}
+.card-port{color:#889;font-size:0.8rem}
+.status-badge{display:inline-block;padding:4px 14px;border-radius:50px;font-size:0.75rem;font-weight:600;margin:10px 0}
+.status-running{background:rgba(0,229,255,0.15);color:#00e5ff;border:1px solid rgba(0,229,255,0.2)}
+.status-stopped{background:rgba(255,71,87,0.15);color:#ff4757;border:1px solid rgba(255,71,87,0.2)}
+.status-uploaded{background:rgba(255,170,0,0.15);color:#ffaa00;border:1px solid rgba(255,170,0,0.2)}
+.status-queued{background:rgba(100,100,255,0.15);color:#6666ff;border:1px solid rgba(100,100,255,0.2)}
+.status-cloning{background:rgba(255,165,0,0.15);color:#ffa500;border:1px solid rgba(255,165,0,0.2)}
+.status-installing{background:rgba(0,200,200,0.15);color:#00c8c8;border:1px solid rgba(0,200,200,0.2)}
+.status-starting{background:rgba(0,255,0,0.15);color:#00ff00;border:1px solid rgba(0,255,0,0.2)}
+.status-failed{background:rgba(255,0,0,0.15);color:#ff0000;border:1px solid rgba(255,0,0,0.2)}
+.card-meta{color:#666;font-size:0.8rem;margin:8px 0}
+.visit-link{display:inline-block;padding:8px 20px;border-radius:50px;background:#00e5ff;color:#000;text-decoration:none;font-weight:700;font-size:0.9rem;transition:.3s;margin:10px 0}
+.visit-link:hover{transform:scale(1.05);box-shadow:0 0 30px rgba(0,229,255,0.3)}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:15px}
+.actions button{padding:6px 14px;border:none;border-radius:12px;font-size:0.8rem;font-weight:600;cursor:pointer;transition:.2s}
+.actions button:hover{transform:scale(1.05)}
+.btn-start{background:rgba(0,229,255,0.2);color:#00e5ff}
+.btn-start:hover{background:#00e5ff;color:#000}
+.btn-stop{background:rgba(255,71,87,0.2);color:#ff4757}
+.btn-stop:hover{background:#ff4757;color:#fff}
+.btn-restart{background:rgba(255,170,0,0.2);color:#ffaa00}
+.btn-restart:hover{background:#ffaa00;color:#000}
+.btn-manage{background:rgba(255,255,255,0.08);color:#aaa}
+.btn-manage:hover{background:rgba(255,255,255,0.15);color:#fff}
+.btn-delete{background:rgba(255,0,0,0.15);color:#ff4444}
+.btn-delete:hover{background:#ff0000;color:#fff}
+.name-edit{display:flex;gap:8px;margin-top:12px}
+.name-edit input{flex:1;padding:8px 12px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;color:#fff;outline:none;font-size:0.85rem}
+.name-edit input:focus{border-color:#00e5ff}
+.name-edit button{padding:8px 16px;background:#00e5ff;border:none;border-radius:12px;color:#000;font-weight:600;cursor:pointer;transition:.2s}
+.name-edit button:hover{transform:scale(1.05)}
+@media(max-width:600px){.header{flex-direction:column;gap:10px;text-align:center}.grid{grid-template-columns:1fr}}
+.github-box input[type="text"]{width:100%;padding:12px;margin:8px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;outline:none}
+.github-box input:focus{border-color:#7a00ff}
+
+.log-container {
+    display: none;
+    margin: 20px 0 30px 0;
+    background: #0d0d0d;
+    border-radius: 15px;
+    padding: 15px;
+    border: 1px solid rgba(255,255,255,0.1);
+    max-height: 400px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #aab;
+}
+.log-container::-webkit-scrollbar{width:6px}
+.log-container::-webkit-scrollbar-track{background:#1a1a1a;border-radius:10px}
+.log-container::-webkit-scrollbar-thumb{background:#00e5ff;border-radius:10px}
+.log-container .line{margin:0;white-space:pre-wrap;word-break:break-all}
+.log-container .line .ts{color:#666;margin-right:10px}
+.log-container .line .step{color:#888;margin-right:10px}
+.log-container .line.SYSTEM{color:#00e5ff}
+.log-container .line.SUCCESS{color:#00ff88}
+.log-container .line.ERROR{color:#ff4757}
+.log-container .line.PIP{color:#ffaa00}
+.log-container .line.GIT{color:#a855f7}
+.log-container .line.STARTUP{color:#fbbf24}
+.log-container .line.PORT{color:#60a5fa}
+.log-container .line.FILE{color:#34d399}
+.log-container .line.PYTHON{color:#f472b6}
+.log-container .line.PROCESS{color:#9ca3af}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>🚀 Yuvicodex Host</h1>
+<div class="user-badge">
+<span class="badge">{{ user }}</span>
+<span class="plan-badge">{{ plan.upper() }}</span>
+<a href="/logout" class="btn-logout">Logout</a>
+</div>
+</div>
+
+<!-- Upload ZIP -->
+<div class="upload-box" id="dropZone">
+<h3>📤 Upload Website (ZIP + extra files)</h3>
+<p style="color:#889;font-size:0.9rem;margin-bottom:10px;">Drag & drop files here or click to select</p>
+<input type="file" id="zipFile" multiple accept=".zip,.py,.txt,.html,.js,.css,application/zip">
+<button class="btn" id="uploadBtn" style="margin-top:10px;">Upload & Deploy</button>
+<div id="uploadStatus"></div>
+</div>
+
+<!-- GitHub Deploy -->
+<div class="github-box">
+<h3>🐙 Deploy from GitHub</h3>
+<input type="text" id="repoUrl" placeholder="Repository URL (e.g., https://github.com/user/repo.git)">
+<input type="text" id="branch" placeholder="Branch (default: main)" value="main">
+<button class="btn" id="githubBtn">Clone & Deploy</button>
+<div id="githubStatus"></div>
+</div>
+
+<!-- Inline Build Logs -->
+<div class="log-container" id="logContainer">
+    <div id="logContent"></div>
+</div>
+
+<h2 style="margin-bottom:15px;">Your Websites</h2>
+<div class="grid">
+{% for w in websites %}
+<div class="card">
+<div class="card-title">{{ w.website_name or w.website_slug }}</div>
+<div class="card-slug">🔗 {{ base_url }}/<strong>{{ w.website_slug }}</strong>/</div>
+<div class="card-port">Port: {{ w.allocated_port or 'Not allocated' }}</div>
+<div class="status-badge status-{{ w.status }}">{{ w.status.upper() }}</div>
+<div class="card-meta">Created: {{ w.created_at[:10] }} | Size: {{ (w.website_size or 0)//1024 }} KB</div>
+{% if w.status == 'running' %}
+<a href="{{ w.url }}" target="_blank" class="visit-link">🌐 Visit Site</a>
+{% else %}
+<div style="color:#666;font-size:0.85rem;margin:10px 0;">⚪ Website not running</div>
+{% endif %}
+<div class="actions">
+<button class="btn-start" onclick="action({{ w.id }},'start')">▶ Start</button>
+<button class="btn-stop" onclick="action({{ w.id }},'stop')">■ Stop</button>
+<button class="btn-restart" onclick="action({{ w.id }},'restart')">⟳ Restart</button>
+<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/files'">📁 Files</button>
+<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/logs'">📜 Logs</button>
+<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/deployments'">📋 Deployments</button>
+<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/build'">🖥 Build Logs</button>
+<button class="btn-delete" onclick="if(confirm('Delete this website?')) action({{ w.id }},'delete')">🗑 Delete</button>
+</div>
+<!-- Rename Website (Display Name) -->
+<div class="name-edit">
+<input type="text" id="name_input_{{ w.id }}" value="{{ w.website_name or '' }}" placeholder="Website Name">
+<button onclick="renameWebsite({{ w.id }})">Rename</button>
+</div>
+</div>
+{% endfor %}
+</div>
+</div>
+
+<script>
+// Drag and Drop
+const dropZone = document.getElementById('dropZone');
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => { dropZone.classList.remove('dragover'); });
+dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    const files = e.dataTransfer.files;
+    const input = document.getElementById('zipFile');
+    const dt = new DataTransfer();
+    for (let f of files) dt.items.add(f);
+    input.files = dt.files;
+    document.getElementById('uploadStatus').innerHTML = `✅ ${files.length} file(s) selected`;
+});
+
+function action(id,type){
+fetch('/website/'+id+'/'+type,{method:'POST'})
+.then(r=>r.json())
+.then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
+.catch(()=>alert('Network error'));
+}
+
+function renameWebsite(id){
+const val=document.getElementById('name_input_'+id).value.trim();
+if(!val)return alert('Enter a name');
+fetch('/website/'+id+'/rename',{
+method:'POST',
+headers:{'Content-Type':'application/x-www-form-urlencoded'},
+body:'name='+encodeURIComponent(val)
+})
+.then(r=>r.json())
+.then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
+.catch(()=>alert('Network error'));
+}
+
+// Upload
+document.getElementById('uploadBtn').onclick=function(){
+const files = document.getElementById('zipFile').files;
+if(!files.length)return alert('Select at least one file (ZIP required)');
+let hasZip = false;
+for(let f of files){ if(f.name.toLowerCase().endsWith('.zip')) hasZip = true; }
+if(!hasZip)return alert('A ZIP file is required');
+const fd = new FormData();
+for(let f of files){ fd.append('files[]', f); }
+const st = document.getElementById('uploadStatus');
+st.innerHTML='⏳ Uploading...';
+fetch('/upload',{method:'POST',body:fd})
+.then(r=>r.json())
+.then(d=>{
+if(d.success){
+st.innerHTML='✅ Uploaded! Showing logs...';
+showLogs(d.website_id);
+}else st.innerHTML='❌ '+d.error;
+})
+.catch(()=>st.innerHTML='❌ Network error');
+};
+
+// GitHub Deploy
+document.getElementById('githubBtn').onclick=function(){
+const repo=document.getElementById('repoUrl').value.trim();
+const branch=document.getElementById('branch').value.trim()||'main';
+if(!repo)return alert('Enter repository URL');
+const st=document.getElementById('githubStatus');
+st.innerHTML='⏳ Starting deployment...';
+fetch('/github_deploy',{
+method:'POST',
+headers:{'Content-Type':'application/x-www-form-urlencoded'},
+body:'repo_url='+encodeURIComponent(repo)+'&branch='+encodeURIComponent(branch)
+})
+.then(r=>r.json())
+.then(d=>{
+if(d.success){
+st.innerHTML='✅ Deployment started! Showing logs...';
+showLogs(d.website_id);
+}else st.innerHTML='❌ '+d.error;
+})
+.catch(()=>st.innerHTML='❌ Network error');
+};
+
+// Inline Logs
+let currentEventSource = null;
+const logContainer = document.getElementById('logContainer');
+const logContent = document.getElementById('logContent');
+
+function showLogs(websiteId) {
+    if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
+    logContent.innerHTML = '';
+    logContainer.style.display = 'block';
+    logContainer.scrollTop = 0;
+    const evtSource = new EventSource('/deploy/' + websiteId + '/logs');
+    currentEventSource = evtSource;
+    let autoScroll = true;
+    evtSource.onmessage = function(event) {
+        const data = event.data;
+        if (!data) return;
+        if (data === '[REFRESH]') {
+            // Refresh the page after a small delay
+            setTimeout(() => { location.reload(); }, 2000);
+            return;
+        }
+        const lineDiv = document.createElement('div');
+        lineDiv.className = 'line';
+        const match = data.match(/^\[(\d{2}:\d{2}:\d{2})\] \[([A-Z]+)\] (.*)$/);
+        if (match) {
+            const [, ts, step, msg] = match;
+            lineDiv.innerHTML = `<span class="ts">[${ts}]</span><span class="step">[${step}]</span>${msg}`;
+            lineDiv.classList.add(step);
+        } else {
+            lineDiv.textContent = data;
+        }
+        logContent.appendChild(lineDiv);
+        if (autoScroll) logContainer.scrollTop = logContainer.scrollHeight;
+        if (data.includes('Deployment completed with status:')) {
+            setTimeout(() => {
+                logContainer.style.display = 'none';
+                if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
+                location.reload();
+            }, 3000);
+        }
+    };
+    evtSource.onerror = function() {};
+    logContainer.addEventListener('scroll', function() {
+        if (logContainer.scrollTop < logContainer.scrollHeight - logContainer.clientHeight - 10) autoScroll = false;
+        else autoScroll = true;
+    });
+}
+</script>
+</body>
+</html>
+"""
+
+# Other templates (ERROR, LOGIN, REGISTER, FILES, EDIT, DEPLOYMENTS, BUILD_LOGS) are kept as previously defined.
+# For brevity, I'll include them in the final code (they are the same as before).
+
+ERROR_TEMPLATE = """<!DOCTYPE html>
+<html><head><title>Website Unavailable</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}.glass{background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,0.1);border-radius:30px;padding:50px;text-align:center;max-width:500px;box-shadow:0 0 80px rgba(0,229,255,0.05)}h1{font-size:2.5rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:15px}p{color:#aab;font-size:1.1rem;margin:15px 0}a{color:#00e5ff;text-decoration:none;padding:12px 30px;border:2px solid #00e5ff;border-radius:50px;display:inline-block;margin-top:20px;transition:.3s}a:hover{background:#00e5ff;color:#000;transform:scale(1.05)}
+</style></head>
+<body><div class="glass"><h1>⚠️ {{ message }}</h1><p>Slug: <strong>{{ slug }}</strong></p><a href="/dashboard">← Go to Dashboard</a></div></body></html>"""
+
 LOGIN_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -1511,7 +1893,6 @@ LOGIN_TEMPLATE = """
 </html>
 """
 
-# Register page (matching style)
 REGISTER_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -1628,329 +2009,304 @@ REGISTER_TEMPLATE = """
 </html>
 """
 
-# (Other templates: ERROR_TEMPLATE, DASHBOARD_TEMPLATE, FILES_TEMPLATE, EDIT_TEMPLATE, LOGS_TEMPLATE, DEPLOYMENTS_TEMPLATE, BUILD_LOGS_TEMPLATE)
-# For brevity, I'll include the essential DASHBOARD_TEMPLATE with the name change input and removed slug change.
-
-DASHBOARD_TEMPLATE = """
+FILES_TEMPLATE = """
 <!DOCTYPE html>
 <html>
-<head><title>Dashboard - Yuvicodex</title>
+<head><title>Files - Yuvicodex</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-@keyframes zoomIn{0%{opacity:0;transform:scale(0.95)}100%{opacity:1;transform:scale(1)}}
-@keyframes glow{0%{box-shadow:0 0 20px rgba(0,229,255,0.1)}50%{box-shadow:0 0 40px rgba(0,229,255,0.2)}100%{box-shadow:0 0 20px rgba(0,229,255,0.1)}}
-body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;padding:20px;min-height:100vh}
-.container{max-width:1300px;margin:auto;animation:zoomIn 0.5s ease}
-.header{display:flex;justify-content:space-between;align-items:center;padding:15px 25px;background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border-radius:20px;border:1px solid rgba(255,255,255,0.08);margin-bottom:30px}
-.header h1{font-size:1.8rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.user-badge{display:flex;align-items:center;gap:15px}
-.badge{background:rgba(0,229,255,0.15);padding:4px 14px;border-radius:50px;font-size:0.8rem;border:1px solid rgba(0,229,255,0.2)}
-.plan-badge{background:linear-gradient(135deg,#7a00ff,#00e5ff);padding:2px 12px;border-radius:50px;font-size:0.7rem;font-weight:700}
-.btn-logout{color:#ff4757;text-decoration:none;font-weight:600;padding:8px 20px;border:1px solid #ff4757;border-radius:50px;transition:.3s}
-.btn-logout:hover{background:#ff4757;color:#fff}
-.upload-box, .github-box{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:2px dashed rgba(255,255,255,0.2);border-radius:25px;padding:30px;margin-bottom:30px;transition:.3s;position:relative}
-.upload-box.dragover{border-color:#00e5ff;background:rgba(0,229,255,0.05);animation:glow 1s ease-in-out infinite}
-.upload-box:hover, .github-box:hover{border-color:#00e5ff}
-.upload-box h3, .github-box h3{font-size:1.3rem;margin-bottom:15px;color:#ddd}
-.upload-box input[type="file"], .github-box input{width:100%;padding:10px;margin:8px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;outline:none}
-.upload-box input:focus, .github-box input:focus{border-color:#00e5ff}
-.btn{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 40px;border-radius:50px;color:#fff;font-size:1rem;font-weight:700;cursor:pointer;transition:.3s}
-.btn:hover{transform:scale(1.05);box-shadow:0 0 40px rgba(0,229,255,0.2)}
-.btn-secondary{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1)}
-.btn-secondary:hover{background:rgba(255,255,255,0.15)}
-#uploadStatus, #githubStatus{margin-top:15px;font-weight:500}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:25px;margin-top:20px}
-.card{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.07);border-radius:20px;padding:25px;transition:.3s}
-.card:hover{transform:translateY(-5px);border-color:rgba(0,229,255,0.2);box-shadow:0 20px 60px rgba(0,0,0,0.3)}
-.card-title{font-size:1.2rem;font-weight:700;color:#fff}
-.card-slug{color:#889;font-size:0.9rem;margin:5px 0}
-.card-port{color:#889;font-size:0.8rem}
-.status-badge{display:inline-block;padding:4px 14px;border-radius:50px;font-size:0.75rem;font-weight:600;margin:10px 0}
-.status-running{background:rgba(0,229,255,0.15);color:#00e5ff;border:1px solid rgba(0,229,255,0.2)}
-.status-stopped{background:rgba(255,71,87,0.15);color:#ff4757;border:1px solid rgba(255,71,87,0.2)}
-.status-uploaded{background:rgba(255,170,0,0.15);color:#ffaa00;border:1px solid rgba(255,170,0,0.2)}
-.status-queued{background:rgba(100,100,255,0.15);color:#6666ff;border:1px solid rgba(100,100,255,0.2)}
-.status-cloning{background:rgba(255,165,0,0.15);color:#ffa500;border:1px solid rgba(255,165,0,0.2)}
-.status-installing{background:rgba(0,200,200,0.15);color:#00c8c8;border:1px solid rgba(0,200,200,0.2)}
-.status-starting{background:rgba(0,255,0,0.15);color:#00ff00;border:1px solid rgba(0,255,0,0.2)}
-.status-failed{background:rgba(255,0,0,0.15);color:#ff0000;border:1px solid rgba(255,0,0,0.2)}
-.card-meta{color:#666;font-size:0.8rem;margin:8px 0}
-.visit-link{display:inline-block;padding:8px 20px;border-radius:50px;background:#00e5ff;color:#000;text-decoration:none;font-weight:700;font-size:0.9rem;transition:.3s;margin:10px 0}
-.visit-link:hover{transform:scale(1.05);box-shadow:0 0 30px rgba(0,229,255,0.3)}
-.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:15px}
-.actions button{padding:6px 14px;border:none;border-radius:12px;font-size:0.8rem;font-weight:600;cursor:pointer;transition:.2s}
-.actions button:hover{transform:scale(1.05)}
-.btn-start{background:rgba(0,229,255,0.2);color:#00e5ff}
-.btn-start:hover{background:#00e5ff;color:#000}
-.btn-stop{background:rgba(255,71,87,0.2);color:#ff4757}
-.btn-stop:hover{background:#ff4757;color:#fff}
-.btn-restart{background:rgba(255,170,0,0.2);color:#ffaa00}
-.btn-restart:hover{background:#ffaa00;color:#000}
-.btn-manage{background:rgba(255,255,255,0.08);color:#aaa}
-.btn-manage:hover{background:rgba(255,255,255,0.15);color:#fff}
-.btn-delete{background:rgba(255,0,0,0.15);color:#ff4444}
-.btn-delete:hover{background:#ff0000;color:#fff}
-.name-edit{display:flex;gap:8px;margin-top:12px}
-.name-edit input{flex:1;padding:8px 12px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;color:#fff;outline:none;font-size:0.85rem}
-.name-edit input:focus{border-color:#00e5ff}
-.name-edit button{padding:8px 16px;background:#00e5ff;border:none;border-radius:12px;color:#000;font-weight:600;cursor:pointer;transition:.2s}
-.name-edit button:hover{transform:scale(1.05)}
-.domain-edit{display:flex;gap:8px;margin-top:8px}
-.domain-edit input{flex:1;padding:8px 12px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;color:#fff;outline:none;font-size:0.85rem}
-.domain-edit input:focus{border-color:#ffaa00}
-.domain-edit button{padding:8px 16px;background:#ffaa00;border:none;border-radius:12px;color:#000;font-weight:600;cursor:pointer;transition:.2s}
-.domain-edit button:hover{transform:scale(1.05)}
-@media(max-width:600px){.header{flex-direction:column;gap:10px;text-align:center}.grid{grid-template-columns:1fr}}
-.github-box input[type="text"]{width:100%;padding:12px;margin:8px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;outline:none}
-.github-box input:focus{border-color:#7a00ff}
-
-.log-container {
-    display: none;
-    margin: 20px 0 30px 0;
-    background: #0d0d0d;
-    border-radius: 15px;
-    padding: 15px;
-    border: 1px solid rgba(255,255,255,0.1);
-    max-height: 400px;
-    overflow-y: auto;
-    font-family: 'Courier New', monospace;
-    font-size: 13px;
-    line-height: 1.5;
-    color: #aab;
-}
-.log-container::-webkit-scrollbar{width:6px}
-.log-container::-webkit-scrollbar-track{background:#1a1a1a;border-radius:10px}
-.log-container::-webkit-scrollbar-thumb{background:#00e5ff;border-radius:10px}
-.log-container .line{margin:0;white-space:pre-wrap;word-break:break-all}
-.log-container .line .ts{color:#666;margin-right:10px}
-.log-container .line .step{color:#888;margin-right:10px}
-.log-container .line.SYSTEM{color:#00e5ff}
-.log-container .line.SUCCESS{color:#00ff88}
-.log-container .line.ERROR{color:#ff4757}
-.log-container .line.PIP{color:#ffaa00}
-.log-container .line.GIT{color:#a855f7}
-.log-container .line.STARTUP{color:#fbbf24}
-.log-container .line.PORT{color:#60a5fa}
-.log-container .line.FILE{color:#34d399}
-.log-container .line.PYTHON{color:#f472b6}
-.log-container .line.PROCESS{color:#9ca3af}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:1000px;margin:auto}
+.back{color:#00e5ff;text-decoration:none;font-weight:600}
+h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.upload-area{margin:15px 0;padding:20px;border:2px dashed rgba(255,255,255,0.2);border-radius:15px;text-align:center}
+.upload-area input{display:block;margin:10px auto}
+ul{list-style:none;padding:0}
+li{display:flex;justify-content:space-between;align-items:center;padding:10px 15px;border-bottom:1px solid rgba(255,255,255,0.05);border-radius:10px;transition:.2s}
+li:hover{background:rgba(255,255,255,0.03)}
+a{color:#00e5ff;text-decoration:none}
+.actions a,.actions button{background:rgba(255,255,255,0.05);border:none;color:#aaa;padding:4px 10px;border-radius:8px;cursor:pointer;font-size:0.75rem;transition:.2s}
+.actions a:hover,.actions button:hover{background:rgba(255,255,255,0.1);color:#fff}
+.search{width:100%;padding:12px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;color:#fff;margin-bottom:15px}
 </style>
 </head>
 <body>
 <div class="container">
-<div class="header">
-<h1>🚀 Yuvicodex Host</h1>
-<div class="user-badge">
-<span class="badge">{{ user }}</span>
-<span class="plan-badge">{{ plan.upper() }}</span>
-<a href="/logout" class="btn-logout">Logout</a>
+<a href="/dashboard" class="back">← Dashboard</a>
+<h2>📁 {{ website.website_name or website.website_slug }}</h2>
+<div class="upload-area">
+<h4>Upload File</h4>
+<input type="file" id="fileUpload" multiple>
+<button onclick="uploadFiles({{ website.id }})">Upload</button>
 </div>
-</div>
-
-<!-- Upload ZIP -->
-<div class="upload-box" id="dropZone">
-<h3>📤 Upload Website (ZIP + extra files)</h3>
-<p style="color:#889;font-size:0.9rem;margin-bottom:10px;">Drag & drop files here or click to select</p>
-<input type="file" id="zipFile" multiple accept=".zip,.py,.txt,.html,.js,.css,application/zip">
-<button class="btn" id="uploadBtn" style="margin-top:10px;">Upload & Deploy</button>
-<div id="uploadStatus"></div>
-</div>
-
-<!-- GitHub Deploy -->
-<div class="github-box">
-<h3>🐙 Deploy from GitHub</h3>
-<input type="text" id="repoUrl" placeholder="Repository URL (e.g., https://github.com/user/repo.git)">
-<input type="text" id="branch" placeholder="Branch (default: main)" value="main">
-<button class="btn" id="githubBtn">Clone & Deploy</button>
-<div id="githubStatus"></div>
-</div>
-
-<!-- Inline Build Logs -->
-<div class="log-container" id="logContainer">
-    <div id="logContent"></div>
-</div>
-
-<h2 style="margin-bottom:15px;">Your Websites</h2>
-<div class="grid">
-{% for w in websites %}
-<div class="card">
-<div class="card-title">{{ w.website_name or w.website_slug }}</div>
-<div class="card-slug">🔗 {{ base_url }}/<strong>{{ w.website_slug }}</strong>/</div>
-<div class="card-port">Port: {{ w.allocated_port or 'Not allocated' }}</div>
-<div class="status-badge status-{{ w.status }}">{{ w.status.upper() }}</div>
-<div class="card-meta">Created: {{ w.created_at[:10] }} | Size: {{ (w.website_size or 0)//1024 }} KB</div>
-{% if w.status == 'running' %}
-<a href="{{ w.url }}" target="_blank" class="visit-link">🌐 Visit Site</a>
-{% else %}
-<div style="color:#666;font-size:0.85rem;margin:10px 0;">⚪ Website not running</div>
+<input type="text" class="search" id="searchFile" placeholder="Search files..." onkeyup="filterFiles()">
+<ul id="fileList">
+{% for item in items %}
+<li data-name="{{ item.name.lower() }}" data-path="{{ item.path }}">
+<span>{% if item.is_dir %}📁 {% else %}📄 {% endif %}<a href="?path={{ item.path }}">{{ item.name }}</a></span>
+<span class="actions">
+{% if not item.is_dir %}
+<a href="/website/{{ website.id }}/edit?path={{ item.path }}">✏️</a>
+<a href="/website/{{ website.id }}/file/download?path={{ item.path }}">⬇️</a>
 {% endif %}
-<div class="actions">
-<button class="btn-start" onclick="action({{ w.id }},'start')">▶ Start</button>
-<button class="btn-stop" onclick="action({{ w.id }},'stop')">■ Stop</button>
-<button class="btn-restart" onclick="action({{ w.id }},'restart')">⟳ Restart</button>
-<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/files'">📁 Files</button>
-<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/logs'">📜 Logs</button>
-<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/deployments'">📋 Deployments</button>
-<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/build'">🖥 Build Logs</button>
-<button class="btn-delete" onclick="if(confirm('Delete this website?')) action({{ w.id }},'delete')">🗑 Delete</button>
-</div>
-<!-- Rename Website (Display Name) -->
-<div class="name-edit">
-<input type="text" id="name_input_{{ w.id }}" value="{{ w.website_name or '' }}" placeholder="Website Name">
-<button onclick="renameWebsite({{ w.id }})">Rename</button>
-</div>
-<!-- Custom Domain (keep as is) -->
-<div class="domain-edit">
-<input type="text" id="domain_input_{{ w.id }}" value="{{ w.custom_domain or '' }}" placeholder="custom.domain.com">
-<button onclick="setDomain({{ w.id }})">Set Domain</button>
-</div>
-</div>
+<button onclick="deleteFile({{ website.id }},'{{ item.path }}')">🗑</button>
+<button onclick="renamePrompt({{ website.id }},'{{ item.path }}')">✏️ Rename</button>
+</span>
+</li>
 {% endfor %}
+</ul>
 </div>
-</div>
-
 <script>
-// Drag and Drop
-const dropZone = document.getElementById('dropZone');
-dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
-dropZone.addEventListener('dragleave', () => { dropZone.classList.remove('dragover'); });
-dropZone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    dropZone.classList.remove('dragover');
-    const files = e.dataTransfer.files;
-    const input = document.getElementById('zipFile');
-    const dt = new DataTransfer();
-    for (let f of files) dt.items.add(f);
-    input.files = dt.files;
-    document.getElementById('uploadStatus').innerHTML = `✅ ${files.length} file(s) selected`;
+function uploadFiles(websiteId){
+const files=document.getElementById('fileUpload').files;
+if(!files.length)return alert('Select files');
+const fd=new FormData();
+for(let f of files) fd.append('file', f);
+const params=new URLSearchParams(window.location.search);
+const path=params.get('path')||'';
+fd.append('path', path);
+fetch('/website/'+websiteId+'/file/upload',{method:'POST',body:fd})
+.then(r=>r.json())
+.then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
+.catch(()=>alert('Network error'));
+}
+function deleteFile(websiteId,path){
+if(!confirm('Delete this?'))return;
+fetch('/website/'+websiteId+'/file/delete',{
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({path:path})
+})
+.then(r=>r.json())
+.then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
+.catch(()=>alert('Network error'));
+}
+function renamePrompt(websiteId,oldPath){
+const newName=prompt('Enter new name:', oldPath.split('/').pop());
+if(!newName)return;
+fetch('/website/'+websiteId+'/file/rename',{
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({old_path:oldPath, new_name:newName})
+})
+.then(r=>r.json())
+.then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
+.catch(()=>alert('Network error'));
+}
+function filterFiles(){
+const q=document.getElementById('searchFile').value.toLowerCase();
+const items=document.querySelectorAll('#fileList li');
+items.forEach(li=>{
+const name=li.dataset.name;
+li.style.display=name.includes(q)?'flex':'none';
 });
-
-function action(id,type){
-fetch('/website/'+id+'/'+type,{method:'POST'})
-.then(r=>r.json())
-.then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
-.catch(()=>alert('Network error'));
-}
-
-function renameWebsite(id){
-const val=document.getElementById('name_input_'+id).value.trim();
-if(!val)return alert('Enter a name');
-fetch('/website/'+id+'/rename',{
-method:'POST',
-headers:{'Content-Type':'application/x-www-form-urlencoded'},
-body:'name='+encodeURIComponent(val)
-})
-.then(r=>r.json())
-.then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
-.catch(()=>alert('Network error'));
-}
-
-function setDomain(id){
-const val=document.getElementById('domain_input_'+id).value.trim();
-if(!val)return alert('Enter domain');
-fetch('/website/'+id+'/custom_domain',{
-method:'POST',
-headers:{'Content-Type':'application/x-www-form-urlencoded'},
-body:'domain='+encodeURIComponent(val)
-})
-.then(r=>r.json())
-.then(d=>{if(d.success)location.reload();else alert('Error: '+d.error)})
-.catch(()=>alert('Network error'));
-}
-
-// Upload
-document.getElementById('uploadBtn').onclick=function(){
-const files = document.getElementById('zipFile').files;
-if(!files.length)return alert('Select at least one file (ZIP required)');
-let hasZip = false;
-for(let f of files){ if(f.name.toLowerCase().endsWith('.zip')) hasZip = true; }
-if(!hasZip)return alert('A ZIP file is required');
-const fd = new FormData();
-for(let f of files){ fd.append('files[]', f); }
-const st = document.getElementById('uploadStatus');
-st.innerHTML='⏳ Uploading...';
-fetch('/upload',{method:'POST',body:fd})
-.then(r=>r.json())
-.then(d=>{
-if(d.success){
-st.innerHTML='✅ Uploaded! Showing logs...';
-showLogs(d.website_id);
-}else st.innerHTML='❌ '+d.error;
-})
-.catch(()=>st.innerHTML='❌ Network error');
-};
-
-// GitHub Deploy
-document.getElementById('githubBtn').onclick=function(){
-const repo=document.getElementById('repoUrl').value.trim();
-const branch=document.getElementById('branch').value.trim()||'main';
-if(!repo)return alert('Enter repository URL');
-const st=document.getElementById('githubStatus');
-st.innerHTML='⏳ Starting deployment...';
-fetch('/github_deploy',{
-method:'POST',
-headers:{'Content-Type':'application/x-www-form-urlencoded'},
-body:'repo_url='+encodeURIComponent(repo)+'&branch='+encodeURIComponent(branch)
-})
-.then(r=>r.json())
-.then(d=>{
-if(d.success){
-st.innerHTML='✅ Deployment started! Showing logs...';
-showLogs(d.website_id);
-}else st.innerHTML='❌ '+d.error;
-})
-.catch(()=>st.innerHTML='❌ Network error');
-};
-
-// Inline Logs
-let currentEventSource = null;
-const logContainer = document.getElementById('logContainer');
-const logContent = document.getElementById('logContent');
-
-function showLogs(websiteId) {
-    if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
-    logContent.innerHTML = '';
-    logContainer.style.display = 'block';
-    logContainer.scrollTop = 0;
-    const evtSource = new EventSource('/deploy/' + websiteId + '/logs');
-    currentEventSource = evtSource;
-    let autoScroll = true;
-    evtSource.onmessage = function(event) {
-        const data = event.data;
-        if (!data) return;
-        const lineDiv = document.createElement('div');
-        lineDiv.className = 'line';
-        const match = data.match(/^\[(\d{2}:\d{2}:\d{2})\] \[([A-Z]+)\] (.*)$/);
-        if (match) {
-            const [, ts, step, msg] = match;
-            lineDiv.innerHTML = `<span class="ts">[${ts}]</span><span class="step">[${step}]</span>${msg}`;
-            lineDiv.classList.add(step);
-        } else {
-            lineDiv.textContent = data;
-        }
-        logContent.appendChild(lineDiv);
-        if (autoScroll) logContainer.scrollTop = logContainer.scrollHeight;
-        if (data.includes('Deployment completed with status:')) {
-            setTimeout(() => {
-                logContainer.style.display = 'none';
-                if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
-            }, 5000);
-        }
-    };
-    evtSource.onerror = function() {};
-    logContainer.addEventListener('scroll', function() {
-        if (logContainer.scrollTop < logContainer.scrollHeight - logContainer.clientHeight - 10) autoScroll = false;
-        else autoScroll = true;
-    });
 }
 </script>
 </body>
 </html>
 """
 
-# ... (other templates: ERROR, FILES, EDIT, LOGS, DEPLOYMENTS, BUILD_LOGS) are same as before; for space, I'll include them in the final file but not list all here.
+EDIT_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Edit - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:900px;margin:auto}
+.back{color:#00e5ff;text-decoration:none;font-weight:600}
+h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+textarea{width:100%;height:400px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;padding:15px;font-family:'Courier New',monospace;font-size:14px;outline:none}
+textarea:focus{border-color:#00e5ff}
+.btns{display:flex;gap:12px;margin-top:15px}
+.save{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 30px;border-radius:50px;color:#fff;font-weight:700;cursor:pointer;transition:.3s}
+.save:hover{transform:scale(1.05)}
+.cancel{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);padding:12px 30px;border-radius:50px;color:#aaa;text-decoration:none;transition:.3s}
+.cancel:hover{background:rgba(255,255,255,0.15);color:#fff}
+</style>
+</head>
+<body>
+<div class="container">
+<a href="/website/{{ website.id }}/files" class="back">← Back</a>
+<h2>✏️ {{ file_path }}</h2>
+<form method="POST">
+<textarea name="content">{{ content }}</textarea>
+<div class="btns">
+<button class="save" type="submit">💾 Save</button>
+<a href="/website/{{ website.id }}/files" class="cancel">Cancel</a>
+</div>
+</form>
+</div>
+</body>
+</html>
+"""
 
-# Server start
+DEPLOYMENTS_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Deployments - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;padding:20px}
+.container{max-width:1000px;margin:auto}
+.back{color:#00e5ff;text-decoration:none;font-weight:600}
+h2{margin:20px 0;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+table{width:100%;border-collapse:collapse;background:rgba(255,255,255,0.03);border-radius:15px;overflow:hidden}
+th,td{padding:12px 15px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.05)}
+th{background:rgba(255,255,255,0.05)}
+.status-badge{padding:3px 10px;border-radius:50px;font-size:0.75rem}
+.status-success{background:rgba(0,229,255,0.2);color:#00e5ff}
+.status-failed{background:rgba(255,0,0,0.2);color:#ff0000}
+.status-queued{background:rgba(100,100,255,0.2);color:#6666ff}
+.status-cloning{background:rgba(255,165,0,0.2);color:#ffa500}
+.status-installing{background:rgba(0,200,200,0.2);color:#00c8c8}
+.status-starting{background:rgba(0,255,0,0.2);color:#00ff00}
+</style>
+</head>
+<body>
+<div class="container">
+<a href="/dashboard" class="back">← Dashboard</a>
+<h2>📋 Deployment History for {{ website.website_name or website.website_slug }}</h2>
+<table>
+<tr><th>#</th><th>Repo</th><th>Branch</th><th>Status</th><th>Started</th><th>Duration</th><th>Logs</th></tr>
+{% for dep in deployments %}
+<tr>
+<td>{{ dep.id }}</td>
+<td>{{ dep.repo_url }}</td>
+<td>{{ dep.branch }}</td>
+<td><span class="status-badge status-{{ dep.status }}">{{ dep.status.upper() }}</span></td>
+<td>{{ dep.started_at }}</td>
+<td>{{ dep.duration or 'N/A' }}s</td>
+<td><a href="/deploy/{{ website.id }}/logs" target="_blank">📄 View</a></td>
+</tr>
+{% else %}
+<tr><td colspan="7">No deployments yet.</td></tr>
+{% endfor %}
+</table>
+</div>
+</body>
+</html>
+"""
+
+BUILD_LOGS_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head><title>Build Logs - Yuvicodex</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e1a;color:#fff;font-family:'Segoe UI',sans-serif;height:100vh;display:flex;flex-direction:column;padding:20px;overflow:hidden}
+.top-bar{display:flex;justify-content:space-between;align-items:center;padding:10px 20px;background:rgba(255,255,255,0.05);border-radius:15px;margin-bottom:15px;flex-shrink:0}
+.top-bar h2{background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.top-bar a{color:#00e5ff;text-decoration:none;font-weight:600}
+.terminal{flex:1;background:#0d0d0d;border-radius:15px;padding:20px;overflow-y:auto;font-family:'Courier New',monospace;font-size:14px;line-height:1.6;border:1px solid rgba(255,255,255,0.05);box-shadow:inset 0 0 30px rgba(0,0,0,0.5)}
+.terminal::-webkit-scrollbar{width:8px}
+.terminal::-webkit-scrollbar-track{background:#1a1a1a;border-radius:10px}
+.terminal::-webkit-scrollbar-thumb{background:#00e5ff;border-radius:10px}
+.terminal .line{margin:0;white-space:pre-wrap;word-break:break-all}
+.terminal .line .timestamp{color:#666;margin-right:10px}
+.terminal .line .step{color:#888;margin-right:10px}
+.terminal .line.SYSTEM{color:#00e5ff}
+.terminal .line.SUCCESS{color:#00ff88}
+.terminal .line.ERROR{color:#ff4757}
+.terminal .line.PIP{color:#ffaa00}
+.terminal .line.GIT{color:#a855f7}
+.terminal .line.STARTUP{color:#fbbf24}
+.terminal .line.PORT{color:#60a5fa}
+.terminal .line.FILE{color:#34d399}
+.terminal .line.PYTHON{color:#f472b6}
+.terminal .line.PROCESS{color:#9ca3af}
+.status-indicator{padding:8px 16px;border-radius:50px;font-size:0.9rem;font-weight:600}
+.status-indicator.running{background:rgba(0,229,255,0.2);color:#00e5ff;animation:pulse 1.5s infinite}
+.status-indicator.success{background:rgba(0,255,136,0.2);color:#00ff88}
+.status-indicator.failed{background:rgba(255,71,87,0.2);color:#ff4757}
+@keyframes pulse{0%{opacity:1}50%{opacity:0.5}100%{opacity:1}}
+</style>
+</head>
+<body>
+<div class="top-bar">
+<h2>🖥 Build Logs – {{ website.website_name or website.website_slug }}</h2>
+<div>
+<span class="status-indicator running" id="statusBadge">Running</span>
+<a href="/dashboard" style="margin-left:20px;">← Dashboard</a>
+</div>
+</div>
+<div class="terminal" id="terminal">
+<div id="logContainer">
+{% if no_logs %}
+<div class="line SYSTEM"><span class="timestamp">[--:--:--]</span><span class="step">[SYSTEM]</span>No deployment logs yet. Upload or deploy to see logs.</div>
+{% endif %}
+</div>
+</div>
+<script>
+const terminal = document.getElementById('terminal');
+const logContainer = document.getElementById('logContainer');
+const statusBadge = document.getElementById('statusBadge');
+
+{% if not no_logs %}
+const evtSource = new EventSource('/deploy/{{ website.id }}/logs');
+let autoScroll = true;
+
+evtSource.onmessage = function(event) {
+    const data = event.data;
+    if (!data) return;
+    if (data === '[REFRESH]') {
+        location.reload();
+        return;
+    }
+    const lineDiv = document.createElement('div');
+    lineDiv.className = 'line';
+    const match = data.match(/^\[(\d{2}:\d{2}:\d{2})\] \[([A-Z]+)\] (.*)$/);
+    if (match) {
+        const [, ts, step, msg] = match;
+        lineDiv.innerHTML = `<span class="timestamp">[${ts}]</span><span class="step">[${step}]</span>${msg}`;
+        lineDiv.classList.add(step);
+    } else {
+        lineDiv.textContent = data;
+    }
+    logContainer.appendChild(lineDiv);
+    if (autoScroll) {
+        terminal.scrollTop = terminal.scrollHeight;
+    }
+    if (data.includes('Deployment Successful')) {
+        statusBadge.textContent = '✅ Success';
+        statusBadge.className = 'status-indicator success';
+        evtSource.close();
+    } else if (data.includes('Deployment failed') || data.includes('ERROR')) {
+        statusBadge.textContent = '❌ Failed';
+        statusBadge.className = 'status-indicator failed';
+    }
+    if (data.includes('Deployment completed with status:')) {
+        if (data.includes('success')) {
+            statusBadge.textContent = '✅ Success';
+            statusBadge.className = 'status-indicator success';
+        } else {
+            statusBadge.textContent = '❌ Failed';
+            statusBadge.className = 'status-indicator failed';
+        }
+        evtSource.close();
+    }
+};
+evtSource.onerror = function() {
+    setTimeout(() => {
+        if (evtSource.readyState === EventSource.CLOSED) {
+            // Maybe reopen if not done
+        }
+    }, 2000);
+};
+terminal.addEventListener('scroll', function() {
+    if (terminal.scrollTop < terminal.scrollHeight - terminal.clientHeight - 10) {
+        autoScroll = false;
+    } else {
+        autoScroll = true;
+    }
+});
+{% endif %}
+</script>
+</body>
+</html>
+"""
+
+# ---------- Server Start ----------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
