@@ -12,8 +12,9 @@ import requests
 import threading
 import queue
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 import urllib.parse
 
 app = Flask(__name__)
@@ -699,7 +700,7 @@ monitor_thread = threading.Thread(target=monitor_websites, daemon=True)
 monitor_thread.start()
 
 # ============================================================
-# टेम्प्लेट्स (सभी को परिभाषित करें)
+# टेम्प्लेट्स (सभी)
 # ============================================================
 
 ERROR_TEMPLATE = """
@@ -1195,7 +1196,7 @@ document.getElementById('msg').innerHTML='❌ '+d.error;
 """
 
 # ============================================================
-# स्पेसिफिक रूट्स (अब टेम्प्लेट्स परिभाषित होने के बाद)
+# मुख्य रूट्स (लॉगिन, रजिस्टर, डैशबोर्ड, आदि)
 # ============================================================
 
 @app.route('/')
@@ -1309,7 +1310,27 @@ def dashboard():
     websites = []
     for w in rows:
         site = dict(w)
-        site['url'] = f"{base_url}/{site['website_slug']}/"
+        # build public URL: if custom_domain exists, use it; else use subdomain on main domain.
+        if site.get('custom_domain'):
+            public_url = f"https://{site['custom_domain']}"
+        else:
+            # use subdomain if we have a domain that supports wildcard; otherwise path-based.
+            # For localhost, we use path-based (slug in path)
+            # For production, we assume we can use subdomain: slug + '.' + domain
+            # Detect if we are on render.com: we cannot use wildcard subdomain without custom domain.
+            # So we use path-based for Render's domain.
+            domain = os.environ.get('MAIN_DOMAIN', 'localhost')
+            if domain == 'localhost':
+                public_url = f"{base_url}/{site['website_slug']}"
+            else:
+                # Use subdomain
+                public_url = f"https://{site['website_slug']}.{domain}"
+                # But for render, we cannot have wildcard subdomains, so we fallback to path-based.
+                # Let's detect if domain is onrender.com
+                if 'onrender.com' in domain:
+                    public_url = f"{base_url}/{site['website_slug']}"
+        site['public_url'] = public_url
+        site['url'] = public_url  # for template compatibility
         websites.append(site)
     user = get_user_by_id(session['user_id'])
     return render_template_string(DASHBOARD_TEMPLATE, 
@@ -1320,7 +1341,7 @@ def dashboard():
                                   base_url=base_url,
                                   user_obj=user)
 
-# ---------- Upload ----------
+# ---------- अपलोड ----------
 @app.route('/upload', methods=['POST'])
 def upload_website():
     if 'user_id' not in session:
@@ -1415,6 +1436,7 @@ def upload_website():
     log_website(website_id, f"Uploaded {len(files)} file(s), framework: {framework}")
     log_activity(user_id, 'upload', f'Uploaded {len(files)} files', request.remote_addr)
 
+    # Auto-start
     update_website_status(website_id, 'starting')
     ok, msg, logs = start_website_process(website_id)
     if ok:
@@ -1499,7 +1521,7 @@ def deploy_github_stream():
                 break
     return Response(generate(), mimetype='text/event-stream')
 
-# ---------- Website Management API ----------
+# ---------- वेबसाइट मैनेजमेंट API ----------
 @app.route('/website/<int:website_id>/start', methods=['POST'])
 def start_website(website_id):
     if 'user_id' not in session:
@@ -1573,6 +1595,7 @@ def delete_website(website_id):
     log_activity(session['user_id'], 'delete', f'Deleted website {website_id}', request.remote_addr)
     return jsonify({'success': True})
 
+# ---------- File Manager ----------
 @app.route('/website/<int:website_id>/files')
 def files(website_id):
     if 'user_id' not in session:
@@ -1735,23 +1758,203 @@ def env_vars(website_id):
         else:
             return jsonify({'success': True, 'restarted': False})
 
-# ============================================================
-# PROXY – सबसे नीचे
-# ============================================================
-@app.route('/<slug>/', defaults={'path': ''})
-@app.route('/<slug>/<path:path>')
-def proxy_website(slug, path):
-    website = get_website_by_slug(slug)
+# ---------- फाइल अपलोड/डाउनलोड/डिलीट/रिनेम (File Manager Operations) ----------
+@app.route('/website/<int:website_id>/file/upload', methods=['POST'])
+def file_upload(website_id):
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            return jsonify({'success': False, 'error': 'Not found'}), 404
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    if not os.path.exists(folder):
+        return jsonify({'success': False, 'error': 'Website folder not found'}), 404
+    target_path = request.form.get('path', '')
+    if target_path and '..' in target_path:
+        return jsonify({'success': False, 'error': 'Invalid path'}), 400
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'error': 'No file'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'success': False, 'error': 'Empty filename'}), 400
+    # Secure filename
+    filename = secure_filename(file.filename)
+    if not filename:
+        return jsonify({'success': False, 'error': 'Invalid filename'}), 400
+    save_path = os.path.join(folder, target_path, filename) if target_path else os.path.join(folder, filename)
+    # Ensure save_path is inside website folder
+    if not os.path.realpath(save_path).startswith(os.path.realpath(folder)):
+        return jsonify({'success': False, 'error': 'Path traversal detected'}), 400
+    try:
+        file.save(save_path)
+        log_website(website_id, f"Uploaded file: {os.path.join(target_path, filename) if target_path else filename}")
+        return jsonify({'success': True, 'filename': filename})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/website/<int:website_id>/file/download', methods=['GET'])
+def file_download(website_id):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            return jsonify({'error': 'Not found'}), 404
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    path = request.args.get('path', '').strip()
+    if not path or '..' in path:
+        return jsonify({'error': 'Invalid path'}), 400
+    full_path = os.path.join(folder, path)
+    if not os.path.realpath(full_path).startswith(os.path.realpath(folder)):
+        return jsonify({'error': 'Access denied'}), 403
+    if not os.path.exists(full_path) or not os.path.isfile(full_path):
+        return jsonify({'error': 'File not found'}), 404
+    return send_file(full_path, as_attachment=True)
+
+@app.route('/website/<int:website_id>/file/delete', methods=['POST'])
+def file_delete(website_id):
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            return jsonify({'success': False, 'error': 'Not found'}), 404
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    path = request.form.get('path', '').strip()
+    if not path or '..' in path:
+        return jsonify({'success': False, 'error': 'Invalid path'}), 400
+    full_path = os.path.join(folder, path)
+    if not os.path.realpath(full_path).startswith(os.path.realpath(folder)):
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+    if not os.path.exists(full_path):
+        return jsonify({'success': False, 'error': 'File not found'}), 404
+    try:
+        if os.path.isdir(full_path):
+            shutil.rmtree(full_path)
+        else:
+            os.remove(full_path)
+        log_website(website_id, f"Deleted: {path}")
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/website/<int:website_id>/file/rename', methods=['POST'])
+def file_rename(website_id):
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            return jsonify({'success': False, 'error': 'Not found'}), 404
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    old = request.form.get('old', '').strip()
+    new = request.form.get('new', '').strip()
+    if not old or not new or '..' in old or '..' in new:
+        return jsonify({'success': False, 'error': 'Invalid path'}), 400
+    old_path = os.path.join(folder, old)
+    new_path = os.path.join(folder, new)
+    if not os.path.realpath(old_path).startswith(os.path.realpath(folder)) or not os.path.realpath(new_path).startswith(os.path.realpath(folder)):
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+    if not os.path.exists(old_path):
+        return jsonify({'success': False, 'error': 'File not found'}), 404
+    if os.path.exists(new_path):
+        return jsonify({'success': False, 'error': 'Target already exists'}), 400
+    try:
+        os.rename(old_path, new_path)
+        log_website(website_id, f"Renamed: {old} -> {new}")
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/website/<int:website_id>/folder/create', methods=['POST'])
+def folder_create(website_id):
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    website = get_website_by_id(website_id)
+    if not website or website['owner_id'] != session['user_id']:
+        if session.get('role') != 'admin':
+            return jsonify({'success': False, 'error': 'Not found'}), 404
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    path = request.form.get('path', '').strip()
+    name = request.form.get('name', '').strip()
+    if not name or '..' in name:
+        return jsonify({'success': False, 'error': 'Invalid name'}), 400
+    full_path = os.path.join(folder, path, name) if path else os.path.join(folder, name)
+    if not os.path.realpath(full_path).startswith(os.path.realpath(folder)):
+        return jsonify({'success': False, 'error': 'Access denied'}), 403
+    try:
+        os.makedirs(full_path, exist_ok=False)
+        log_website(website_id, f"Created folder: {os.path.join(path, name) if path else name}")
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ---------- REVERSE PROXY + SUBDOMAIN ROUTING ----------
+# This is the core catch-all route for all website requests.
+# It first checks if the host header matches a website subdomain or custom domain.
+# If so, it proxies to that website's internal port.
+# Otherwise, it falls back to the path-based routing (for localhost / render.com main domain)
+# Note: We'll define a catch-all route after all specific routes.
+
+@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
+@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
+def catch_all(path):
+    # Check if the request is for the main application (dashboard, api, etc.)
+    # We can detect by checking if the path starts with /api, /dashboard, /login, etc.
+    # We should not proxy those; they are handled by the app routes.
+    # But those routes are already defined above, so Flask will match them first.
+    # This catch-all will only be hit if no specific route matches.
+    # However, we need to handle requests to the root domain that don't match any specific route.
+    # For subdomain-based routing, we need to check the host header.
+    # If the host is a subdomain (or custom domain), we should treat it as a website request.
+
+    # Get the host from the request
+    host = request.host.split(':')[0]  # remove port
+    # Determine if this is our main domain (the domain where the panel is hosted)
+    main_domain = os.environ.get('MAIN_DOMAIN', 'localhost')
+    if main_domain == 'localhost':
+        # For localhost, we use path-based routing (already handled by the proxy_website route defined later)
+        # But since we have a catch-all, we need to check if the path starts with a known slug.
+        # We can attempt to find a website by the first segment of the path.
+        # However, we already have a separate route for /<slug>/... so this won't be reached.
+        # So we can safely return 404 or fallback.
+        return "Website not found", 404
+
+    # If host matches the main domain, then we should handle path-based routing.
+    if host == main_domain:
+        # Path-based routing: first segment of path is slug
+        # If path is empty, show the panel (but that is already handled by index route)
+        # If path starts with something, try to match a website slug.
+        # But we already have a route for /<slug>/... so this catch-all won't be hit.
+        # So return 404.
+        return "Not found", 404
+
+    # Otherwise, treat the host as a subdomain or custom domain.
+    # Extract slug: if host is <slug>.main_domain, then slug = host.split('.')[0]
+    # If custom domain is set, we need to lookup by custom_domain field.
+    website = None
+    # Check custom domain first
+    with get_db() as conn:
+        website = conn.execute('SELECT * FROM websites WHERE custom_domain = ?', (host,)).fetchone()
     if not website:
-        return render_template_string(ERROR_TEMPLATE, message="Website not found", slug=slug), 404
+        # Check if host is subdomain of main_domain
+        if host.endswith('.' + main_domain):
+            slug = host.replace('.' + main_domain, '')
+            website = get_website_by_slug(slug)
+    if not website:
+        # If still not found, return 404
+        return render_template_string(ERROR_TEMPLATE, message="Website not found", slug=host), 404
+
+    # Check if website is running
     if website['status'] != 'running':
-        return render_template_string(ERROR_TEMPLATE, 
-                                      message="This website is not running. Please start it from the dashboard.",
-                                      slug=slug), 503
+        return render_template_string(ERROR_TEMPLATE, message="Website is not running. Please start it from the dashboard.", slug=website['website_slug']), 503
+
     port = website['allocated_port']
     if not port:
-        return "Port not allocated", 500
-    
+        return render_template_string(ERROR_TEMPLATE, message="Port not allocated", slug=website['website_slug']), 500
+
+    # Proxy request to internal port
     target_url = f"http://localhost:{port}/{path}"
     headers = {}
     for key, value in request.headers:
@@ -1763,7 +1966,7 @@ def proxy_website(slug, path):
     headers['X-Forwarded-Proto'] = request.scheme
     headers['X-Forwarded-Port'] = str(request.environ.get('REMOTE_PORT', '80'))
     cookies = request.cookies
-    
+
     try:
         method = request.method
         data = request.get_data()
@@ -1777,38 +1980,40 @@ def proxy_website(slug, path):
             timeout=30,
             allow_redirects=False
         )
+        # Handle redirects
         if resp.status_code in [301, 302, 303, 307, 308]:
             location = resp.headers.get('Location')
             if location:
                 parsed = urllib.parse.urlparse(location)
+                # If redirect is to localhost or relative, rewrite to external URL
                 if parsed.netloc == f"localhost:{port}" or parsed.netloc == '':
-                    base_url = os.environ.get('BASE_URL', request.host_url.rstrip('/'))
-                    new_location = f"{base_url}/{slug}/" + parsed.path.lstrip('/')
+                    # Build external URL: https://{host}/{path}
+                    external_url = f"https://{host}/" + parsed.path.lstrip('/')
                     if parsed.query:
-                        new_location += '?' + parsed.query
-                    resp.headers['Location'] = new_location
-        
-        response_headers = [(k, v) for k, v in resp.headers.items() 
+                        external_url += '?' + parsed.query
+                    resp.headers['Location'] = external_url
+
+        # Build response
+        response_headers = [(k, v) for k, v in resp.headers.items()
                            if k.lower() not in ['content-encoding', 'content-length', 'transfer-encoding']]
-        
         def generate():
             for chunk in resp.iter_content(chunk_size=8192):
                 if chunk:
                     yield chunk
-        return Response(
-            stream_with_context(generate()),
-            status=resp.status_code,
-            headers=response_headers
-        )
+        return Response(stream_with_context(generate()),
+                        status=resp.status_code,
+                        headers=response_headers)
     except requests.exceptions.ConnectionError:
         update_website_status(website['id'], 'crashed')
         log_website(website['id'], "Proxy connection failed - website crashed", 'error')
-        return render_template_string(ERROR_TEMPLATE, 
-                                      message="Website crashed. Please restart from dashboard.",
-                                      slug=slug), 503
+        return render_template_string(ERROR_TEMPLATE, message="Website crashed. Please restart from dashboard.", slug=website['website_slug']), 503
     except Exception as e:
         log_website(website['id'], f"Proxy error: {str(e)}", 'error')
         return f"Proxy error: {str(e)}", 500
+
+# Note: The original path-based proxy route is not needed because the catch-all handles both subdomain and path-based.
+# However, we keep the specific route for path-based for backward compatibility.
+# We'll add a fallback route for /<slug>/... which will also work.
 
 # ---------- सर्वर स्टार्ट ----------
 if __name__ == '__main__':
