@@ -29,6 +29,16 @@ STARTUP_PRIORITY = ['app.py', 'main.py', 'server.py', 'run.py', 'manage.py', 'in
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
 
+# ---------- Debug Logging ----------
+DEBUG_LOG = os.path.join(LOG_FOLDER, 'debug.log')
+def log_debug(msg):
+    try:
+        with open(DEBUG_LOG, 'a') as f:
+            f.write(f"{datetime.now().isoformat()} - {msg}\n")
+    except:
+        pass
+    print(msg, file=sys.stderr)
+
 # ---------- Database ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -144,10 +154,13 @@ def get_next_available_port(start=5001):
 def generate_website_slug(username, count):
     return username if count == 0 else f"{username}{count}"
 def log_website(website_id, message, log_type='info'):
-    with get_db() as conn:
-        conn.execute('INSERT INTO logs (website_id, log_type, log_text) VALUES (?, ?, ?)',
-                     (website_id, log_type, message))
-        conn.commit()
+    try:
+        with get_db() as conn:
+            conn.execute('INSERT INTO logs (website_id, log_type, log_text) VALUES (?, ?, ?)',
+                         (website_id, log_type, message))
+            conn.commit()
+    except:
+        pass
 def log_activity(user_id, action, details='', ip=''):
     with get_db() as conn:
         conn.execute('INSERT INTO activity_logs (user_id, action, details, ip_address) VALUES (?, ?, ?, ?)',
@@ -217,8 +230,7 @@ def find_startup_file(folder):
     return None
 
 def detect_runtime_and_get_cmd(folder, port):
-    """Detect runtime and return (cmd, runtime, env)."""
-    # ----- Node.js (with package.json) -----
+    # Node.js with package.json
     if os.path.exists(os.path.join(folder, 'package.json')):
         try:
             with open(os.path.join(folder, 'package.json'), 'r') as f:
@@ -240,30 +252,25 @@ def detect_runtime_and_get_cmd(folder, port):
                     return cmd, 'nodejs', {'NODE_ENV': 'production', 'PORT': str(port)}
         except:
             pass
-    
-    # ----- Node.js (without package.json) -----
+    # Node.js without package.json
     js_files = ['server.js', 'index.js', 'app.js', 'main.js']
     for fname in js_files:
         if os.path.exists(os.path.join(folder, fname)):
             return ['node', fname], 'nodejs', {'PORT': str(port)}
-    
-    # fallback: any .js file
+    # fallback any .js
     try:
         for f in os.listdir(folder):
             if f.endswith('.js') and os.path.isfile(os.path.join(folder, f)):
                 return ['node', f], 'nodejs', {'PORT': str(port)}
     except:
         pass
-    
-    # ----- PHP -----
+    # PHP
     if os.path.exists(os.path.join(folder, 'index.php')):
         return ['php', '-S', f'0.0.0.0:{port}'], 'php', {}
-    
-    # ----- Go -----
+    # Go
     if os.path.exists(os.path.join(folder, 'go.mod')):
         return ['go', 'run', 'main.go'], 'go', {}
-    
-    # ----- Java -----
+    # Java
     if os.path.exists(os.path.join(folder, 'pom.xml')):
         return ['mvn', 'spring-boot:run'], 'java', {}
     if os.path.exists(os.path.join(folder, 'build.gradle')):
@@ -271,8 +278,7 @@ def detect_runtime_and_get_cmd(folder, port):
     jars = [f for f in os.listdir(folder) if f.endswith('.jar')]
     if jars:
         return ['java', '-jar', jars[0]], 'java', {}
-    
-    # ----- Python Flask/Django -----
+    # Python Flask/Django
     flask_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
     for f in flask_files:
         path = os.path.join(folder, f)
@@ -291,11 +297,9 @@ def detect_runtime_and_get_cmd(folder, port):
     startup = find_startup_file(folder)
     if startup:
         return [sys.executable, startup], 'python', {}
-    
-    # ----- Static -----
+    # Static
     if os.path.exists(os.path.join(folder, 'index.html')):
         return [sys.executable, '-m', 'http.server', str(port)], 'static', {}
-    
     return None, None, {}
 
 # ---------- Install Dependencies ----------
@@ -439,6 +443,7 @@ def health_check_on_ports(port_list, max_retries=3, delay=2):
 
 # ---------- Start Process with Logging and Auto Port Detection ----------
 def start_website_process(website_id, log_callback=None):
+    log_debug(f"start_website_process called for website {website_id}")
     website = get_website_by_id(website_id)
     if not website:
         return False, "Website not found"
@@ -569,6 +574,7 @@ def start_website_process(website_id, log_callback=None):
         update_website_status(website_id, 'failed')
         if log_callback:
             log_callback("ERROR", f"Start error: {str(e)}")
+        log_debug(f"start_website_process exception: {str(e)}")
         return False, str(e)
 
 # ---------- Stop Process ----------
@@ -601,9 +607,11 @@ def write_log_step(log_file, step, message):
     return line
 
 def deploy_zip(website_id, extra_files=None):
+    log_debug(f"deploy_zip called for website {website_id}")
     try:
         website = get_website_by_id(website_id)
         if not website:
+            log_debug(f"deploy_zip: website {website_id} not found")
             return
         with get_db() as conn:
             cur = conn.execute('''INSERT INTO deployments (website_id, repo_url, branch, status, started_at)
@@ -614,6 +622,7 @@ def deploy_zip(website_id, extra_files=None):
         log_file = os.path.join(LOG_FOLDER, f"deploy_{deployment_id}.log")
         with open(log_file, 'w') as f:
             f.write(write_log_step(log_file, "SYSTEM", "ZIP Deployment started"))
+        log_debug(f"deploy_zip: deployment_id {deployment_id}, log_file {log_file}")
         def log_cb(step, msg):
             write_log_step(log_file, step, msg)
             log_website(website_id, f"[{step}] {msg}", 'info')
@@ -670,6 +679,7 @@ def deploy_zip(website_id, extra_files=None):
                 conn.commit()
             log_cb("ERROR", f"Deployment failed: {msg}")
     except Exception as e:
+        log_debug(f"deploy_zip exception: {str(e)}")
         log_website(website_id, f"Deployment exception: {str(e)}", 'error')
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
@@ -677,9 +687,11 @@ def deploy_zip(website_id, extra_files=None):
             conn.commit()
 
 def deploy_github(website_id, repo_url, branch):
+    log_debug(f"deploy_github called for website {website_id}")
     try:
         website = get_website_by_id(website_id)
         if not website:
+            log_debug(f"deploy_github: website {website_id} not found")
             return
         with get_db() as conn:
             cur = conn.execute('''INSERT INTO deployments (website_id, repo_url, branch, status, started_at)
@@ -690,6 +702,7 @@ def deploy_github(website_id, repo_url, branch):
         log_file = os.path.join(LOG_FOLDER, f"deploy_{deployment_id}.log")
         with open(log_file, 'w') as f:
             f.write(write_log_step(log_file, "SYSTEM", f"GitHub Deployment started for {repo_url} (branch {branch})"))
+        log_debug(f"deploy_github: deployment_id {deployment_id}, log_file {log_file}")
         def log_cb(step, msg):
             write_log_step(log_file, step, msg)
             log_website(website_id, f"[{step}] {msg}", 'info')
@@ -737,6 +750,7 @@ def deploy_github(website_id, repo_url, branch):
                 conn.commit()
             log_cb("ERROR", f"Deployment failed: {msg}")
     except Exception as e:
+        log_debug(f"deploy_github exception: {str(e)}")
         log_website(website_id, f"Deployment exception: {str(e)}", 'error')
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
@@ -864,6 +878,7 @@ def dashboard():
 # ---------- Upload (ZIP + extra files) ----------
 @app.route('/upload', methods=['POST'])
 def upload_website():
+    log_debug("upload_website called")
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Not logged in'}), 401
     user_id = session['user_id']
@@ -918,10 +933,13 @@ def upload_website():
         data = f.read()
         extra_data.append((f.filename, data))
     def bg_deploy():
+        log_debug(f"background thread started for website {website_id}")
         deploy_zip(website_id, extra_data)
+        log_debug(f"background thread finished for website {website_id}")
     thread = threading.Thread(target=bg_deploy)
-    thread.daemon = True
+    thread.daemon = False
     thread.start()
+    log_debug(f"upload: thread started for website {website_id}")
     log_website(website_id, f"Uploaded: {zip_file.filename} + {len(extra_files)} extra files")
     log_activity(user_id, 'upload', f'Uploaded {zip_file.filename}', request.remote_addr)
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
@@ -929,6 +947,7 @@ def upload_website():
 # ---------- GitHub Deploy ----------
 @app.route('/github_deploy', methods=['POST'])
 def github_deploy():
+    log_debug("github_deploy called")
     if 'user_id' not in session:
         return jsonify({'success': False, 'error': 'Not logged in'}), 401
     repo_url = request.form.get('repo_url', '').strip()
@@ -949,10 +968,13 @@ def github_deploy():
         website_id = cur.lastrowid
         conn.commit()
     def bg_deploy():
+        log_debug(f"background thread (github) started for website {website_id}")
         deploy_github(website_id, repo_url, branch)
+        log_debug(f"background thread (github) finished for website {website_id}")
     thread = threading.Thread(target=bg_deploy)
-    thread.daemon = True
+    thread.daemon = False
     thread.start()
+    log_debug(f"github: thread started for website {website_id}")
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug, 'message': 'Deployment started'})
 
 # ---------- Build Logs Page ----------
