@@ -252,7 +252,6 @@ def detect_runtime_and_get_cmd(folder, port):
     try:
         for f in os.listdir(folder):
             if f.endswith('.js') and os.path.isfile(os.path.join(folder, f)):
-                # Avoid node_modules, but this is a fallback
                 return ['node', f], 'nodejs', {'PORT': str(port)}
     except:
         pass
@@ -400,30 +399,53 @@ def install_dependencies(folder, runtime, log_callback=None):
         return True, "No dependencies"
     return True, "Unknown runtime"
 
-# ---------- Health Check with Retry ----------
-def health_check_with_retry(port, max_retries=5, delay=2):
-    for i in range(max_retries):
-        try:
-            response = requests.get(f"http://localhost:{port}", timeout=3)
-            if response.status_code < 500:
-                return True, "OK"
-            else:
-                return False, f"HTTP {response.status_code}"
-        except requests.exceptions.ConnectionError:
-            if i < max_retries - 1:
-                time.sleep(delay)
-            else:
-                return False, "Connection refused (after retries)"
-        except requests.exceptions.Timeout:
-            if i < max_retries - 1:
-                time.sleep(delay)
-            else:
-                return False, "Timeout"
-        except Exception as e:
-            return False, str(e)
-    return False, "Health check failed"
+# ---------- Auto Port Detection & Health Check ----------
+def detect_port_from_log(log_file):
+    """Read log file and try to extract port number from common patterns."""
+    if not os.path.exists(log_file):
+        return None
+    try:
+        with open(log_file, 'r') as f:
+            content = f.read()
+            # Patterns: listening on port 3000, localhost:3000, port 3000, :::3000, etc.
+            patterns = [
+                r'port\s*[:=]\s*(\d+)',
+                r'listening\s+on\s+(\d+)',
+                r'localhost\s*:\s*(\d+)',
+                r'127\.0\.0\.1\s*:\s*(\d+)',
+                r'0\.0\.0\.0\s*:\s*(\d+)',
+                r'::\s*:\s*(\d+)',
+                r'port\s+(\d+)',
+                r'http://[^:]+:(\d+)',
+                r':(\d{4,5})'  # generic 4-5 digit number
+            ]
+            for pattern in patterns:
+                matches = re.findall(pattern, content, re.IGNORECASE)
+                if matches:
+                    port = int(matches[0])
+                    if 1024 <= port <= 65535:
+                        return port
+    except:
+        pass
+    return None
 
-# ---------- Start Process with Logging ----------
+def health_check_on_ports(port_list, max_retries=3, delay=2):
+    """Try health check on a list of ports."""
+    for port in port_list:
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(f"http://localhost:{port}", timeout=3)
+                if response.status_code < 500:
+                    return True, port, f"OK (port {port})"
+                else:
+                    # If status code >=500, it's a server error, probably not the right port
+                    pass
+            except:
+                pass
+            time.sleep(delay)
+    return False, None, "Health check failed on all ports"
+
+# ---------- Start Process with Logging and Auto Port Detection ----------
 def start_website_process(website_id, log_callback=None):
     website = get_website_by_id(website_id)
     if not website:
@@ -434,8 +456,9 @@ def start_website_process(website_id, log_callback=None):
         update_website_status(website_id, 'failed')
         return False, "Folder not found"
     
-    port = get_next_available_port()
-    cmd, runtime, env_extra = detect_runtime_and_get_cmd(folder, port)
+    # Allocate a port (will be used as primary, but we'll auto-detect)
+    allocated_port = get_next_available_port()
+    cmd, runtime, env_extra = detect_runtime_and_get_cmd(folder, allocated_port)
     if not cmd:
         log_website(website_id, "No startup file detected", 'error')
         update_website_status(website_id, 'failed')
@@ -454,7 +477,7 @@ def start_website_process(website_id, log_callback=None):
         return False, msg
     
     env = os.environ.copy()
-    env['PORT'] = str(port)
+    env['PORT'] = str(allocated_port)
     env['PYTHONUNBUFFERED'] = '1'
     env.update(env_extra)
     if runtime == 'flask':
@@ -464,11 +487,11 @@ def start_website_process(website_id, log_callback=None):
             env['FLASK_APP'] = 'main.py'
     
     if runtime == 'php':
-        cmd = ['php', '-S', f'0.0.0.0:{port}']
+        cmd = ['php', '-S', f'0.0.0.0:{allocated_port}']
     
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
     if log_callback:
-        log_callback("STARTUP", f"Starting: {' '.join(cmd)} on port {port} (runtime: {runtime})")
+        log_callback("STARTUP", f"Starting: {' '.join(cmd)} (allocated port {allocated_port}, runtime: {runtime})")
     
     try:
         f_log = open(log_file, 'a')
@@ -493,7 +516,8 @@ def start_website_process(website_id, log_callback=None):
         thread.daemon = True
         thread.start()
         
-        time.sleep(2)
+        # Wait a bit for process to start and write logs
+        time.sleep(3)
         if proc.poll() is not None:
             with open(log_file, 'r') as f:
                 error_lines = f.read()[-500:]
@@ -503,18 +527,41 @@ def start_website_process(website_id, log_callback=None):
                 log_callback("ERROR", f"Process crashed: {error_lines}")
             return False, f"Process crashed: {error_lines}"
         
-        healthy, health_msg = health_check_with_retry(port, max_retries=5, delay=2)
+        # Auto-detect port from log
+        detected_port = detect_port_from_log(log_file)
+        if detected_port:
+            if log_callback:
+                log_callback("PORT", f"Detected application using port {detected_port} from logs")
+        else:
+            if log_callback:
+                log_callback("PORT", "Could not detect port from logs, will try common ports")
+        
+        # Build list of ports to try
+        ports_to_try = []
+        if detected_port:
+            ports_to_try.append(detected_port)
+        # Always try the allocated port
+        ports_to_try.append(allocated_port)
+        # Common default ports
+        for p in [3000, 8080, 5000, 8000, 8081, 3001]:
+            if p not in ports_to_try:
+                ports_to_try.append(p)
+        
+        # Health check
+        healthy, actual_port, health_msg = health_check_on_ports(ports_to_try, max_retries=5, delay=2)
         if healthy:
-            update_website_status(website_id, 'running', proc.pid, port)
-            log_website(website_id, f"Started on port {port} (PID {proc.pid})")
+            # Update database with actual port
+            update_website_status(website_id, 'running', proc.pid, actual_port)
+            log_website(website_id, f"Started on port {actual_port} (PID {proc.pid})")
             with get_db() as conn:
                 conn.execute('UPDATE websites SET startup_file = ?, last_started = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                              (cmd[0] if not runtime.startswith('python') else 'app', website_id))
                 conn.commit()
             if log_callback:
-                log_callback("SUCCESS", f"Application running on port {port}")
-            return True, f"Running on port {port}"
+                log_callback("SUCCESS", f"Application running on port {actual_port}")
+            return True, f"Running on port {actual_port}"
         else:
+            # Health check failed - kill process
             try:
                 if os.name == 'nt':
                     subprocess.run(['taskkill', '/PID', str(proc.pid), '/F'], capture_output=True)
