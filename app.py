@@ -9,20 +9,27 @@ import zipfile
 import subprocess
 import time
 import threading
+import requests
+import signal
+import sys
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, url_for, send_from_directory, session, jsonify, abort
+from flask import Flask, render_template_string, request, redirect, url_for, send_from_directory, session, jsonify, abort, Response
 
 app = Flask(__name__)
-app.secret_key = 'super-secret-key-change-this'
+app.secret_key = 'super-secret-key-12345'
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 USERS_FILE = os.path.join(BASE_DIR, 'users.json')
-STATIC_FOLDER = os.path.join(BASE_DIR, 'static')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(STATIC_FOLDER, exist_ok=True)
+PROCESSES_FILE = os.path.join(BASE_DIR, 'processes.json')
 
-# ---------- USER DATABASE ----------
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# ---------- MAIN PANEL CREDENTIALS ----------
+MAIN_USER = "admin"
+MAIN_PASS = "admin"
+
+# ---------- DATABASE FUNCTIONS ----------
 def load_users():
     if os.path.exists(USERS_FILE):
         with open(USERS_FILE, 'r') as f:
@@ -35,210 +42,414 @@ def save_users(users):
 
 users_db = load_users()
 
+def load_processes():
+    if os.path.exists(PROCESSES_FILE):
+        with open(PROCESSES_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_processes(procs):
+    with open(PROCESSES_FILE, 'w') as f:
+        json.dump(procs, f, indent=2)
+
 # ---------- HELPERS ----------
 def get_user_folder(username):
     folder = os.path.join(UPLOAD_FOLDER, username)
     os.makedirs(folder, exist_ok=True)
     return folder
 
-def generate_username():
-    return str(uuid.uuid4())[:8]
-
-def is_safe_path(path):
-    abs_path = os.path.abspath(path)
-    return abs_path.startswith(os.path.abspath(UPLOAD_FOLDER))
+def find_free_port():
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
 
 def extract_zip(zip_path, extract_to):
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_to)
     os.remove(zip_path)
 
-# ---------- ROUTES ----------
-@app.route('/')
-def index():
-    return render_template_string(HTML_INDEX)
+# ---------- PROCESS MANAGER ----------
+processes = load_processes()
+process_handles = {}
 
+def start_user_app(username, folder):
+    """Start the user's app in a subprocess and return the port."""
+    # Check for Python files
+    app_files = ['app.py', 'main.py', 'index.py', 'server.py']
+    main_file = None
+    for f in app_files:
+        if os.path.exists(os.path.join(folder, f)):
+            main_file = f
+            break
+
+    if not main_file:
+        # Static website - serve directly, no process needed
+        return None
+
+    # Find free port
+    port = find_free_port()
+    
+    # Start subprocess
+    try:
+        env = os.environ.copy()
+        env['PORT'] = str(port)
+        env['HOST'] = '0.0.0.0'
+        
+        proc = subprocess.Popen(
+            ['python3', main_file],
+            cwd=folder,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            preexec_fn=os.setsid if os.name != 'nt' else None
+        )
+        
+        # Save process info
+        processes[username] = {
+            'pid': proc.pid,
+            'port': port,
+            'file': main_file,
+            'started_at': datetime.now().isoformat(),
+            'status': 'running'
+        }
+        process_handles[username] = proc
+        save_processes(processes)
+        
+        # Wait a moment for the server to start
+        time.sleep(2)
+        return port
+    except Exception as e:
+        print(f"Error starting app for {username}: {e}")
+        return None
+
+def stop_user_app(username):
+    if username in process_handles:
+        proc = process_handles[username]
+        try:
+            if os.name != 'nt':
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            else:
+                proc.terminate()
+            proc.wait(timeout=5)
+        except:
+            pass
+        del process_handles[username]
+    
+    if username in processes:
+        del processes[username]
+        save_processes(processes)
+    return True
+
+def is_app_running(username):
+    return username in process_handles and process_handles[username].poll() is None
+
+# ---------- REVERSE PROXY HANDLER ----------
+def proxy_request(username, path, method, headers, data, query_string):
+    if username not in processes:
+        return None, None
+    
+    port = processes[username]['port']
+    target_url = f"http://localhost:{port}/{path}"
+    if query_string:
+        target_url += "?" + query_string
+    
+    # Forward request to user's app
+    try:
+        # Remove host header to avoid confusion
+        headers.pop('Host', None)
+        headers.pop('Content-Length', None)
+        
+        # Forward the request
+        resp = requests.request(
+            method=method,
+            url=target_url,
+            headers=headers,
+            data=data,
+            allow_redirects=False,
+            timeout=30
+        )
+        
+        # Return the response
+        return resp, None
+    except requests.exceptions.ConnectionError:
+        return None, "App not responding"
+    except Exception as e:
+        return None, str(e)
+
+# ---------- MAIN PANEL ROUTES ----------
+@app.route('/', methods=['GET', 'POST'])
+def main_login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        if username == MAIN_USER and password == MAIN_PASS:
+            session['logged_in'] = True
+            return redirect(url_for('dashboard'))
+        else:
+            return render_template_string(LOGIN_HTML, error="Invalid credentials")
+    if session.get('logged_in'):
+        return redirect(url_for('dashboard'))
+    return render_template_string(LOGIN_HTML, error=None)
+
+@app.route('/dashboard')
+def dashboard():
+    if not session.get('logged_in'):
+        return redirect(url_for('main_login'))
+    return render_template_string(DASHBOARD_HTML, users=users_db, processes=processes)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('main_login'))
+
+# ---------- UPLOAD ROUTE ----------
 @app.route('/deploy', methods=['POST'])
 def deploy():
-    # get username and password from form
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Unauthorized'}), 401
+    
     username = request.form.get('username', '').strip()
-    password = request.form.get('password', '').strip()
     if not username:
-        username = generate_username()
-    if not password:
-        password = 'password'   # default
-
-    # check if username already exists
+        username = str(uuid.uuid4())[:8]
+    
     if username in users_db:
         return jsonify({'error': 'Username already taken. Choose another.'}), 400
-
-    # handle files
+    
     files = request.files.getlist('files')
     if not files or all(f.filename == '' for f in files):
         return jsonify({'error': 'No files uploaded.'}), 400
-
+    
+    # Stop any existing app for this user (should not happen)
+    if username in processes:
+        stop_user_app(username)
+    
     user_folder = get_user_folder(username)
-    # clear folder if exists (should not, but just in case)
+    # Clean folder
     shutil.rmtree(user_folder, ignore_errors=True)
     os.makedirs(user_folder)
-
-    # save files
+    
+    # Save files
     for file in files:
         if file.filename == '':
             continue
         if file.filename.lower().endswith('.zip'):
-            # save zip temporarily
             temp_path = os.path.join(user_folder, file.filename)
             file.save(temp_path)
             extract_zip(temp_path, user_folder)
         else:
             file.save(os.path.join(user_folder, file.filename))
-
-    # save user credentials
+    
+    # Save user info
     users_db[username] = {
-        'password': password,
         'created_at': datetime.now().isoformat(),
         'folder': user_folder
     }
     save_users(users_db)
-
-    # generate link
+    
+    # Start the app
+    port = start_user_app(username, user_folder)
+    
     link = request.host_url + username
+    if port:
+        status = f"✅ Running on port {port}"
+    else:
+        status = "📁 Static site (no server process)"
+    
     return jsonify({
         'success': True,
         'username': username,
-        'password': password,
-        'link': link
+        'link': link,
+        'status': status,
+        'port': port
     })
 
+@app.route('/stop/<username>', methods=['POST'])
+def stop_app(username):
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Unauthorized'}), 401
+    if username not in users_db:
+        return jsonify({'error': 'User not found'}), 404
+    stop_user_app(username)
+    return jsonify({'success': True})
+
+@app.route('/restart/<username>', methods=['POST'])
+def restart_app(username):
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Unauthorized'}), 401
+    if username not in users_db:
+        return jsonify({'error': 'User not found'}), 404
+    stop_user_app(username)
+    folder = get_user_folder(username)
+    port = start_user_app(username, folder)
+    return jsonify({'success': True, 'port': port})
+
+@app.route('/delete/<username>', methods=['POST'])
+def delete_app(username):
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Unauthorized'}), 401
+    if username not in users_db:
+        return jsonify({'error': 'User not found'}), 404
+    stop_user_app(username)
+    shutil.rmtree(get_user_folder(username), ignore_errors=True)
+    del users_db[username]
+    save_users(users_db)
+    return jsonify({'success': True})
+
+# ---------- PROXY ROUTE (THE MAGIC) ----------
 @app.route('/<username>/', defaults={'path': ''})
 @app.route('/<username>/<path:path>')
 def serve_user_site(username, path):
-    # check if user exists
+    # Check if user exists
     if username not in users_db:
-        abort(404)
-
-    # check login
-    if not session.get(f'logged_in_{username}'):
-        # if user has index.html or index.py, we still need login first
-        return redirect(url_for('login_page', username=username))
-
-    user_folder = get_user_folder(username)
-    if path == '':
-        # try index.html, then index.py, else list files
-        if os.path.exists(os.path.join(user_folder, 'index.html')):
-            return send_from_directory(user_folder, 'index.html')
-        elif os.path.exists(os.path.join(user_folder, 'index.py')):
-            return run_python_script(user_folder, 'index.py')
+        return "User site not found", 404
+    
+    # Check if app is running (has process)
+    if username in processes and is_app_running(username):
+        # PROXY EVERYTHING to the user's app
+        method = request.method
+        headers = dict(request.headers)
+        data = request.get_data()
+        query_string = request.query_string.decode('utf-8')
+        
+        resp, err = proxy_request(username, path, method, headers, data, query_string)
+        if err:
+            return f"Proxy error: {err}", 500
+        if resp:
+            # Forward the response back to the client
+            response = Response(resp.content, resp.status_code)
+            # Forward headers (except a few)
+            exclude_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+            for key, value in resp.headers.items():
+                if key.lower() not in exclude_headers:
+                    response.headers[key] = value
+            return response
         else:
-            # list files
-            return render_template_string(FILE_LIST_HTML, username=username, files=os.listdir(user_folder))
+            return "App not reachable", 502
     else:
-        # serve file or run .py
-        file_path = os.path.join(user_folder, path)
-        if not os.path.exists(file_path):
-            abort(404)
-        if os.path.isdir(file_path):
-            # if directory, redirect to /username/path/
-            return redirect(url_for('serve_user_site', username=username, path=path + '/'))
-        if path.endswith('.py'):
-            return run_python_script(user_folder, path)
+        # No process running - serve as static files
+        user_folder = get_user_folder(username)
+        if path == '':
+            # Try index.html
+            if os.path.exists(os.path.join(user_folder, 'index.html')):
+                return send_from_directory(user_folder, 'index.html')
+            else:
+                # List files
+                files = os.listdir(user_folder)
+                file_list = "<ul>"
+                for f in files:
+                    file_list += f'<li><a href="{f}">{f}</a></li>'
+                file_list += "</ul>"
+                return f"<h2>📁 Files for {username}</h2>{file_list}"
         else:
+            file_path = os.path.join(user_folder, path)
+            if not os.path.exists(file_path):
+                return "File not found", 404
+            if os.path.isdir(file_path):
+                return redirect(url_for('serve_user_site', username=username, path=path + '/'))
             return send_from_directory(user_folder, path)
 
-def run_python_script(folder, filename):
-    """Run a python script and return its output as HTTP response."""
-    try:
-        result = subprocess.run(
-            ['python3', filename],
-            cwd=folder,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        # if stdout is HTML, return it; else wrap in pre
-        if result.stdout.strip().startswith('<!DOCTYPE html>') or result.stdout.strip().startswith('<html'):
-            return result.stdout
-        else:
-            return f"<pre>{result.stdout}</pre>" + (f"<pre style='color:red'>Error: {result.stderr}</pre>" if result.stderr else "")
-    except subprocess.TimeoutExpired:
-        return "<h3>Script timed out after 30 seconds.</h3>"
-    except Exception as e:
-        return f"<h3>Error running script: {e}</h3>"
-
-@app.route('/login/<username>', methods=['GET', 'POST'])
-def login_page(username):
-    if username not in users_db:
-        abort(404)
-    if request.method == 'POST':
-        pwd = request.form.get('password')
-        if pwd == users_db[username]['password']:
-            session[f'logged_in_{username}'] = True
-            return redirect(url_for('serve_user_site', username=username))
-        else:
-            return render_template_string(LOGIN_HTML, username=username, error='Invalid password')
-    return render_template_string(LOGIN_HTML, username=username, error=None)
-
-@app.route('/logout/<username>')
-def logout_user(username):
-    session.pop(f'logged_in_{username}', None)
-    return redirect(url_for('serve_user_site', username=username))
-
 # ---------- HTML TEMPLATES ----------
-HTML_INDEX = """
+LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Website Hosting Panel</title>
+    <title>Panel Login</title>
     <style>
-        body { font-family: Arial, sans-serif; background: #0c1018; color: #fff; padding: 20px; }
-        .container { max-width: 700px; margin: 0 auto; }
-        h1 { text-align: center; color: #00e5ff; }
-        .drop-zone { border: 2px dashed #00e5ff; border-radius: 15px; padding: 40px; text-align: center; background: #161b25; margin: 20px 0; cursor: pointer; transition: 0.3s; }
-        .drop-zone.dragover { background: #1a2a3a; border-color: #fff; }
-        .drop-zone i { font-size: 48px; color: #00e5ff; margin-bottom: 10px; }
-        .drop-zone p { color: #aaa; }
+        body { background: #0c1018; color: #fff; font-family: Arial; display: flex; justify-content: center; align-items: center; height: 100vh; margin:0; }
+        .box { background: #161b25; padding: 40px; border-radius: 20px; border: 1px solid #2b3240; width: 350px; }
+        h2 { text-align: center; color: #00e5ff; }
+        input { width: 100%; padding: 14px; margin: 10px 0; background: #0c1018; border: 1px solid #2b3240; color: white; border-radius: 8px; }
+        .btn { width: 100%; padding: 14px; background: #00e5ff; color: #000; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; }
+        .error { color: #ff4d4d; text-align: center; margin-top: 10px; }
+    </style>
+</head>
+<body>
+<div class="box">
+    <h2>🔐 Admin Panel</h2>
+    <form method="POST">
+        <input type="text" name="username" placeholder="Username" value="admin" />
+        <input type="password" name="password" placeholder="Password" value="admin" />
+        <button class="btn">Login</button>
+    </form>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+</div>
+</body>
+</html>
+"""
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard</title>
+    <style>
+        body { background: #0c1018; color: #fff; font-family: Arial; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #00e5ff; }
+        .card { background: #161b25; border: 1px solid #2b3240; border-radius: 15px; padding: 20px; margin: 20px 0; }
+        .drop-zone { border: 2px dashed #00e5ff; border-radius: 15px; padding: 40px; text-align: center; cursor: pointer; margin: 10px 0; }
+        .btn { background: #00e5ff; color: #000; border: none; padding: 12px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; }
+        .btn-danger { background: #ff4d4d; color: #fff; }
+        .btn-success { background: #00ff6a; color: #000; }
+        .link { color: #00e5ff; word-break: break-all; }
+        .app-item { background: #0c1018; padding: 15px; border-radius: 10px; margin: 10px 0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+        .status { padding: 4px 12px; border-radius: 20px; font-size: 12px; }
+        .status.running { background: #00ff6a33; color: #00ff6a; border: 1px solid #00ff6a; }
+        .status.static { background: #333; color: #aaa; border: 1px solid #555; }
+        .logout { float: right; color: #ff4d4d; text-decoration: none; }
+        .input-group { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
+        .input-group input { flex: 1; padding: 12px; background: #0c1018; border: 1px solid #2b3240; color: white; border-radius: 8px; min-width: 150px; }
         #fileList { margin: 10px 0; color: #aaa; }
-        .form-group { margin: 15px 0; }
-        .form-group label { display: block; margin-bottom: 5px; color: #aaa; }
-        .form-group input { width: 100%; padding: 12px; background: #0c1018; border: 1px solid #2b3240; color: white; border-radius: 8px; }
-        .btn { background: #00e5ff; color: #000; border: none; padding: 14px 30px; border-radius: 8px; font-weight: bold; cursor: pointer; width: 100%; font-size: 16px; }
-        .btn:hover { opacity: 0.9; }
-        #result { margin-top: 20px; padding: 15px; background: #161b25; border-radius: 8px; display: none; }
-        .success { color: #00ff6a; }
-        .error { color: #ff4d4d; }
-        .link { word-break: break-all; color: #00e5ff; }
-        .footer { text-align: center; margin-top: 40px; color: #555; }
+        #result { margin-top: 20px; padding: 15px; background: #0c1018; border-radius: 8px; border: 1px solid #2b3240; }
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>🚀 Website Hosting</h1>
-    <p style="text-align:center;color:#aaa;">Upload your website (HTML, Python, JS, ZIP) and get a live link.</p>
-
-    <div class="drop-zone" id="dropZone">
-        <i>📂</i>
-        <p>Drag & drop files here or click to browse</p>
-        <p style="font-size:12px;color:#555;">Supports .html .py .js .css .zip and more</p>
+    <h1>🚀 Hosting Panel <a href="/logout" class="logout">Logout</a></h1>
+    
+    <div class="card">
+        <h3>📤 Upload New Website</h3>
+        <div class="drop-zone" id="dropZone">
+            <p>📂 Drag & drop files or click to browse</p>
+            <p style="font-size:12px;color:#555;">Supports .zip, .html, .py, .js, .css</p>
+        </div>
+        <input type="file" id="fileInput" multiple style="display:none;">
+        <div id="fileList"></div>
+        <div class="input-group">
+            <input type="text" id="usernameInput" placeholder="Username (leave blank for auto)" />
+            <button class="btn" id="deployBtn">🚀 Deploy</button>
+        </div>
+        <div id="result"></div>
     </div>
-    <input type="file" id="fileInput" multiple style="display:none;">
 
-    <div id="fileList"></div>
-
-    <div class="form-group">
-        <label>Choose a username (optional)</label>
-        <input type="text" id="username" placeholder="Leave blank for auto-generate" />
+    <div class="card">
+        <h3>📋 Deployed Sites</h3>
+        <div id="siteList">
+            {% for username, user in users.items() %}
+                <div class="app-item" data-username="{{ username }}">
+                    <div>
+                        <strong>{{ username }}</strong><br />
+                        <a href="{{ request.host_url + username }}" target="_blank" class="link">{{ request.host_url + username }}</a>
+                        <span class="status {% if username in processes %}running{% else %}static{% endif %}">
+                            {% if username in processes %}🟢 Running{% else %}📁 Static{% endif %}
+                        </span>
+                    </div>
+                    <div>
+                        {% if username in processes %}
+                            <button class="btn btn-danger restart-btn" data-username="{{ username }}">🔄 Restart</button>
+                            <button class="btn btn-danger stop-btn" data-username="{{ username }}">⏹ Stop</button>
+                        {% endif %}
+                        <button class="btn btn-danger delete-btn" data-username="{{ username }}">🗑 Delete</button>
+                    </div>
+                </div>
+            {% endfor %}
+        </div>
     </div>
-    <div class="form-group">
-        <label>Set a password for your site</label>
-        <input type="text" id="password" placeholder="Default: password" value="password" />
-    </div>
-    <button class="btn" id="deployBtn">🚀 Deploy Website</button>
-
-    <div id="result"></div>
-    <div class="footer">Your site will be available at: <span id="linkPreview">https://your-domain.com/username</span></div>
 </div>
 
 <script>
@@ -247,16 +458,15 @@ HTML_INDEX = """
     const fileList = document.getElementById('fileList');
     const deployBtn = document.getElementById('deployBtn');
     const resultDiv = document.getElementById('result');
-    const linkPreview = document.getElementById('linkPreview');
-
+    const usernameInput = document.getElementById('usernameInput');
     let selectedFiles = [];
 
     dropZone.addEventListener('click', () => fileInput.click());
-    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
-    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.borderColor = '#fff'; });
+    dropZone.addEventListener('dragleave', () => dropZone.style.borderColor = '#00e5ff');
     dropZone.addEventListener('drop', (e) => {
         e.preventDefault();
-        dropZone.classList.remove('dragover');
+        dropZone.style.borderColor = '#00e5ff';
         if (e.dataTransfer.files.length) {
             selectedFiles = Array.from(e.dataTransfer.files);
             updateFileList();
@@ -270,38 +480,23 @@ HTML_INDEX = """
     });
 
     function updateFileList() {
-        if (selectedFiles.length === 0) {
-            fileList.innerHTML = '';
-            return;
-        }
-        let html = '<strong>Selected files:</strong><ul style="margin:5px 0;padding-left:20px;color:#aaa;">';
+        if (selectedFiles.length === 0) { fileList.innerHTML = ''; return; }
+        let html = '<strong>Selected:</strong><ul style="margin:5px 0;padding-left:20px;color:#aaa;">';
         selectedFiles.forEach(f => html += `<li>${f.name} (${(f.size/1024).toFixed(1)} KB)</li>`);
         html += '</ul>';
         fileList.innerHTML = html;
-        // update preview link with username if entered
-        const uname = document.getElementById('username').value.trim() || 'username';
-        linkPreview.textContent = window.location.origin + '/' + uname;
     }
 
-    document.getElementById('username').addEventListener('input', updateFileList);
-    document.getElementById('password').addEventListener('input', updateFileList);
-
     deployBtn.addEventListener('click', async () => {
-        if (selectedFiles.length === 0) {
-            alert('Please select at least one file.');
-            return;
-        }
-        const username = document.getElementById('username').value.trim() || '';
-        const password = document.getElementById('password').value.trim() || 'password';
+        if (selectedFiles.length === 0) { alert('Select files first.'); return; }
+        const username = usernameInput.value.trim();
 
         const formData = new FormData();
         selectedFiles.forEach(f => formData.append('files', f));
         formData.append('username', username);
-        formData.append('password', password);
 
         deployBtn.disabled = true;
         deployBtn.textContent = 'Deploying...';
-        resultDiv.style.display = 'block';
         resultDiv.innerHTML = '<p>⏳ Uploading...</p>';
 
         try {
@@ -309,103 +504,75 @@ HTML_INDEX = """
             const data = await res.json();
             if (data.success) {
                 resultDiv.innerHTML = `
-                    <p class="success">✅ Website deployed successfully!</p>
+                    <p style="color:#00ff6a;">✅ Deployed successfully!</p>
                     <p><strong>Username:</strong> ${data.username}</p>
-                    <p><strong>Password:</strong> ${data.password}</p>
                     <p><strong>Link:</strong> <a href="${data.link}" target="_blank" class="link">${data.link}</a></p>
-                    <p style="margin-top:10px;color:#aaa;">⚠️ Remember your password! You'll need it to access your site.</p>
+                    <p><strong>Status:</strong> ${data.status}</p>
                 `;
-                linkPreview.textContent = data.link;
+                setTimeout(() => location.reload(), 2000);
             } else {
-                resultDiv.innerHTML = `<p class="error">❌ Error: ${data.error}</p>`;
+                resultDiv.innerHTML = `<p style="color:#ff4d4d;">❌ Error: ${data.error}</p>`;
             }
-        } catch (e) {
-            resultDiv.innerHTML = `<p class="error">❌ Network error: ${e.message}</p>`;
+        } catch(e) {
+            resultDiv.innerHTML = `<p style="color:#ff4d4d;">❌ Network Error: ${e.message}</p>`;
         }
         deployBtn.disabled = false;
-        deployBtn.textContent = '🚀 Deploy Website';
+        deployBtn.textContent = '🚀 Deploy';
     });
 
-    // update link preview on any change
-    document.querySelectorAll('input').forEach(inp => inp.addEventListener('input', updateFileList));
-    updateFileList();
+    // Action buttons
+    document.querySelectorAll('.stop-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            if (!confirm('Stop this app?')) return;
+            const username = e.target.dataset.username;
+            const res = await fetch(`/stop/${username}`, { method: 'POST' });
+            if (res.ok) location.reload();
+        });
+    });
+
+    document.querySelectorAll('.restart-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            if (!confirm('Restart this app?')) return;
+            const username = e.target.dataset.username;
+            const res = await fetch(`/restart/${username}`, { method: 'POST' });
+            if (res.ok) location.reload();
+        });
+    });
+
+    document.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            if (!confirm('Delete this site permanently?')) return;
+            const username = e.target.dataset.username;
+            const res = await fetch(`/delete/${username}`, { method: 'POST' });
+            if (res.ok) location.reload();
+        });
+    });
 </script>
 </body>
 </html>
 """
 
-LOGIN_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login - {{ username }}</title>
-    <style>
-        body { font-family: Arial, sans-serif; background: #0c1018; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .login-box { background: #161b25; padding: 40px; border-radius: 20px; border: 1px solid #2b3240; width: 350px; }
-        h2 { text-align: center; color: #00e5ff; }
-        input { width: 100%; padding: 14px; margin: 10px 0; background: #0c1018; border: 1px solid #2b3240; color: white; border-radius: 8px; box-sizing: border-box; }
-        .btn { width: 100%; padding: 14px; background: #00e5ff; color: #000; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; }
-        .error { color: #ff4d4d; text-align: center; margin-top: 10px; }
-        .footer { text-align: center; margin-top: 20px; color: #555; font-size: 12px; }
-    </style>
-</head>
-<body>
-<div class="login-box">
-    <h2>🔐 Login</h2>
-    <p style="text-align:center;color:#aaa;">Website: {{ username }}</p>
-    <form method="POST">
-        <input type="password" name="password" placeholder="Enter password" required autofocus />
-        <button class="btn">Login</button>
-    </form>
-    {% if error %}
-        <div class="error">{{ error }}</div>
-    {% endif %}
-    <div class="footer">Default password: password</div>
-</div>
-</body>
-</html>
-"""
+# ---------- CLEANUP ON EXIT ----------
+def cleanup_processes():
+    for username in list(process_handles.keys()):
+        try:
+            if os.name != 'nt':
+                os.killpg(os.getpgid(process_handles[username].pid), signal.SIGTERM)
+            else:
+                process_handles[username].terminate()
+        except:
+            pass
 
-FILE_LIST_HTML = """
-<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"><title>Files - {{ username }}</title>
-<style>
-    body { background: #0c1018; color: #fff; font-family: Arial; padding: 20px; }
-    a { color: #00e5ff; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .file { padding: 8px 12px; border-bottom: 1px solid #222; }
-    .dir { color: #f0c674; }
-    .logout { float: right; background: #333; padding: 8px 16px; border-radius: 6px; }
-</style>
-</head>
-<body>
-    <div style="max-width:700px;margin:0 auto;">
-        <h2>📁 Files for {{ username }}</h2>
-        <a href="{{ url_for('logout_user', username=username) }}" class="logout">🚪 Logout</a>
-        <div style="margin-top:20px;">
-            {% for f in files %}
-                <div class="file">
-                    <a href="{{ url_for('serve_user_site', username=username, path=f) }}">
-                        {% if f.endswith('/') %}📁{% else %}📄{% endif %} {{ f }}
-                    </a>
-                </div>
-            {% endfor %}
-        </div>
-        <p style="color:#555;margin-top:20px;">Click on a file to view or run it.</p>
-    </div>
-</body>
-</html>
-"""
+import atexit
+atexit.register(cleanup_processes)
 
 # ---------- RUN ----------
 if __name__ == '__main__':
     print("="*60)
-    print("🌐 WEBSITE HOSTING PLATFORM")
-    print(f"📁 Uploads folder: {UPLOAD_FOLDER}")
-    print(f"👥 Users DB: {USERS_FILE}")
-    print("🚀 Starting server at http://0.0.0.0:5000")
+    print("🌐 ADVANCED WEBSITE HOSTING PANEL")
+    print("🔑 Main Login: admin / admin")
+    print("📁 Uploads folder:", UPLOAD_FOLDER)
+    print("🚀 Running at http://0.0.0.0:5000")
+    print("⚡ Supports Flask, Static HTML, and more!")
     print("="*60)
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
