@@ -12,6 +12,7 @@ import threading
 import requests
 import signal
 import sys
+import socket
 from datetime import datetime
 from flask import Flask, render_template_string, request, redirect, url_for, send_from_directory, session, jsonify, abort, Response
 
@@ -20,16 +21,18 @@ app.secret_key = 'super-secret-key-12345'
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+LOGS_FOLDER = os.path.join(BASE_DIR, 'logs')
 USERS_FILE = os.path.join(BASE_DIR, 'users.json')
 PROCESSES_FILE = os.path.join(BASE_DIR, 'processes.json')
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(LOGS_FOLDER, exist_ok=True)
 
 # ---------- MAIN PANEL CREDENTIALS ----------
 MAIN_USER = "admin"
 MAIN_PASS = "admin"
 
-# ---------- DATABASE FUNCTIONS ----------
+# ---------- DATABASE ----------
 def load_users():
     if os.path.exists(USERS_FILE):
         with open(USERS_FILE, 'r') as f:
@@ -58,8 +61,10 @@ def get_user_folder(username):
     os.makedirs(folder, exist_ok=True)
     return folder
 
+def get_user_log_file(username):
+    return os.path.join(LOGS_FOLDER, f"{username}.log")
+
 def find_free_port():
-    import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
         return s.getsockname()[1]
@@ -69,12 +74,22 @@ def extract_zip(zip_path, extract_to):
         zip_ref.extractall(extract_to)
     os.remove(zip_path)
 
+def wait_for_port(port, timeout=10):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(('localhost', port))
+                return True
+        except:
+            time.sleep(0.5)
+    return False
+
 # ---------- PROCESS MANAGER ----------
 processes = load_processes()
 process_handles = {}
 
 def start_user_app(username, folder):
-    """Start the user's app in a subprocess and return the port."""
     # Check for Python files
     app_files = ['app.py', 'main.py', 'index.py', 'server.py']
     main_file = None
@@ -84,26 +99,32 @@ def start_user_app(username, folder):
             break
 
     if not main_file:
-        # Static website - serve directly, no process needed
-        return None
+        # Static website - no process needed
+        return None, None
 
     # Find free port
     port = find_free_port()
+    log_file = get_user_log_file(username)
     
-    # Start subprocess
+    # Clear previous log
+    with open(log_file, 'w') as f:
+        f.write(f"--- Starting {main_file} at {datetime.now()} ---\n")
+    
+    # Start subprocess with output redirection
     try:
         env = os.environ.copy()
         env['PORT'] = str(port)
         env['HOST'] = '0.0.0.0'
         
-        proc = subprocess.Popen(
-            ['python3', main_file],
-            cwd=folder,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            preexec_fn=os.setsid if os.name != 'nt' else None
-        )
+        with open(log_file, 'a') as log_f:
+            proc = subprocess.Popen(
+                ['python3', main_file],
+                cwd=folder,
+                stdout=log_f,
+                stderr=log_f,
+                env=env,
+                preexec_fn=os.setsid if os.name != 'nt' else None
+            )
         
         # Save process info
         processes[username] = {
@@ -111,17 +132,35 @@ def start_user_app(username, folder):
             'port': port,
             'file': main_file,
             'started_at': datetime.now().isoformat(),
-            'status': 'running'
+            'status': 'starting'
         }
         process_handles[username] = proc
         save_processes(processes)
         
-        # Wait a moment for the server to start
-        time.sleep(2)
-        return port
+        # Wait for port to be ready
+        if wait_for_port(port, timeout=10):
+            processes[username]['status'] = 'running'
+            save_processes(processes)
+            return port, None
+        else:
+            # Timeout - check if process is still alive
+            if proc.poll() is None:
+                # Still running but not listening? kill it
+                try:
+                    if os.name != 'nt':
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    else:
+                        proc.terminate()
+                except:
+                    pass
+                proc.wait(timeout=2)
+            processes[username]['status'] = 'failed'
+            save_processes(processes)
+            return None, "App failed to start (port not listening)"
     except Exception as e:
-        print(f"Error starting app for {username}: {e}")
-        return None
+        processes[username] = {'status': 'error', 'error': str(e)}
+        save_processes(processes)
+        return None, str(e)
 
 def stop_user_app(username):
     if username in process_handles:
@@ -135,7 +174,6 @@ def stop_user_app(username):
         except:
             pass
         del process_handles[username]
-    
     if username in processes:
         del processes[username]
         save_processes(processes)
@@ -144,23 +182,25 @@ def stop_user_app(username):
 def is_app_running(username):
     return username in process_handles and process_handles[username].poll() is None
 
-# ---------- REVERSE PROXY HANDLER ----------
+def get_log_content(username):
+    log_file = get_user_log_file(username)
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            return f.read()
+    return "No logs yet."
+
+# ---------- REVERSE PROXY ----------
 def proxy_request(username, path, method, headers, data, query_string):
     if username not in processes:
-        return None, None
-    
+        return None, "App not found"
     port = processes[username]['port']
     target_url = f"http://localhost:{port}/{path}"
     if query_string:
         target_url += "?" + query_string
     
-    # Forward request to user's app
     try:
-        # Remove host header to avoid confusion
         headers.pop('Host', None)
         headers.pop('Content-Length', None)
-        
-        # Forward the request
         resp = requests.request(
             method=method,
             url=target_url,
@@ -169,11 +209,9 @@ def proxy_request(username, path, method, headers, data, query_string):
             allow_redirects=False,
             timeout=30
         )
-        
-        # Return the response
         return resp, None
     except requests.exceptions.ConnectionError:
-        return None, "App not responding"
+        return None, "App not responding (Connection refused)"
     except Exception as e:
         return None, str(e)
 
@@ -203,7 +241,7 @@ def logout():
     session.clear()
     return redirect(url_for('main_login'))
 
-# ---------- UPLOAD ROUTE ----------
+# ---------- UPLOAD ----------
 @app.route('/deploy', methods=['POST'])
 def deploy():
     if not session.get('logged_in'):
@@ -214,22 +252,19 @@ def deploy():
         username = str(uuid.uuid4())[:8]
     
     if username in users_db:
-        return jsonify({'error': 'Username already taken. Choose another.'}), 400
+        return jsonify({'error': 'Username already taken.'}), 400
     
     files = request.files.getlist('files')
     if not files or all(f.filename == '' for f in files):
         return jsonify({'error': 'No files uploaded.'}), 400
     
-    # Stop any existing app for this user (should not happen)
     if username in processes:
         stop_user_app(username)
     
     user_folder = get_user_folder(username)
-    # Clean folder
     shutil.rmtree(user_folder, ignore_errors=True)
     os.makedirs(user_folder)
     
-    # Save files
     for file in files:
         if file.filename == '':
             continue
@@ -240,28 +275,29 @@ def deploy():
         else:
             file.save(os.path.join(user_folder, file.filename))
     
-    # Save user info
     users_db[username] = {
         'created_at': datetime.now().isoformat(),
         'folder': user_folder
     }
     save_users(users_db)
     
-    # Start the app
-    port = start_user_app(username, user_folder)
+    port, error = start_user_app(username, user_folder)
     
     link = request.host_url + username
     if port:
         status = f"✅ Running on port {port}"
+    elif error:
+        status = f"❌ Failed: {error}"
     else:
         status = "📁 Static site (no server process)"
     
     return jsonify({
-        'success': True,
+        'success': True if port or error is None else False,
         'username': username,
         'link': link,
         'status': status,
-        'port': port
+        'port': port,
+        'error': error
     })
 
 @app.route('/stop/<username>', methods=['POST'])
@@ -281,8 +317,8 @@ def restart_app(username):
         return jsonify({'error': 'User not found'}), 404
     stop_user_app(username)
     folder = get_user_folder(username)
-    port = start_user_app(username, folder)
-    return jsonify({'success': True, 'port': port})
+    port, error = start_user_app(username, folder)
+    return jsonify({'success': True if port else False, 'port': port, 'error': error})
 
 @app.route('/delete/<username>', methods=['POST'])
 def delete_app(username):
@@ -292,21 +328,31 @@ def delete_app(username):
         return jsonify({'error': 'User not found'}), 404
     stop_user_app(username)
     shutil.rmtree(get_user_folder(username), ignore_errors=True)
+    # Delete log file
+    log_file = get_user_log_file(username)
+    if os.path.exists(log_file):
+        os.remove(log_file)
     del users_db[username]
     save_users(users_db)
     return jsonify({'success': True})
 
-# ---------- PROXY ROUTE (THE MAGIC) ----------
+@app.route('/logs/<username>', methods=['GET'])
+def view_logs(username):
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Unauthorized'}), 401
+    if username not in users_db:
+        return jsonify({'error': 'User not found'}), 404
+    log_content = get_log_content(username)
+    return jsonify({'logs': log_content})
+
+# ---------- PROXY ROUTE ----------
 @app.route('/<username>/', defaults={'path': ''})
 @app.route('/<username>/<path:path>')
 def serve_user_site(username, path):
-    # Check if user exists
     if username not in users_db:
         return "User site not found", 404
     
-    # Check if app is running (has process)
     if username in processes and is_app_running(username):
-        # PROXY EVERYTHING to the user's app
         method = request.method
         headers = dict(request.headers)
         data = request.get_data()
@@ -314,11 +360,12 @@ def serve_user_site(username, path):
         
         resp, err = proxy_request(username, path, method, headers, data, query_string)
         if err:
-            return f"Proxy error: {err}", 500
+            # Log error
+            with open(get_user_log_file(username), 'a') as f:
+                f.write(f"Proxy error: {err}\n")
+            return f"Proxy error: {err}", 502
         if resp:
-            # Forward the response back to the client
             response = Response(resp.content, resp.status_code)
-            # Forward headers (except a few)
             exclude_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
             for key, value in resp.headers.items():
                 if key.lower() not in exclude_headers:
@@ -327,14 +374,12 @@ def serve_user_site(username, path):
         else:
             return "App not reachable", 502
     else:
-        # No process running - serve as static files
+        # Static or failed app
         user_folder = get_user_folder(username)
         if path == '':
-            # Try index.html
             if os.path.exists(os.path.join(user_folder, 'index.html')):
                 return send_from_directory(user_folder, 'index.html')
             else:
-                # List files
                 files = os.listdir(user_folder)
                 file_list = "<ul>"
                 for f in files:
@@ -389,23 +434,30 @@ DASHBOARD_HTML = """
     <title>Dashboard</title>
     <style>
         body { background: #0c1018; color: #fff; font-family: Arial; padding: 20px; }
-        .container { max-width: 900px; margin: 0 auto; }
+        .container { max-width: 1000px; margin: 0 auto; }
         h1 { color: #00e5ff; }
         .card { background: #161b25; border: 1px solid #2b3240; border-radius: 15px; padding: 20px; margin: 20px 0; }
         .drop-zone { border: 2px dashed #00e5ff; border-radius: 15px; padding: 40px; text-align: center; cursor: pointer; margin: 10px 0; }
-        .btn { background: #00e5ff; color: #000; border: none; padding: 12px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; }
+        .btn { background: #00e5ff; color: #000; border: none; padding: 10px 18px; border-radius: 8px; font-weight: bold; cursor: pointer; }
         .btn-danger { background: #ff4d4d; color: #fff; }
         .btn-success { background: #00ff6a; color: #000; }
+        .btn-info { background: #4d88ff; color: #fff; }
         .link { color: #00e5ff; word-break: break-all; }
         .app-item { background: #0c1018; padding: 15px; border-radius: 10px; margin: 10px 0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
         .status { padding: 4px 12px; border-radius: 20px; font-size: 12px; }
         .status.running { background: #00ff6a33; color: #00ff6a; border: 1px solid #00ff6a; }
+        .status.failed { background: #ff4d4d33; color: #ff4d4d; border: 1px solid #ff4d4d; }
         .status.static { background: #333; color: #aaa; border: 1px solid #555; }
         .logout { float: right; color: #ff4d4d; text-decoration: none; }
         .input-group { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
         .input-group input { flex: 1; padding: 12px; background: #0c1018; border: 1px solid #2b3240; color: white; border-radius: 8px; min-width: 150px; }
         #fileList { margin: 10px 0; color: #aaa; }
         #result { margin-top: 20px; padding: 15px; background: #0c1018; border-radius: 8px; border: 1px solid #2b3240; }
+        .log-popup { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 9999; justify-content: center; align-items: center; }
+        .log-popup-content { background: #0c1018; border: 1px solid #2b3240; border-radius: 15px; padding: 30px; max-width: 90%; max-height: 80%; overflow: auto; width: 800px; }
+        .log-popup-content pre { background: #000; color: #00ff6a; padding: 15px; border-radius: 8px; font-size: 12px; max-height: 500px; overflow: auto; white-space: pre-wrap; }
+        .close-btn { float: right; background: #ff4d4d; color: #fff; border: none; padding: 8px 16px; border-radius: 5px; cursor: pointer; }
+        .btn-group { display: flex; gap: 5px; flex-wrap: wrap; }
     </style>
 </head>
 <body>
@@ -435,11 +487,16 @@ DASHBOARD_HTML = """
                     <div>
                         <strong>{{ username }}</strong><br />
                         <a href="{{ request.host_url + username }}" target="_blank" class="link">{{ request.host_url + username }}</a>
-                        <span class="status {% if username in processes %}running{% else %}static{% endif %}">
-                            {% if username in processes %}🟢 Running{% else %}📁 Static{% endif %}
+                        <span class="status {% if username in processes %}{{ processes[username]['status'] }}{% else %}static{% endif %}">
+                            {% if username in processes %}
+                                {{ processes[username]['status'] }}
+                            {% else %}
+                                Static
+                            {% endif %}
                         </span>
                     </div>
-                    <div>
+                    <div class="btn-group">
+                        <button class="btn btn-info log-btn" data-username="{{ username }}">📜 Logs</button>
                         {% if username in processes %}
                             <button class="btn btn-danger restart-btn" data-username="{{ username }}">🔄 Restart</button>
                             <button class="btn btn-danger stop-btn" data-username="{{ username }}">⏹ Stop</button>
@@ -449,6 +506,15 @@ DASHBOARD_HTML = """
                 </div>
             {% endfor %}
         </div>
+    </div>
+</div>
+
+<!-- Log Popup -->
+<div class="log-popup" id="logPopup">
+    <div class="log-popup-content">
+        <button class="close-btn" id="logCloseBtn">✕ Close</button>
+        <h3>📜 Logs</h3>
+        <pre id="logContent">Loading...</pre>
     </div>
 </div>
 
@@ -508,6 +574,7 @@ DASHBOARD_HTML = """
                     <p><strong>Username:</strong> ${data.username}</p>
                     <p><strong>Link:</strong> <a href="${data.link}" target="_blank" class="link">${data.link}</a></p>
                     <p><strong>Status:</strong> ${data.status}</p>
+                    ${data.error ? `<p style="color:#ff4d4d;">Error: ${data.error}</p>` : ''}
                 `;
                 setTimeout(() => location.reload(), 2000);
             } else {
@@ -547,12 +614,35 @@ DASHBOARD_HTML = """
             if (res.ok) location.reload();
         });
     });
+
+    // Log viewer
+    const logPopup = document.getElementById('logPopup');
+    const logContent = document.getElementById('logContent');
+    const logCloseBtn = document.getElementById('logCloseBtn');
+
+    document.querySelectorAll('.log-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            const username = e.target.dataset.username;
+            logContent.textContent = 'Loading...';
+            logPopup.style.display = 'flex';
+            try {
+                const res = await fetch(`/logs/${username}`);
+                const data = await res.json();
+                logContent.textContent = data.logs || 'No logs.';
+            } catch(e) {
+                logContent.textContent = 'Error loading logs.';
+            }
+        });
+    });
+
+    logCloseBtn.addEventListener('click', () => { logPopup.style.display = 'none'; });
+    logPopup.addEventListener('click', (e) => { if (e.target === logPopup) logPopup.style.display = 'none'; });
 </script>
 </body>
 </html>
 """
 
-# ---------- CLEANUP ON EXIT ----------
+# ---------- CLEANUP ----------
 def cleanup_processes():
     for username in list(process_handles.keys()):
         try:
@@ -572,6 +662,7 @@ if __name__ == '__main__':
     print("🌐 ADVANCED WEBSITE HOSTING PANEL")
     print("🔑 Main Login: admin / admin")
     print("📁 Uploads folder:", UPLOAD_FOLDER)
+    print("📜 Logs folder:", LOGS_FOLDER)
     print("🚀 Running at http://0.0.0.0:5000")
     print("⚡ Supports Flask, Static HTML, and more!")
     print("="*60)
