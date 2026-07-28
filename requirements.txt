@@ -7,3 +7,4 @@ Flask>=2.3.0
 gunicorn>=21.2.0
 requests
 psutil
+pyTelegramBotAPI==4.34.0
