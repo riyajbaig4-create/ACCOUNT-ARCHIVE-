@@ -227,7 +227,6 @@ def detect_runtime_and_get_cmd(folder, port):
                 if 'start' in scripts:
                     cmd = ['npm', 'start']
                 else:
-                    # try common entry files
                     entry = None
                     for fname in ['server.js', 'index.js', 'app.js', 'main.js']:
                         if os.path.exists(os.path.join(folder, fname)):
@@ -241,29 +240,23 @@ def detect_runtime_and_get_cmd(folder, port):
                     return cmd, 'nodejs', {'NODE_ENV': 'production', 'PORT': str(port)}
         except:
             pass
-    
-    # ----- Node.js (without package.json) – look for common JS files -----
+    # ----- Node.js (without package.json) -----
     js_files = ['server.js', 'index.js', 'app.js', 'main.js']
     for fname in js_files:
         if os.path.exists(os.path.join(folder, fname)):
             return ['node', fname], 'nodejs', {'PORT': str(port)}
-    
-    # ----- If still no JS found, scan for any .js file in root (fallback) -----
     try:
         for f in os.listdir(folder):
             if f.endswith('.js') and os.path.isfile(os.path.join(folder, f)):
                 return ['node', f], 'nodejs', {'PORT': str(port)}
     except:
         pass
-    
     # ----- PHP -----
     if os.path.exists(os.path.join(folder, 'index.php')):
         return ['php', '-S', f'0.0.0.0:{port}'], 'php', {}
-    
     # ----- Go -----
     if os.path.exists(os.path.join(folder, 'go.mod')):
         return ['go', 'run', 'main.go'], 'go', {}
-    
     # ----- Java -----
     if os.path.exists(os.path.join(folder, 'pom.xml')):
         return ['mvn', 'spring-boot:run'], 'java', {}
@@ -272,7 +265,6 @@ def detect_runtime_and_get_cmd(folder, port):
     jars = [f for f in os.listdir(folder) if f.endswith('.jar')]
     if jars:
         return ['java', '-jar', jars[0]], 'java', {}
-    
     # ----- Python Flask/Django -----
     flask_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
     for f in flask_files:
@@ -289,38 +281,45 @@ def detect_runtime_and_get_cmd(folder, port):
         return [sys.executable, 'manage.py', 'runserver', f'0.0.0.0:{port}'], 'django', {}
     if os.path.exists(os.path.join(folder, 'asgi.py')):
         return ['uvicorn', 'asgi:application', '--host', '0.0.0.0', '--port', str(port)], 'fastapi', {}
-    
-    # ----- NEW: Gunicorn detection -----
-    # If requirements.txt contains gunicorn, and there is a wsgi file (app.py with app object, or wsgi.py)
+    # ----- Gunicorn detection (improved) -----
     req_file = os.path.join(folder, 'requirements.txt')
     if os.path.exists(req_file):
         with open(req_file, 'r') as f:
-            req_content = f.read()
-            if 'gunicorn' in req_content:
-                # Detect wsgi app: try app:app or wsgi:application
+            if 'gunicorn' in f.read():
                 wsgi_app = None
-                # Check for app.py with 'app' variable
-                if os.path.exists(os.path.join(folder, 'app.py')):
-                    with open(os.path.join(folder, 'app.py'), 'r') as fh:
-                        if 'app =' in fh.read():
-                            wsgi_app = 'app:app'
-                elif os.path.exists(os.path.join(folder, 'wsgi.py')):
-                    wsgi_app = 'wsgi:application'
-                else:
-                    # fallback: maybe app:app
-                    wsgi_app = 'app:app'
+                for root, dirs, files in os.walk(folder):
+                    for file in files:
+                        if file.endswith('.py') and not file.startswith('__'):
+                            file_path = os.path.join(root, file)
+                            try:
+                                with open(file_path, 'r', errors='ignore') as fh:
+                                    content = fh.read()
+                                    import re
+                                    match = re.search(r'(app|application)\s*=\s*(?:Flask|Django|FastAPI|create_app)\s*\(', content)
+                                    if match:
+                                        var_name = match.group(1)
+                                        rel_path = os.path.relpath(file_path, folder)
+                                        if rel_path.endswith('.py'):
+                                            module_name = rel_path[:-3].replace(os.sep, '.')
+                                            wsgi_app = f"{module_name}:{var_name}"
+                                            break
+                            except:
+                                continue
+                    if wsgi_app:
+                        break
+                if not wsgi_app:
+                    for f in ['app.py', 'wsgi.py', 'application.py']:
+                        if os.path.exists(os.path.join(folder, f)):
+                            wsgi_app = f"{f[:-3]}:app"
+                            break
                 if wsgi_app:
                     return ['gunicorn', '--bind', f'0.0.0.0:{port}', wsgi_app], 'gunicorn', {}
-    # ----- End gunicorn detection -----
-
+    # ----- Fallback -----
     startup = find_startup_file(folder)
     if startup:
         return [sys.executable, startup], 'python', {}
-    
-    # ----- Static -----
     if os.path.exists(os.path.join(folder, 'index.html')):
         return [sys.executable, '-m', 'http.server', str(port)], 'static', {}
-    
     return None, None, {}
 
 # ---------- Install Dependencies ----------
@@ -357,8 +356,7 @@ def install_dependencies(folder, runtime, log_callback=None):
             except:
                 pass
             return True, "Dependencies installed"
-        # If no package.json, nothing to install
-        return True, "No dependencies to install (no package.json)"
+        return True, "No dependencies"
     elif runtime == 'php':
         if os.path.exists(os.path.join(folder, 'composer.json')):
             cmd = ['composer', 'install']
@@ -405,7 +403,6 @@ def install_dependencies(folder, runtime, log_callback=None):
             return True, "Build successful"
         return True, "No build required"
     else:
-        # Python - requirements.txt
         req_file = os.path.join(folder, 'requirements.txt')
         if os.path.exists(req_file):
             cmd = [sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt']
@@ -425,13 +422,11 @@ def install_dependencies(folder, runtime, log_callback=None):
 
 # ---------- Auto Port Detection & Health Check ----------
 def detect_port_from_log(log_file):
-    """Read log file and try to extract port number from common patterns."""
     if not os.path.exists(log_file):
         return None
     try:
         with open(log_file, 'r') as f:
             content = f.read()
-            # Patterns: listening on port 3000, localhost:3000, port 3000, :::3000, etc.
             patterns = [
                 r'port\s*[:=]\s*(\d+)',
                 r'listening\s+on\s+(\d+)',
@@ -441,10 +436,8 @@ def detect_port_from_log(log_file):
                 r'::\s*:\s*(\d+)',
                 r'port\s+(\d+)',
                 r'http://[^:]+:(\d+)',
-                r':(\d{4,5})',  # generic 4-5 digit number
-                # New pattern for gunicorn
+                r':(\d{4,5})',
                 r'Listening at:\s*http://[^:]+:(\d+)',
-                r'Starting gunicorn.*\n.*http://[^:]+:(\d+)'  # multi-line not easy, but we'll handle with simple
             ]
             for pattern in patterns:
                 matches = re.findall(pattern, content, re.IGNORECASE)
@@ -456,19 +449,26 @@ def detect_port_from_log(log_file):
         pass
     return None
 
-def health_check_on_ports(port_list, max_retries=8, delay=3):
-    """Try health check on a list of ports."""
+def health_check_on_ports(port_list, max_retries=30, delay=2, log_callback=None):
+    """Try health check on a list of ports with logging."""
+    total_attempts = 0
     for port in port_list:
         for attempt in range(max_retries):
+            total_attempts += 1
+            if log_callback:
+                log_callback("CHECK", f"Health check attempt {total_attempts} on port {port}...")
             try:
                 response = requests.get(f"http://localhost:{port}", timeout=3)
                 if response.status_code < 500:
+                    if log_callback:
+                        log_callback("CHECK", f"✅ Port {port} is responding (status {response.status_code})")
                     return True, port, f"OK (port {port})"
                 else:
-                    # If status code >=500, it's a server error, probably not the right port
-                    pass
-            except:
-                pass
+                    if log_callback:
+                        log_callback("CHECK", f"⚠️ Port {port} returned status {response.status_code}, retrying...")
+            except Exception as e:
+                if log_callback:
+                    log_callback("CHECK", f"⏳ Port {port} not ready yet ({str(e)[:50]})...")
             time.sleep(delay)
     return False, None, "Health check failed on all ports"
 
@@ -483,7 +483,6 @@ def start_website_process(website_id, log_callback=None):
         update_website_status(website_id, 'failed')
         return False, "Folder not found"
     
-    # Allocate a port (will be used as primary, but we'll auto-detect)
     allocated_port = get_next_available_port()
     cmd, runtime, env_extra = detect_runtime_and_get_cmd(folder, allocated_port)
     if not cmd:
@@ -512,7 +511,6 @@ def start_website_process(website_id, log_callback=None):
             env['FLASK_APP'] = 'app.py'
         elif os.path.exists(os.path.join(folder, 'main.py')):
             env['FLASK_APP'] = 'main.py'
-    
     if runtime == 'php':
         cmd = ['php', '-S', f'0.0.0.0:{allocated_port}']
     
@@ -530,6 +528,7 @@ def start_website_process(website_id, log_callback=None):
             proc = subprocess.Popen(cmd, cwd=folder, env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     preexec_fn=os.setsid)
+        
         def read_output():
             for line in iter(proc.stdout.readline, b''):
                 if line:
@@ -543,42 +542,35 @@ def start_website_process(website_id, log_callback=None):
         thread.daemon = True
         thread.start()
         
-        # Wait longer for process to start and write logs
-        time.sleep(8)  # increased from 3
+        # --- Give the app time to start (60 seconds initial wait) ---
+        if log_callback:
+            log_callback("WAIT", "⏳ Waiting 60 seconds for application to start... (first deployment may take longer)")
+        time.sleep(60)
         
         if proc.poll() is not None:
             with open(log_file, 'r') as f:
                 error_lines = f.read()[-500:]
             update_website_status(website_id, 'failed')
-            log_website(website_id, f"Process crashed immediately: {error_lines}", 'error')
+            log_website(website_id, f"Process crashed: {error_lines}", 'error')
             if log_callback:
-                log_callback("ERROR", f"Process crashed: {error_lines}")
+                log_callback("ERROR", f"❌ Process crashed: {error_lines}")
             return False, f"Process crashed: {error_lines}"
         
         # Auto-detect port from log
         detected_port = detect_port_from_log(log_file)
-        if detected_port:
-            if log_callback:
-                log_callback("PORT", f"Detected application using port {detected_port} from logs")
-        else:
-            if log_callback:
-                log_callback("PORT", "Could not detect port from logs, will try common ports")
-        
-        # Build list of ports to try
         ports_to_try = []
         if detected_port:
             ports_to_try.append(detected_port)
-        # Always try the allocated port
+            if log_callback:
+                log_callback("PORT", f"🔍 Detected port {detected_port} from logs")
         ports_to_try.append(allocated_port)
-        # Common default ports
         for p in [3000, 8080, 5000, 8000, 8081, 3001, 10000, 8001]:
             if p not in ports_to_try:
                 ports_to_try.append(p)
         
-        # Health check with more retries and longer delay
-        healthy, actual_port, health_msg = health_check_on_ports(ports_to_try, max_retries=8, delay=3)
+        # Health check with many retries (30 attempts, 2 sec delay = 60 seconds more)
+        healthy, actual_port, health_msg = health_check_on_ports(ports_to_try, max_retries=30, delay=2, log_callback=log_callback)
         if healthy:
-            # Update database with actual port
             update_website_status(website_id, 'running', proc.pid, actual_port)
             log_website(website_id, f"Started on port {actual_port} (PID {proc.pid})")
             with get_db() as conn:
@@ -586,7 +578,7 @@ def start_website_process(website_id, log_callback=None):
                              (cmd[0] if not runtime.startswith('python') else 'app', website_id))
                 conn.commit()
             if log_callback:
-                log_callback("SUCCESS", f"Application running on port {actual_port}")
+                log_callback("SUCCESS", f"✅ Application running on port {actual_port}")
             return True, f"Running on port {actual_port}"
         else:
             # Health check failed - kill process
@@ -605,7 +597,7 @@ def start_website_process(website_id, log_callback=None):
                     error_log = ''.join(lines[-20:]) if lines else ""
             log_website(website_id, f"Health check failed: {health_msg}", 'error')
             if log_callback:
-                log_callback("ERROR", f"Health check failed: {health_msg}")
+                log_callback("ERROR", f"❌ Health check failed: {health_msg}")
                 if error_log:
                     log_callback("ERROR", f"Last log lines:\n{error_log}")
             return False, f"Health check failed: {health_msg}\n{error_log}"
@@ -613,7 +605,7 @@ def start_website_process(website_id, log_callback=None):
         log_website(website_id, f"Start error: {str(e)}", 'error')
         update_website_status(website_id, 'failed')
         if log_callback:
-            log_callback("ERROR", f"Start error: {str(e)}")
+            log_callback("ERROR", f"❌ Start error: {str(e)}")
         return False, str(e)
 
 # ---------- Stop Process ----------
