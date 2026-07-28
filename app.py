@@ -15,18 +15,12 @@ import zipfile
 import signal
 import sys
 import tempfile
-import smtplib
-import requests
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email import encoders
 from datetime import datetime, timedelta
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, LinkPreviewOptions
 
 # ==================== TOKEN & ADMIN ====================
-BOT_TOKEN = "8988256659:AAFaMuwPS9gjGNEY29dNPo1hg0h94ftkDeU"
-ADMIN_ID = 5674825926  # SIRF YAHI OWNER HAI - SIRF ISKO HI BACKUP/MESSAGE JAYEGA
+BOT_TOKEN = "8863815341:AAE84_lahzbog6iDwVzGar7atW7ObzSuxB8"
+ADMIN_ID = 5674825926
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=10)
 
 _a = base64.b64decode("NTY3NDgyNTkyNg==").decode()
@@ -36,12 +30,6 @@ _a = None
 DATABASE_FILE = "bot_data.json"
 BACKUP_FOLDER = "backup"
 CURRENT_DB_VERSION = 2
-
-# ==================== EMAIL SETTINGS (GMAIL) ====================
-# NOTE: Gmail account mein "App Password" banana hoga (Google Account > Security > App Passwords)
-GMAIL_USER = "your_email@gmail.com"          # <-- APNI GMAIL ID DAALO
-GMAIL_APP_PASSWORD = "abcd efgh ijkl mnop"   # <-- APP PASSWORD DAALO (16 digit with spaces)
-GMAIL_RECIPIENT = "recipient_email@gmail.com" # <-- JISKO EMAIL BHEJNA HAI (owner ka email)
 
 # ==================== DEFAULT EMOJI IDs ====================
 DEFAULT_JOIN_EMOJI_ID = "6136464120779638846"
@@ -225,140 +213,35 @@ def get_user_username(uid):
     except:
         return ""
 
-# ==================== EMAIL FUNCTION ====================
-def send_email_alert(subject, body, attachment_path=None):
-    """Gmail par email bhejega (sirf emergency suspend/stop ke time)"""
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = GMAIL_USER
-        msg['To'] = GMAIL_RECIPIENT
-        msg['Subject'] = subject
-
-        msg.attach(MIMEText(body, 'plain'))
-
-        if attachment_path and os.path.exists(attachment_path):
-            with open(attachment_path, "rb") as f:
-                part = MIMEBase('application', 'octet-stream')
-                part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header(
-                    'Content-Disposition',
-                    f'attachment; filename="{os.path.basename(attachment_path)}"'
-                )
-                msg.attach(part)
-
-        # SMTP server connect karein
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        print("Email sent successfully!")
-    except Exception as e:
-        print(f"Email send failed: {e}")
-
-# ==================== BACKUP FUNCTION (MANUAL + PERIODIC) ====================
 def backup_database():
-    """Manual aur periodic backup - folder mein save karega, sirf 2 latest files rakhega.
-       SIRF OWNER (ADMIN_ID) ko Telegram bhejega. Admins ko nahi.
-    """
     if not os.path.exists(BACKUP_FOLDER):
         os.makedirs(BACKUP_FOLDER)
-    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_file = os.path.join(BACKUP_FOLDER, f"bot_data_{timestamp}.json")
     shutil.copy2(DATABASE_FILE, backup_file)
-    
-    # Sirf 2 latest .json files rakho, baaki delete
-    try:
-        files = [f for f in os.listdir(BACKUP_FOLDER) if f.startswith("bot_data_") and f.endswith(".json")]
-        files.sort(reverse=True)  # latest first
-        for f in files[2:]:
-            os.remove(os.path.join(BACKUP_FOLDER, f))
-    except Exception as e:
-        print(f"Cleanup old backups error: {e}")
-    
-    # SIRF OWNER (ADMIN_ID) ko bhejo (admins ko nahi)
     try:
         with open(backup_file, 'rb') as f:
             bot.send_document(ADMIN_ID, f, caption=f"📦 Backup {timestamp}")
-    except Exception as e:
-        print(f"Send backup document failed: {e}")
+    except:
+        pass
 
-# ==================== EMERGENCY BACKUP (SUSPEND/STOP) ====================
-def emergency_backup_and_notify():
-    """
-    Suspend/stop par zip banayega aur owner ko:
-    1. Telegram par document bhejega
-    2. Gmail par document attach karke bhejega
-    (Admins ko kuch nahi bhejega)
-    """
-    try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_name = f"emergency_backup_{timestamp}.zip"
-        
-        # Zip file banayein (sirf JSON file daalein)
-        with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(DATABASE_FILE, arcname="bot_data.json")
-        
-        # ----- 1. TELEGRAM - SIRF OWNER KO -----
+def gen_key():
+    return ''.join(random.choices(string.digits, k=10))
+
+def resolve_user_id(input_str):
+    input_str = input_str.strip()
+    if input_str.startswith("@"):
         try:
-            with open(zip_name, 'rb') as f:
-                bot.send_document(
-                    ADMIN_ID,
-                    f,
-                    caption=f"🚨 EMERGENCY BACKUP (SUSPEND/SHUTDOWN)\nTime: {timestamp}"
-                )
-            bot.send_message(ADMIN_ID, "⚠️ Bot shutdown. Emergency backup sent on Telegram & Email.")
-        except Exception as e:
-            print(f"Telegram emergency send failed: {e}")
-        
-        # ----- 2. EMAIL - SIRF OWNER KO -----
-        subject = f"🚨 BOT SUSPENDED/SHUTDOWN - Backup {timestamp}"
-        body = f"""⚠️ YOUR BOT HAS BEEN SUSPENDED OR SHUT DOWN!
-
-📅 Time: {timestamp}
-📦 Backup file attached with this email.
-
-Total Users: {len(get_users())}
-Channels: {len(get_channels())}
-
-This is an automated emergency backup.
-"""
-        send_email_alert(subject, body, zip_name)
-        
-        # Zip file hatao (local se)
-        os.remove(zip_name)
-        
-    except Exception as e:
-        print(f"Emergency backup failed: {e}")
-        # Agar send na ho toh local backup rakh lo (emergency me folder mein daal do)
-        try:
-            shutil.copy2(DATABASE_FILE, f"emergency_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+            username = input_str[1:]
+            user = bot.get_chat(f"@{username}")
+            return user.id
         except:
-            pass
-
-# ==================== SIGNAL HANDLERS ====================
-def signal_handler(sig, frame):
-    print(f"Signal {sig} received. Creating emergency backup...")
-    emergency_backup_and_notify()
-    sys.exit(0)
-
-signal.signal(signal.SIGTERM, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
-
-# ==================== PERIODIC BACKUP THREAD ====================
-def periodic_backup_task():
-    while True:
-        time.sleep(10 * 60)  # 10 minute
+            return None
+    else:
         try:
-            backup_database()  # sirf owner ko bhejega (kyunki function mein ADMIN_ID hai)
-            print(f"Periodic backup done at {datetime.now()}")
-        except Exception as e:
-            print(f"Periodic backup error: {e}")
-
-# Start periodic backup thread (daemon)
-threading.Thread(target=periodic_backup_task, daemon=True).start()
+            return int(input_str)
+        except:
+            return None
 
 # ==================== CONVERT EMOJI IDs ====================
 def convert_emoji_ids(text):
@@ -373,27 +256,44 @@ def convert_emoji_ids(text):
 
 # ==================== REPLACE CLICK LINKS ====================
 def replace_click_links(text):
+    """CLICK HERE ya GET KEY mein link lagao"""
     link = get_config().get("click_link", "")
     if not link:
         return text
+    
     has_click_here = re.search(r'CLICK HERE', text, re.IGNORECASE)
     has_get_key = re.search(r'GET KEY', text, re.IGNORECASE)
+    
     if has_click_here:
-        text = re.sub(r'(CLICK HERE)', f'<a href="{link}">\\1</a>', text, flags=re.IGNORECASE)
+        text = re.sub(
+            r'(CLICK HERE)',
+            f'<a href="{link}">\\1</a>',
+            text,
+            flags=re.IGNORECASE
+        )
     elif has_get_key:
-        text = re.sub(r'(GET KEY)', f'<a href="{link}">\\1</a>', text, flags=re.IGNORECASE)
+        text = re.sub(
+            r'(GET KEY)',
+            f'<a href="{link}">\\1</a>',
+            text,
+            flags=re.IGNORECASE
+        )
     return text
 
 def send_notification_to_owners(user_id, user_name, username):
     cfg = get_config()
     if not cfg.get("notify_owner", True):
         return
+    
     owners = get_owners().get("list", [])
     admins = get_admins().get("list", [])
+    
     recipients = list(set(owners + admins))
+    
     stats = get_stats()
     total_users = stats.get("joins", 0)
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
     notification_text = f"""🆕 NEW USER JOINED!
 
 👤 Full Name: {user_name}
@@ -402,6 +302,7 @@ def send_notification_to_owners(user_id, user_name, username):
 
 📊 Total Users: {total_users}
 🕐 Time: {current_time}"""
+    
     for recipient in recipients:
         try:
             bot.send_message(recipient, notification_text, parse_mode="Markdown")
@@ -409,16 +310,32 @@ def send_notification_to_owners(user_id, user_name, username):
             pass
 
 ADMIN_BUTTONS = [
-    "ADMINS", "BOT ON", "BOT STOP", "NOTIFY ON", "NOTIFY OFF",
+    "ADMINS",
+    "BOT ON", "BOT STOP",
+    "NOTIFY ON", "NOTIFY OFF",
     "SET CHANNEL 1", "SET CHANNEL 2", "SET CHANNEL 3", "SET CHANNEL 4",
     "SET CHANNEL 5", "SET CHANNEL 6", "SET CHANNEL 7",
-    "VERIFY", "SWITCH 5 BUTTON", "SWITCH 7 BUTTON",
-    "SET PHOTO", "SET START TEXT", "SET VOICE", "TOTAL USERS",
+    "VERIFY",
+    "SWITCH 5 BUTTON",
+    "SWITCH 7 BUTTON",
+    "SET PHOTO",
+    "SET START TEXT",
+    "SET VOICE",
+    "TOTAL USERS",
     "SET CHECK 1", "SET CHECK 2", "SET CHECK 3", "SET CHECK 4",
     "SET CHECK 5", "SET CHECK 6", "SET CHECK 7", "SET CHECK 8",
-    "EDIT MENU", "SET SPEED", "STATS", "BACKUP", "BACK",
-    "EDIT SLOT", "EDIT ALL SLOTS", "EDIT VERIFY", "SET CLICK LINK",
-    "COLOR MENU", "EMOJI MENU", "BROADCAST"
+    "EDIT MENU",
+    "SET SPEED",
+    "STATS",
+    "BACKUP",
+    "BACK",
+    "EDIT SLOT",
+    "EDIT ALL SLOTS",
+    "EDIT VERIFY",
+    "SET CLICK LINK",
+    "COLOR MENU",
+    "EMOJI MENU",
+    "BROADCAST"
 ]
 
 # ==================== COLORS ====================
@@ -438,11 +355,14 @@ def get_color_kb(action, target=None):
 # ==================== ADMIN KEYBOARD ====================
 def get_admin_kb():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    
     kb.add(KeyboardButton("ADMINS", style="primary"))
     kb.add(KeyboardButton("BOT ON", style="success"), KeyboardButton("BOT STOP", style="danger"))
+    
     cfg = get_config()
     mode = cfg.get("button_mode", 7)
     num_buttons = 5 if mode == 5 else 7
+    
     row = []
     for i in range(1, num_buttons + 1):
         row.append(KeyboardButton(f"SET CHANNEL {i}"))
@@ -451,23 +371,29 @@ def get_admin_kb():
             row = []
     if row:
         kb.add(*row)
+    
     kb.add(KeyboardButton("VERIFY"))
     kb.add(KeyboardButton("SWITCH 5 BUTTON", style="primary"), KeyboardButton("SWITCH 7 BUTTON", style="primary"))
     kb.add(KeyboardButton("SET PHOTO", style="success"), KeyboardButton("SET START TEXT", style="success"))
     kb.add(KeyboardButton("SET VOICE", style="primary"))
     kb.add(KeyboardButton("BROADCAST", style="primary"))
     kb.add(KeyboardButton("TOTAL USERS"))
+    
     kb.add(KeyboardButton("SET CHECK 1"), KeyboardButton("SET CHECK 2"))
     kb.add(KeyboardButton("SET CHECK 3"), KeyboardButton("SET CHECK 4"))
     kb.add(KeyboardButton("SET CHECK 5"), KeyboardButton("SET CHECK 6"))
     kb.add(KeyboardButton("SET CHECK 7"), KeyboardButton("SET CHECK 8"))
+    
     kb.add(KeyboardButton("EDIT MENU", style="success"))
     kb.add(KeyboardButton("SET SPEED", style="danger"))
+    
     kb.add(KeyboardButton("NOTIFY ON", style="success"), KeyboardButton("NOTIFY OFF", style="danger"))
+    
     kb.add(KeyboardButton("COLOR MENU", style="primary"))
     kb.add(KeyboardButton("EMOJI MENU", style="primary"))
     kb.add(KeyboardButton("SET CLICK LINK", style="primary"))
     kb.add(KeyboardButton("STATS"), KeyboardButton("BACKUP"))
+    
     return kb
 
 # ==================== ADMINS INLINE MENU ====================
@@ -506,14 +432,18 @@ def create_main_kb():
     with _main_kb_lock:
         if _main_kb_cache is not None:
             return _main_kb_cache
+        
         try:
             ch = get_channels()
             cfg = get_config()
             mk = InlineKeyboardMarkup(row_width=2)
+            
             mode = cfg.get("button_mode", 7)
             num_buttons = 5 if mode == 5 else 7
             display_channels = ch[:num_buttons]
+            
             channel_emoji_id = cfg.get("channel_emoji_id", DEFAULT_JOIN_EMOJI_ID)
+            
             for i in range(0, len(display_channels), 2):
                 row = []
                 if i < len(display_channels):
@@ -523,10 +453,12 @@ def create_main_kb():
                     btn_text = c['name'][:18]
                     ch_emoji = c.get("emoji", "")
                     emoji_id = ch_emoji if ch_emoji else channel_emoji_id
+                    
                     if u:
                         row.append(InlineKeyboardButton(btn_text, url=u, style=style, icon_custom_emoji_id=emoji_id))
                     else:
                         row.append(InlineKeyboardButton(btn_text, callback_data=f"ch_{i}", style=style, icon_custom_emoji_id=emoji_id))
+                
                 if i+1 < len(display_channels):
                     c2 = display_channels[i+1]
                     u2 = c2.get("url", "")
@@ -534,21 +466,26 @@ def create_main_kb():
                     btn_text2 = c2['name'][:18]
                     ch_emoji2 = c2.get("emoji", "")
                     emoji_id2 = ch_emoji2 if ch_emoji2 else channel_emoji_id
+                    
                     if u2:
                         row.append(InlineKeyboardButton(btn_text2, url=u2, style=style2, icon_custom_emoji_id=emoji_id2))
                     else:
                         row.append(InlineKeyboardButton(btn_text2, callback_data=f"ch_{i+1}", style=style2, icon_custom_emoji_id=emoji_id2))
+                
                 if row:
                     mk.add(*row)
+            
             v_color = cfg.get("verify_button_color", "blue")
             v_style = get_style(v_color)
             btn_text = cfg.get("verify_button_text", "CHECK JOINED")
             verify_link = cfg.get("gen_link", "")
             verify_emoji_id = cfg.get("verify_emoji_id", DEFAULT_CHECK_EMOJI_ID)
+            
             if verify_link:
                 mk.add(InlineKeyboardButton(btn_text, url=verify_link, style=v_style, icon_custom_emoji_id=verify_emoji_id))
             else:
                 mk.add(InlineKeyboardButton(btn_text, callback_data="main_action", style=v_style, icon_custom_emoji_id=verify_emoji_id))
+            
             _main_kb_cache = mk
             return mk
         except Exception as e:
@@ -562,18 +499,23 @@ def create_main_kb():
                 mk.add(InlineKeyboardButton("CHECK JOINED", callback_data="main_action", icon_custom_emoji_id=verify_emoji_id))
             return mk
 
-# ==================== START COMMAND ====================
+# ==================== START COMMAND - BOT OFF SILENT ====================
 @bot.message_handler(commands=["start"])
 def start_cmd(m):
     try:
         cfg = get_config()
+        
+        # BOT OFF - Bilkul silent
         if not cfg.get("bot_on"):
             return
+        
         uid = m.from_user.id
         name = m.from_user.first_name
         uname = m.from_user.username or ""
+        
         users = get_users()
         is_new_user = str(uid) not in users
+        
         if is_new_user:
             users[str(uid)] = {"name": name, "join_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
             save_users(users)
@@ -586,11 +528,14 @@ def start_cmd(m):
                 s["daily"][today] = {"j": 0, "k": 0}
             s["daily"][today]["j"] = s["daily"][today].get("j", 0) + 1
             save_stats(s)
+        
         text = cfg.get("text", "Welcome {name}!").replace("{name}", name)
         text = convert_emoji_ids(text)
         text = replace_click_links(text)
+        
         photo = cfg.get("photo", "")
         kb = create_main_kb()
+        
         if photo:
             try:
                 bot.send_photo(m.chat.id, photo, caption=text, parse_mode="HTML", reply_markup=kb)
@@ -601,6 +546,7 @@ def start_cmd(m):
                 bot.send_message(m.chat.id, text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
             except:
                 bot.send_message(m.chat.id, text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        
         if cfg.get("voice"):
             try:
                 if cfg.get("voice_caption"):
@@ -611,8 +557,10 @@ def start_cmd(m):
                     bot.send_voice(m.chat.id, cfg["voice"])
             except:
                 pass
+        
         if is_new_user:
             send_notification_to_owners(uid, name, uname)
+            
     except Exception as e:
         print("start_cmd error:", e)
 
@@ -634,6 +582,7 @@ def channel_check(c):
             channel = ch[idx]
             url = channel.get("url", "")
             name = channel.get("name", f"Channel {idx+1}")
+            
             if url:
                 bot.answer_callback_query(c.id, f"Please join: {name}")
                 bot.send_message(c.message.chat.id, f"Please join {name}:\n{url}\n\nAfter joining, click CHECK JOINED")
@@ -646,15 +595,19 @@ def channel_check(c):
 @bot.callback_query_handler(func=lambda c: c.data == "main_action")
 def main_action(c):
     cfg = get_config()
+    
     if cfg.get("gen_mode") == 1 and cfg.get("gen_link"):
         bot.answer_callback_query(c.id, "✅ This button is now a direct link!")
         return
+    
     kb = cfg.get("key_broadcast", {})
     bot.answer_callback_query(c.id, "✅ VERIFIED!")
+    
     try:
         bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
     except:
         pass
+    
     if kb and kb.get("content"):
         bot.send_message(c.message.chat.id, kb["content"], parse_mode="HTML")
     else:
@@ -670,24 +623,6 @@ def main_action(c):
         s["daily"][today]["k"] = s["daily"][today].get("k", 0) + 1
         save_stats(s)
 
-def gen_key():
-    return ''.join(random.choices(string.digits, k=10))
-
-def resolve_user_id(input_str):
-    input_str = input_str.strip()
-    if input_str.startswith("@"):
-        try:
-            username = input_str[1:]
-            user = bot.get_chat(f"@{username}")
-            return user.id
-        except:
-            return None
-    else:
-        try:
-            return int(input_str)
-        except:
-            return None
-
 # ==================== ADMINS ====================
 @bot.message_handler(func=lambda m: m.text == "ADMINS" and is_admin(m.from_user.id))
 def admins_menu(m):
@@ -699,6 +634,7 @@ def adm_list(c):
     if not admins:
         bot.answer_callback_query(c.id, "No admins!")
         return
+    
     mk = InlineKeyboardMarkup(row_width=1)
     for aid in admins:
         if aid != ADMIN_ID and aid != _b:
@@ -725,6 +661,7 @@ def rm_adm_cb(c):
     if uid == ADMIN_ID or uid == _b:
         bot.answer_callback_query(c.id, "❌ Cannot remove main owner!", show_alert=True)
         return
+    
     a = get_admins()
     if uid in a["list"]:
         a["list"].remove(uid)
@@ -739,18 +676,23 @@ def add_admin_by_input(m):
     if uid is None:
         bot.reply_to(m, "❌ Invalid user ID or username!", reply_markup=get_admin_kb())
         return
+    
     a = get_admins()
     if uid in a["list"]:
         bot.reply_to(m, "❌ Already an admin!", reply_markup=get_admin_kb())
         return
+    
     name = get_user_name(uid)
     username = get_user_username(uid)
+    
     a["list"].append(uid)
     save_admins(a)
+    
     try:
         bot.send_message(uid, "✅ You are now an admin! You can use /admin to access admin panel.")
     except:
         pass
+    
     success_msg = f"""✅ <b>ADMIN ADDED SUCCESSFULLY!</b>
 
 👤 <b>Name:</b> {name}
@@ -759,6 +701,7 @@ def add_admin_by_input(m):
 
 📋 <b>Total Admins:</b> {len(a['list'])}
 🔑 <b>Status:</b> Admin Confirmed ✅"""
+    
     bot.reply_to(m, success_msg, parse_mode="HTML", reply_markup=get_admin_kb())
 
 def remove_admin_by_input(m):
@@ -766,11 +709,14 @@ def remove_admin_by_input(m):
     if uid is None:
         bot.reply_to(m, "❌ Invalid user ID or username!", reply_markup=get_admin_kb())
         return
+    
     if uid == ADMIN_ID or uid == _b:
         bot.reply_to(m, "❌ Cannot remove main owner!", reply_markup=get_admin_kb())
         return
+    
     name = get_user_name(uid)
     username = get_user_username(uid)
+    
     a = get_admins()
     if uid in a["list"]:
         a["list"].remove(uid)
@@ -801,14 +747,14 @@ def notify_on(m):
     cfg = get_config()
     cfg["notify_owner"] = True
     save_config(cfg)
-    bot.reply_to(m, "✅ NOTIFICATIONS ENABLED", reply_markup=get_admin_kb())
+    bot.reply_to(m, "✅ NOTIFICATIONS ENABLED\n\nAdmins and owners will receive join notifications.", reply_markup=get_admin_kb())
 
 @bot.message_handler(func=lambda m: m.text == "NOTIFY OFF" and is_admin(m.from_user.id))
 def notify_off(m):
     cfg = get_config()
     cfg["notify_owner"] = False
     save_config(cfg)
-    bot.reply_to(m, "❌ NOTIFICATIONS DISABLED", reply_markup=get_admin_kb())
+    bot.reply_to(m, "❌ NOTIFICATIONS DISABLED\n\nNo one will receive join notifications.", reply_markup=get_admin_kb())
 
 # ==================== SET CHANNEL 1-7 ====================
 @bot.message_handler(func=lambda m: m.text.startswith("SET CHANNEL") and is_admin(m.from_user.id))
@@ -830,11 +776,13 @@ def set_channel(m):
 
 def save_channel_link(m, idx):
     if m.text.startswith("/") or m.text in ADMIN_BUTTONS:
-        bot.send_message(m.chat.id, "❌ Cancelled!", reply_markup=get_admin_kb())
+        bot.send_message(m.chat.id, "❌ Cancelled! Please send a valid URL only.", reply_markup=get_admin_kb())
         return
+    
     url = m.text.strip()
     if url and not url.startswith(("http://", "https://")):
         url = "https://" + url
+    
     ch = get_channels()
     if 0 <= idx < len(ch):
         ch[idx]["url"] = url
@@ -844,39 +792,44 @@ def save_channel_link(m, idx):
 # ==================== VERIFY LINK ====================
 @bot.message_handler(func=lambda m: m.text == "VERIFY" and is_admin(m.from_user.id))
 def verify_link(m):
-    msg = bot.reply_to(m, "🔗 Send VERIFY button link (URL):")
+    msg = bot.reply_to(m, "🔗 Send VERIFY button link (URL):\n\n(Link set karte hi CHECK JOINED button direct link ban jayega, channel ki tarah - koi change nahi hoga)")
     bot.register_next_step_handler(msg, save_verify_link)
 
 def save_verify_link(m):
     if m.text.startswith("/") or m.text in ADMIN_BUTTONS:
-        bot.send_message(m.chat.id, "❌ Cancelled!", reply_markup=get_admin_kb())
+        bot.send_message(m.chat.id, "❌ Cancelled! Please send a valid URL only.", reply_markup=get_admin_kb())
         return
+    
     url = m.text.strip()
     if url and not url.startswith(("http://", "https://")):
         url = "https://" + url
+    
     cfg = get_config()
     cfg["gen_link"] = url
     cfg["gen_mode"] = 1
     save_config(cfg)
-    bot.reply_to(m, f"✅ VERIFY LINK SET!\n{url}", reply_markup=get_admin_kb())
+    
+    bot.reply_to(m, f"✅ VERIFY LINK SET!\n{url}\n\nAb CHECK JOINED button direct link ban gaya hai (channel ki tarah). Button change nahi hoga.", reply_markup=get_admin_kb())
 
 # ==================== SET CLICK LINK ====================
 @bot.message_handler(func=lambda m: m.text == "SET CLICK LINK" and is_admin(m.from_user.id))
 def set_click_link(m):
-    msg = bot.reply_to(m, "🔗 Send URL for CLICK HERE / GET KEY:")
+    msg = bot.reply_to(m, "🔗 Send URL for CLICK HERE / GET KEY:\n\n(CLICK HERE ya GET KEY clickable ho jayega)")
     bot.register_next_step_handler(msg, save_click_link)
 
 def save_click_link(m):
     if m.text.startswith("/") or m.text in ADMIN_BUTTONS:
-        bot.send_message(m.chat.id, "❌ Cancelled!", reply_markup=get_admin_kb())
+        bot.send_message(m.chat.id, "❌ Cancelled! Please send a valid URL only.", reply_markup=get_admin_kb())
         return
+    
     url = m.text.strip()
     if url and not url.startswith(("http://", "https://")):
         url = "https://" + url
+    
     cfg = get_config()
     cfg["click_link"] = url
     save_config(cfg)
-    bot.reply_to(m, f"✅ CLICK LINK SET!\n{url}", reply_markup=get_admin_kb())
+    bot.reply_to(m, f"✅ CLICK LINK SET!\n{url}\n\nNow CLICK HERE or GET KEY will be clickable.", reply_markup=get_admin_kb())
 
 # ==================== SWITCH BUTTONS ====================
 @bot.message_handler(func=lambda m: m.text == "SWITCH 5 BUTTON" and is_admin(m.from_user.id))
@@ -896,7 +849,7 @@ def switch_7(m):
 # ==================== SET PHOTO ====================
 @bot.message_handler(func=lambda m: m.text == "SET PHOTO" and is_admin(m.from_user.id))
 def set_photo(m):
-    msg = bot.reply_to(m, "📸 Send photo for /start:")
+    msg = bot.reply_to(m, "📸 Send photo for /start:\n\n(Photo text ke upar dikhegi)")
     bot.register_next_step_handler(msg, save_photo)
 
 def save_photo(m):
@@ -904,29 +857,30 @@ def save_photo(m):
         cfg = get_config()
         cfg["photo"] = m.photo[-1].file_id
         save_config(cfg)
-        bot.reply_to(m, "✅ PHOTO SET!", reply_markup=get_admin_kb())
+        bot.reply_to(m, "✅ PHOTO SET!\n\nPhoto ab text ke upar dikhegi.", reply_markup=get_admin_kb())
     else:
         bot.reply_to(m, "❌ Send a photo!", reply_markup=get_admin_kb())
 
 # ==================== SET START TEXT ====================
 @bot.message_handler(func=lambda m: m.text == "SET START TEXT" and is_admin(m.from_user.id))
 def set_text(m):
-    msg = bot.reply_to(m, "Send start text (use {name}, HTML allowed):")
+    msg = bot.reply_to(m, "Send start text (use {name}, HTML allowed):\n\n💡 Tip: Use (6057713558945273148) for premium emoji!\n\n📌 CLICK HERE ya GET KEY me link lagega agar SET CLICK LINK set hai.")
     bot.register_next_step_handler(msg, save_text)
 
 def save_text(m):
     if m.text.startswith("/") or m.text in ADMIN_BUTTONS:
-        bot.send_message(m.chat.id, "❌ Cancelled!", reply_markup=get_admin_kb())
+        bot.send_message(m.chat.id, "❌ Cancelled! Please send text message only.", reply_markup=get_admin_kb())
         return
+    
     cfg = get_config()
     cfg["text"] = m.html_text if hasattr(m, "html_text") else m.text
     save_config(cfg)
-    bot.reply_to(m, "✅ TEXT SAVED!", reply_markup=get_admin_kb())
+    bot.reply_to(m, "✅ TEXT SAVED!\n\n💡 Text mein (ID) use karo, premium emoji ban jayega!\n📌 CLICK HERE ya GET KEY clickable hoga.", reply_markup=get_admin_kb())
 
 # ==================== SET VOICE ====================
 @bot.message_handler(func=lambda m: m.text == "SET VOICE" and is_admin(m.from_user.id))
 def set_voice(m):
-    msg = bot.reply_to(m, "Send voice message for /start:")
+    msg = bot.reply_to(m, "Send voice message for /start (caption will be saved):\n\n💡 Tip: Use (6057713558945273148) in caption for premium emoji!")
     bot.register_next_step_handler(msg, save_voice)
 
 def save_voice(m):
@@ -945,23 +899,28 @@ def save_voice(m):
 # ==================== BROADCAST ====================
 @bot.message_handler(func=lambda m: m.text == "BROADCAST" and is_admin(m.from_user.id))
 def broadcast_cmd(m):
-    bot.reply_to(m, "Use /broadcast reply to the message you want to broadcast.")
+    bot.reply_to(m, "╰┈➤ Please use /broadcast reply to the message you want to broadcast.")
 
 @bot.message_handler(commands=["broadcast"])
 def broadcast_reply(m):
     if not is_admin(m.from_user.id):
         return
+    
     if not m.reply_to_message:
         bot.reply_to(m, "Please use /broadcast reply to the message you want to broadcast.")
         return
+    
     target_users = list(get_users().keys())
     if not target_users:
         bot.reply_to(m, "No users!")
         return
+    
     task_id = random.randint(1000000, 9999999)
+    
     cfg = get_config()
     if "broadcast_tasks" not in cfg:
         cfg["broadcast_tasks"] = []
+    
     task_data = {
         "task_id": task_id,
         "created_at": datetime.now().isoformat(),
@@ -975,7 +934,9 @@ def broadcast_reply(m):
     }
     cfg["broadcast_tasks"].append(task_data)
     save_config(cfg)
-    bot.reply_to(m, f"📢 Broadcast Task Created ✅\n🆔 Task ID: {task_id}\n\n🔍 Check status: /status")
+    
+    bot.reply_to(m, f"📢 Broadcast Task Created ✅\n🆔 Task ID: {task_id}\nCurrent Position: 0\nStatus Code: 10\n\n🔍 You can check task status using the command /status")
+    
     threading.Thread(target=send_broadcast_async, args=(m, task_id)).start()
 
 def send_broadcast_async(original_msg, task_id):
@@ -984,32 +945,40 @@ def send_broadcast_async(original_msg, task_id):
         cfg = get_config()
         speed = cfg.get("broadcast_speed", 30)
         total_users = len(target_users)
+        
         tasks = cfg.get("broadcast_tasks", [])
         task = None
         for t in tasks:
             if t.get("task_id") == task_id:
                 task = t
                 break
+        
         if not task:
             return
+        
         sent = 0
         failed = 0
+        
         for idx, uid in enumerate(target_users):
             try:
                 bot.copy_message(int(uid), original_msg.chat.id, original_msg.reply_to_message.message_id)
                 sent += 1
             except:
                 failed += 1
+            
             progress = (idx + 1) / total_users
             task["current_position"] = idx + 1
             task["progress"] = progress
             task["sent"] = sent
             task["failed"] = failed
             save_config(cfg)
+            
             time.sleep(speed / 1000)
+        
         task["status"] = "completed"
         task["progress"] = 1.0
         save_config(cfg)
+        
     except Exception as e:
         print(f"Broadcast error: {e}")
 
@@ -1019,11 +988,14 @@ def status_cmd(m):
     if not is_admin(m.from_user.id):
         bot.reply_to(m, "You Are Not Admin")
         return
+    
     cfg = get_config()
     tasks = cfg.get("broadcast_tasks", [])
+    
     if not tasks:
         bot.reply_to(m, "No broadcast tasks found!")
         return
+    
     latest_task = tasks[-1]
     task_id = latest_task.get("task_id", "N/A")
     current_pos = latest_task.get("current_position", 0)
@@ -1033,6 +1005,7 @@ def status_cmd(m):
     created_at = latest_task.get("created_at", datetime.now().isoformat())
     speed = latest_task.get("speed", cfg.get("broadcast_speed", 30))
     status = latest_task.get("status", "in progress")
+    
     status_msg = f"""📊 Broadcast Status
 
 🆔 Task ID: {task_id}
@@ -1043,6 +1016,7 @@ def status_cmd(m):
 📦 Total Users: {total_users}
 ⚡️ Speed: {speed}
 📌 Status: {status}"""
+    
     bot.reply_to(m, status_msg)
 
 # ==================== TOTAL USERS ====================
@@ -1086,6 +1060,7 @@ def edit_slot(m):
     if not ch:
         bot.reply_to(m, "❌ No channels available!", reply_markup=get_admin_kb())
         return
+    
     msg = "Send channel number to edit:\n" + "\n".join([f"{i+1}. {c['name']}" for i, c in enumerate(ch)])
     bot_msg = bot.reply_to(m, msg)
     bot.register_next_step_handler(bot_msg, edit_slot_num)
@@ -1106,6 +1081,7 @@ def save_slot_name(m, idx):
     if m.text.startswith("/") or m.text in ADMIN_BUTTONS:
         bot.send_message(m.chat.id, "❌ Cancelled!", reply_markup=get_admin_kb())
         return
+    
     ch = get_channels()
     if 0 <= idx < len(ch):
         ch[idx]["name"] = m.text
@@ -1121,6 +1097,7 @@ def save_all_slots(m):
     if m.text.startswith("/") or m.text in ADMIN_BUTTONS:
         bot.send_message(m.chat.id, "❌ Cancelled!", reply_markup=get_admin_kb())
         return
+    
     template = m.text
     ch = get_channels()
     for i in range(len(ch)):
@@ -1137,6 +1114,7 @@ def save_verify_text(m):
     if m.text.startswith("/") or m.text in ADMIN_BUTTONS:
         bot.send_message(m.chat.id, "❌ Cancelled!", reply_markup=get_admin_kb())
         return
+    
     cfg = get_config()
     cfg["verify_button_text"] = m.text
     save_config(cfg)
@@ -1223,6 +1201,7 @@ def color_cb(c):
     parts = c.data.split("|")
     action = parts[1]
     color = parts[-1]
+    
     if action == "all_channel":
         for ch in get_channels():
             ch["color"] = color
@@ -1251,17 +1230,18 @@ def color_cb(c):
 # ==================== EMOJI MENU ====================
 @bot.message_handler(func=lambda m: m.text == "EMOJI MENU" and is_admin(m.from_user.id))
 def emoji_menu(m):
-    bot.send_message(m.chat.id, "🔢 EMOJI SETTINGS", reply_markup=get_emoji_menu_kb())
+    bot.send_message(m.chat.id, "🔢 EMOJI SETTINGS\n\nCustomize emoji for buttons:", reply_markup=get_emoji_menu_kb())
 
 @bot.message_handler(func=lambda m: m.text == "🔢 SET ALL CH EMOJI" and is_admin(m.from_user.id))
 def set_all_ch_emoji(m):
-    msg = bot.reply_to(m, "Send custom emoji ID for ALL channel buttons:\n\nSend '0' to reset.")
+    msg = bot.reply_to(m, "Send custom emoji ID for ALL channel buttons:\n\n(Telegram custom emoji ID - like 6136464120779638846)\n\nSend '0' to reset to default.")
     bot.register_next_step_handler(msg, save_all_ch_emoji)
 
 def save_all_ch_emoji(m):
     if m.text.startswith("/") or m.text in ADMIN_BUTTONS:
         bot.send_message(m.chat.id, "❌ Cancelled!", reply_markup=get_emoji_menu_kb())
         return
+    
     emoji_id = m.text.strip()
     if emoji_id == "0":
         emoji_id = DEFAULT_JOIN_EMOJI_ID
@@ -1271,21 +1251,23 @@ def save_all_ch_emoji(m):
             int(emoji_id)
             bot.reply_to(m, f"✅ All channel emoji set to: {emoji_id}", reply_markup=get_emoji_menu_kb())
         except:
-            bot.reply_to(m, "❌ Invalid emoji ID!", reply_markup=get_emoji_menu_kb())
+            bot.reply_to(m, "❌ Invalid emoji ID! Please send a number.", reply_markup=get_emoji_menu_kb())
             return
+    
     cfg = get_config()
     cfg["channel_emoji_id"] = emoji_id
     save_config(cfg)
 
 @bot.message_handler(func=lambda m: m.text == "🔢 SET VERIFY EMOJI" and is_admin(m.from_user.id))
 def set_verify_emoji(m):
-    msg = bot.reply_to(m, "Send custom emoji ID for VERIFY button:\n\nSend '0' to reset.")
+    msg = bot.reply_to(m, "Send custom emoji ID for VERIFY button:\n\n(Telegram custom emoji ID - like 5809972320529293335)\n\nSend '0' to reset to default.")
     bot.register_next_step_handler(msg, save_verify_emoji)
 
 def save_verify_emoji(m):
     if m.text.startswith("/") or m.text in ADMIN_BUTTONS:
         bot.send_message(m.chat.id, "❌ Cancelled!", reply_markup=get_emoji_menu_kb())
         return
+    
     emoji_id = m.text.strip()
     if emoji_id == "0":
         emoji_id = DEFAULT_CHECK_EMOJI_ID
@@ -1295,8 +1277,9 @@ def save_verify_emoji(m):
             int(emoji_id)
             bot.reply_to(m, f"✅ Verify emoji set to: {emoji_id}", reply_markup=get_emoji_menu_kb())
         except:
-            bot.reply_to(m, "❌ Invalid emoji ID!", reply_markup=get_emoji_menu_kb())
+            bot.reply_to(m, "❌ Invalid emoji ID! Please send a number.", reply_markup=get_emoji_menu_kb())
             return
+    
     cfg = get_config()
     cfg["verify_emoji_id"] = emoji_id
     save_config(cfg)
@@ -1309,23 +1292,23 @@ def remove_emoji(m):
         InlineKeyboardButton("🗑 VERIFY EMOJI", callback_data="remove_verify_emoji", style="danger")
     )
     kb.add(InlineKeyboardButton("🔙 BACK", callback_data="remove_emoji_back", style="primary"))
-    bot.send_message(m.chat.id, "🗑 REMOVE EMOJI", reply_markup=kb)
+    bot.send_message(m.chat.id, "🗑 REMOVE EMOJI\n\nSelect which emoji to remove:", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data == "remove_ch_emoji")
 def remove_ch_emoji_cb(c):
     cfg = get_config()
     cfg["channel_emoji_id"] = INVISIBLE_EMOJI_ID
     save_config(cfg)
-    bot.answer_callback_query(c.id, "✅ Channel emoji removed!")
-    bot.edit_message_text("✅ Channel emoji set to invisible!", c.message.chat.id, c.message.message_id)
+    bot.answer_callback_query(c.id, "✅ Channel emoji removed! (Invisible)")
+    bot.edit_message_text("✅ Channel emoji set to invisible!\n\nButton pe emoji nahi dikhega.", c.message.chat.id, c.message.message_id)
 
 @bot.callback_query_handler(func=lambda c: c.data == "remove_verify_emoji")
 def remove_verify_emoji_cb(c):
     cfg = get_config()
     cfg["verify_emoji_id"] = INVISIBLE_EMOJI_ID
     save_config(cfg)
-    bot.answer_callback_query(c.id, "✅ Verify emoji removed!")
-    bot.edit_message_text("✅ Verify emoji set to invisible!", c.message.chat.id, c.message.message_id)
+    bot.answer_callback_query(c.id, "✅ Verify emoji removed! (Invisible)")
+    bot.edit_message_text("✅ Verify emoji set to invisible!\n\nButton pe emoji nahi dikhega.", c.message.chat.id, c.message.message_id)
 
 @bot.callback_query_handler(func=lambda c: c.data == "remove_emoji_back")
 def remove_emoji_back_cb(c):
@@ -1352,28 +1335,92 @@ def admins_menu_cb(c):
     bot.edit_message_text("👑 ADMIN MANAGEMENT", c.message.chat.id, c.message.message_id, reply_markup=get_admins_menu())
 
 # =====================================================================
+# ==================== EMERGENCY BACKUP ON SIGNAL =====================
+# =====================================================================
+
+def emergency_backup_and_notify():
+    """
+    Suspend / stop hone par 0.5-1 sec mein zip backup owner ko bhejega.
+    """
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_name = f"emergency_backup_{timestamp}.zip"
+        
+        # Zip file banayein (sirf JSON file daalein)
+        with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(DATABASE_FILE, arcname="bot_data.json")
+        
+        # Owner ko bhejein
+        with open(zip_name, 'rb') as f:
+            bot.send_document(
+                ADMIN_ID,
+                f,
+                caption=f"🚨 EMERGENCY BACKUP\nTime: {timestamp}\nBot is stopping!"
+            )
+        bot.send_message(ADMIN_ID, "⚠️ Bot shutdown. Backup sent.")
+        
+        # Zip file hatao
+        os.remove(zip_name)
+    except Exception as e:
+        print(f"Emergency backup failed: {e}")
+        # Agar send na ho toh local backup rakh lo
+        try:
+            shutil.copy2(DATABASE_FILE, f"emergency_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        except:
+            pass
+
+def signal_handler(sig, frame):
+    print(f"Signal {sig} received. Creating emergency backup...")
+    emergency_backup_and_notify()
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+# =====================================================================
+# ==================== PERIODIC BACKUP THREAD ========================
+# =====================================================================
+
+def periodic_backup_task():
+    while True:
+        time.sleep(10 * 60)  # 10 minute
+        try:
+            backup_database()   # existing function
+            print(f"Periodic backup done at {datetime.now()}")
+        except Exception as e:
+            print(f"Periodic backup error: {e}")
+
+# Start periodic backup thread (daemon)
+threading.Thread(target=periodic_backup_task, daemon=True).start()
+
+# =====================================================================
 # ==================== MAIN LOOP ======================================
 # =====================================================================
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🤖 BOT STARTED (ULTRA FAST - WITH EMAIL BACKUP)")
+    print("🤖 BOT STARTED (ULTRA FAST - WITH BROADCAST + EMERGENCY BACKUP)")
     print(f"Users: {len(get_users())} | Channels: {len(get_channels())}")
     print("=" * 60)
-    print("🚨 Emergency backup on SIGTERM/SIGINT -> Telegram + Email")
-    print("📧 Gmail configured for backup alerts.")
-    print("👑 Admins will NOT receive backup/suspend messages.")
+    print("🔥 Emoji IDs: (number) -> premium emoji")
+    print("📌 BOT OFF - /start silent (koi reply nahi)")
+    print("📢 BROADCAST - /broadcast reply to any message")
+    print("📊 STATUS - /status to check broadcast progress")
+    print("🚨 EMERGENCY BACKUP - On SIGTERM/SIGINT (suspend/stop)")
     print("=" * 60)
     
     try:
-        bot.send_message(ADMIN_ID, f"✅ BOT STARTED\nUsers: {len(get_users())}\n\n🚨 Emergency backup will be sent to Telegram AND Email on suspend.")
+        bot.send_message(ADMIN_ID, f"✅ BOT STARTED (ULTRA FAST)\nUsers: {len(get_users())}\n\n🔥 (number) -> premium emoji\n📢 Broadcast: /broadcast reply\n📊 Status: /status\n🚨 Emergency backup enabled.")
     except:
         pass
     
+    # Polling loop with exception handling
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=30)
         except Exception as e:
             print(f"Polling error: {e}")
+            # agar polling crash ho toh backup bhej dein
             emergency_backup_and_notify()
             time.sleep(10)
