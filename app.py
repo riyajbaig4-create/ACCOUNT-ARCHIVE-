@@ -10,7 +10,6 @@ import re
 import requests
 import threading
 import json
-import io
 from datetime import datetime
 from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -29,23 +28,12 @@ STARTUP_PRIORITY = ['app.py', 'main.py', 'server.py', 'run.py', 'manage.py', 'in
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
-os.makedirs(os.path.join(UPLOAD_FOLDER, 'source_zips'), exist_ok=True)
 
 # ---------- Database ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
-def migrate_db():
-    """Add new columns if they don't exist."""
-    with get_db() as conn:
-        cur = conn.execute("PRAGMA table_info(websites)")
-        columns = [row[1] for row in cur.fetchall()]
-        for col in ['source_type', 'source_data', 'retry_count', 'auto_retry']:
-            if col not in columns:
-                conn.execute(f'ALTER TABLE websites ADD COLUMN {col} TEXT' if col != 'retry_count' else f'ALTER TABLE websites ADD COLUMN {col} INTEGER DEFAULT 0')
-        conn.commit()
 
 def init_db():
     with get_db() as conn:
@@ -88,10 +76,6 @@ def init_db():
             branch TEXT DEFAULT 'main',
             deployment_type TEXT DEFAULT 'zip',
             auto_start BOOLEAN DEFAULT 0,
-            source_type TEXT,
-            source_data TEXT,
-            retry_count INTEGER DEFAULT 0,
-            auto_retry INTEGER DEFAULT 0,
             FOREIGN KEY (owner_id) REFERENCES users (id)
         )''')
         conn.execute('''CREATE TABLE IF NOT EXISTS logs (
@@ -132,7 +116,6 @@ def init_db():
                          ('admin', 'admin@hosting.com', generate_password_hash('admin123'), 'admin', 'pro'))
             conn.commit()
             print("✅ Default admin: admin / admin123 (Pro plan)")
-    migrate_db()
 init_db()
 
 # ---------- Helpers ----------
@@ -233,16 +216,8 @@ def find_startup_file(folder):
             return filename
     return None
 
-def detect_runtime_and_get_cmd(folder, port, website_id=None):
+def detect_runtime_and_get_cmd(folder, port):
     """Detect runtime and return (cmd, runtime, env)."""
-    # Override with manual command if set
-    if website_id:
-        website = get_website_by_id(website_id)
-        if website and website.get('start_cmd'):
-            cmd_str = website['start_cmd']
-            cmd_str = cmd_str.replace('$PORT', str(port))
-            cmd = cmd_str.split()
-            return cmd, 'manual', {}
     # ----- Node.js (with package.json) -----
     if os.path.exists(os.path.join(folder, 'package.json')):
         try:
@@ -252,6 +227,7 @@ def detect_runtime_and_get_cmd(folder, port, website_id=None):
                 if 'start' in scripts:
                     cmd = ['npm', 'start']
                 else:
+                    # try common entry files
                     entry = None
                     for fname in ['server.js', 'index.js', 'app.js', 'main.js']:
                         if os.path.exists(os.path.join(folder, fname)):
@@ -265,23 +241,29 @@ def detect_runtime_and_get_cmd(folder, port, website_id=None):
                     return cmd, 'nodejs', {'NODE_ENV': 'production', 'PORT': str(port)}
         except:
             pass
-    # ----- Node.js (without package.json) -----
+    
+    # ----- Node.js (without package.json) – look for common JS files -----
     js_files = ['server.js', 'index.js', 'app.js', 'main.js']
     for fname in js_files:
         if os.path.exists(os.path.join(folder, fname)):
             return ['node', fname], 'nodejs', {'PORT': str(port)}
+    
+    # ----- If still no JS found, scan for any .js file in root (fallback) -----
     try:
         for f in os.listdir(folder):
             if f.endswith('.js') and os.path.isfile(os.path.join(folder, f)):
                 return ['node', f], 'nodejs', {'PORT': str(port)}
     except:
         pass
+    
     # ----- PHP -----
     if os.path.exists(os.path.join(folder, 'index.php')):
         return ['php', '-S', f'0.0.0.0:{port}'], 'php', {}
+    
     # ----- Go -----
     if os.path.exists(os.path.join(folder, 'go.mod')):
         return ['go', 'run', 'main.go'], 'go', {}
+    
     # ----- Java -----
     if os.path.exists(os.path.join(folder, 'pom.xml')):
         return ['mvn', 'spring-boot:run'], 'java', {}
@@ -290,6 +272,7 @@ def detect_runtime_and_get_cmd(folder, port, website_id=None):
     jars = [f for f in os.listdir(folder) if f.endswith('.jar')]
     if jars:
         return ['java', '-jar', jars[0]], 'java', {}
+    
     # ----- Python Flask/Django -----
     flask_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
     for f in flask_files:
@@ -306,45 +289,14 @@ def detect_runtime_and_get_cmd(folder, port, website_id=None):
         return [sys.executable, 'manage.py', 'runserver', f'0.0.0.0:{port}'], 'django', {}
     if os.path.exists(os.path.join(folder, 'asgi.py')):
         return ['uvicorn', 'asgi:application', '--host', '0.0.0.0', '--port', str(port)], 'fastapi', {}
-    # ----- Gunicorn detection (improved) -----
-    req_file = os.path.join(folder, 'requirements.txt')
-    if os.path.exists(req_file):
-        with open(req_file, 'r') as f:
-            if 'gunicorn' in f.read():
-                wsgi_app = None
-                for root, dirs, files in os.walk(folder):
-                    for file in files:
-                        if file.endswith('.py') and not file.startswith('__'):
-                            file_path = os.path.join(root, file)
-                            try:
-                                with open(file_path, 'r', errors='ignore') as fh:
-                                    content = fh.read()
-                                    import re
-                                    match = re.search(r'(app|application)\s*=\s*(?:Flask|Django|FastAPI|create_app)\s*\(', content)
-                                    if match:
-                                        var_name = match.group(1)
-                                        rel_path = os.path.relpath(file_path, folder)
-                                        if rel_path.endswith('.py'):
-                                            module_name = rel_path[:-3].replace(os.sep, '.')
-                                            wsgi_app = f"{module_name}:{var_name}"
-                                            break
-                            except:
-                                continue
-                    if wsgi_app:
-                        break
-                if not wsgi_app:
-                    for f in ['app.py', 'wsgi.py', 'application.py']:
-                        if os.path.exists(os.path.join(folder, f)):
-                            wsgi_app = f"{f[:-3]}:app"
-                            break
-                if wsgi_app:
-                    return ['gunicorn', '--bind', f'0.0.0.0:{port}', wsgi_app], 'gunicorn', {}
-    # ----- Fallback -----
     startup = find_startup_file(folder)
     if startup:
         return [sys.executable, startup], 'python', {}
+    
+    # ----- Static -----
     if os.path.exists(os.path.join(folder, 'index.html')):
         return [sys.executable, '-m', 'http.server', str(port)], 'static', {}
+    
     return None, None, {}
 
 # ---------- Install Dependencies ----------
@@ -381,7 +333,8 @@ def install_dependencies(folder, runtime, log_callback=None):
             except:
                 pass
             return True, "Dependencies installed"
-        return True, "No dependencies"
+        # If no package.json, nothing to install
+        return True, "No dependencies to install (no package.json)"
     elif runtime == 'php':
         if os.path.exists(os.path.join(folder, 'composer.json')):
             cmd = ['composer', 'install']
@@ -428,6 +381,7 @@ def install_dependencies(folder, runtime, log_callback=None):
             return True, "Build successful"
         return True, "No build required"
     else:
+        # Python - requirements.txt
         req_file = os.path.join(folder, 'requirements.txt')
         if os.path.exists(req_file):
             cmd = [sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt']
@@ -447,11 +401,13 @@ def install_dependencies(folder, runtime, log_callback=None):
 
 # ---------- Auto Port Detection & Health Check ----------
 def detect_port_from_log(log_file):
+    """Read log file and try to extract port number from common patterns."""
     if not os.path.exists(log_file):
         return None
     try:
         with open(log_file, 'r') as f:
             content = f.read()
+            # Patterns: listening on port 3000, localhost:3000, port 3000, :::3000, etc.
             patterns = [
                 r'port\s*[:=]\s*(\d+)',
                 r'listening\s+on\s+(\d+)',
@@ -461,8 +417,7 @@ def detect_port_from_log(log_file):
                 r'::\s*:\s*(\d+)',
                 r'port\s+(\d+)',
                 r'http://[^:]+:(\d+)',
-                r':(\d{4,5})',
-                r'Listening at:\s*http://[^:]+:(\d+)',
+                r':(\d{4,5})'  # generic 4-5 digit number
             ]
             for pattern in patterns:
                 matches = re.findall(pattern, content, re.IGNORECASE)
@@ -474,26 +429,19 @@ def detect_port_from_log(log_file):
         pass
     return None
 
-def health_check_on_ports(port_list, max_retries=30, delay=2, log_callback=None):
-    """Try health check on a list of ports with logging."""
-    total_attempts = 0
+def health_check_on_ports(port_list, max_retries=3, delay=2):
+    """Try health check on a list of ports."""
     for port in port_list:
         for attempt in range(max_retries):
-            total_attempts += 1
-            if log_callback:
-                log_callback("CHECK", f"Health check attempt {total_attempts} on port {port}...")
             try:
                 response = requests.get(f"http://localhost:{port}", timeout=3)
                 if response.status_code < 500:
-                    if log_callback:
-                        log_callback("CHECK", f"✅ Port {port} is responding (status {response.status_code})")
                     return True, port, f"OK (port {port})"
                 else:
-                    if log_callback:
-                        log_callback("CHECK", f"⚠️ Port {port} returned status {response.status_code}, retrying...")
-            except Exception as e:
-                if log_callback:
-                    log_callback("CHECK", f"⏳ Port {port} not ready yet ({str(e)[:50]})...")
+                    # If status code >=500, it's a server error, probably not the right port
+                    pass
+            except:
+                pass
             time.sleep(delay)
     return False, None, "Health check failed on all ports"
 
@@ -508,8 +456,9 @@ def start_website_process(website_id, log_callback=None):
         update_website_status(website_id, 'failed')
         return False, "Folder not found"
     
+    # Allocate a port (will be used as primary, but we'll auto-detect)
     allocated_port = get_next_available_port()
-    cmd, runtime, env_extra = detect_runtime_and_get_cmd(folder, allocated_port, website_id=website_id)
+    cmd, runtime, env_extra = detect_runtime_and_get_cmd(folder, allocated_port)
     if not cmd:
         log_website(website_id, "No startup file detected", 'error')
         update_website_status(website_id, 'failed')
@@ -536,6 +485,7 @@ def start_website_process(website_id, log_callback=None):
             env['FLASK_APP'] = 'app.py'
         elif os.path.exists(os.path.join(folder, 'main.py')):
             env['FLASK_APP'] = 'main.py'
+    
     if runtime == 'php':
         cmd = ['php', '-S', f'0.0.0.0:{allocated_port}']
     
@@ -553,7 +503,6 @@ def start_website_process(website_id, log_callback=None):
             proc = subprocess.Popen(cmd, cwd=folder, env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     preexec_fn=os.setsid)
-        
         def read_output():
             for line in iter(proc.stdout.readline, b''):
                 if line:
@@ -567,32 +516,41 @@ def start_website_process(website_id, log_callback=None):
         thread.daemon = True
         thread.start()
         
-        if log_callback:
-            log_callback("WAIT", "⏳ Waiting 60 seconds for application to start...")
-        time.sleep(60)
-        
+        # Wait a bit for process to start and write logs
+        time.sleep(3)
         if proc.poll() is not None:
             with open(log_file, 'r') as f:
                 error_lines = f.read()[-500:]
             update_website_status(website_id, 'failed')
-            log_website(website_id, f"Process crashed: {error_lines}", 'error')
+            log_website(website_id, f"Process crashed immediately: {error_lines}", 'error')
             if log_callback:
-                log_callback("ERROR", f"❌ Process crashed: {error_lines}")
+                log_callback("ERROR", f"Process crashed: {error_lines}")
             return False, f"Process crashed: {error_lines}"
         
+        # Auto-detect port from log
         detected_port = detect_port_from_log(log_file)
+        if detected_port:
+            if log_callback:
+                log_callback("PORT", f"Detected application using port {detected_port} from logs")
+        else:
+            if log_callback:
+                log_callback("PORT", "Could not detect port from logs, will try common ports")
+        
+        # Build list of ports to try
         ports_to_try = []
         if detected_port:
             ports_to_try.append(detected_port)
-            if log_callback:
-                log_callback("PORT", f"🔍 Detected port {detected_port} from logs")
+        # Always try the allocated port
         ports_to_try.append(allocated_port)
-        for p in [3000, 8080, 5000, 8000, 8081, 3001, 10000, 8001]:
+        # Common default ports
+        for p in [3000, 8080, 5000, 8000, 8081, 3001]:
             if p not in ports_to_try:
                 ports_to_try.append(p)
         
-        healthy, actual_port, health_msg = health_check_on_ports(ports_to_try, max_retries=30, delay=2, log_callback=log_callback)
+        # Health check
+        healthy, actual_port, health_msg = health_check_on_ports(ports_to_try, max_retries=5, delay=2)
         if healthy:
+            # Update database with actual port
             update_website_status(website_id, 'running', proc.pid, actual_port)
             log_website(website_id, f"Started on port {actual_port} (PID {proc.pid})")
             with get_db() as conn:
@@ -600,9 +558,10 @@ def start_website_process(website_id, log_callback=None):
                              (cmd[0] if not runtime.startswith('python') else 'app', website_id))
                 conn.commit()
             if log_callback:
-                log_callback("SUCCESS", f"✅ Application running on port {actual_port}")
+                log_callback("SUCCESS", f"Application running on port {actual_port}")
             return True, f"Running on port {actual_port}"
         else:
+            # Health check failed - kill process
             try:
                 if os.name == 'nt':
                     subprocess.run(['taskkill', '/PID', str(proc.pid), '/F'], capture_output=True)
@@ -618,7 +577,7 @@ def start_website_process(website_id, log_callback=None):
                     error_log = ''.join(lines[-20:]) if lines else ""
             log_website(website_id, f"Health check failed: {health_msg}", 'error')
             if log_callback:
-                log_callback("ERROR", f"❌ Health check failed: {health_msg}")
+                log_callback("ERROR", f"Health check failed: {health_msg}")
                 if error_log:
                     log_callback("ERROR", f"Last log lines:\n{error_log}")
             return False, f"Health check failed: {health_msg}\n{error_log}"
@@ -626,7 +585,7 @@ def start_website_process(website_id, log_callback=None):
         log_website(website_id, f"Start error: {str(e)}", 'error')
         update_website_status(website_id, 'failed')
         if log_callback:
-            log_callback("ERROR", f"❌ Start error: {str(e)}")
+            log_callback("ERROR", f"Start error: {str(e)}")
         return False, str(e)
 
 # ---------- Stop Process ----------
@@ -650,25 +609,6 @@ def stop_website_process(website_id):
     log_website(website_id, f"Stopped (PID {pid})")
     return True, "Stopped"
 
-# ---------- Internal delete (without session check) ----------
-def delete_website_internal(website_id):
-    website = get_website_by_id(website_id)
-    if not website:
-        return
-    if website['status'] in ['running', 'starting']:
-        stop_website_process(website_id)
-    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
-    shutil.rmtree(folder, ignore_errors=True)
-    for f in [f"website_{website_id}.log", f"website_{website_id}_install.log"]:
-        fp = os.path.join(LOG_FOLDER, f)
-        if os.path.exists(fp):
-            os.remove(fp)
-    with get_db() as conn:
-        conn.execute('DELETE FROM websites WHERE id = ?', (website_id,))
-        conn.execute('DELETE FROM logs WHERE website_id = ?', (website_id,))
-        conn.execute('DELETE FROM deployments WHERE website_id = ?', (website_id,))
-        conn.commit()
-
 # ---------- Deployment Core (ZIP & GitHub) ----------
 def write_log_step(log_file, step, message):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -677,6 +617,7 @@ def write_log_step(log_file, step, message):
         f.write(line)
     return line
 
+# 🔥 CHANGE: deploy_zip now handles missing ZIP gracefully
 def deploy_zip(website_id, extra_files=None):
     try:
         website = get_website_by_id(website_id)
@@ -694,36 +635,30 @@ def deploy_zip(website_id, extra_files=None):
         def log_cb(step, msg):
             write_log_step(log_file, step, msg)
             log_website(website_id, f"[{step}] {msg}", 'info')
-        log_cb("SYSTEM", "==> Extracting ZIP...")
+        log_cb("SYSTEM", "==> Checking for ZIP file...")
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('extracting', deployment_id))
             conn.commit()
         folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
         zip_path = os.path.join(folder, 'upload.zip')
-        if not os.path.exists(zip_path):
-            log_cb("ERROR", "ZIP file not found")
-            with get_db() as conn:
-                conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
-                             ('failed', deployment_id))
-                conn.commit()
-            return
-        ok, msg = extract_zip(zip_path, folder)
-        if not ok:
-            log_cb("ERROR", f"Extraction failed: {msg}")
-            with get_db() as conn:
-                conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
-                             ('failed', deployment_id))
-                conn.commit()
-            return
-        os.remove(zip_path)
-        log_cb("SUCCESS", "ZIP extracted successfully")
-        if extra_files:
-            log_cb("SYSTEM", "Copying extra files...")
-            for (filename, content) in extra_files:
-                path = os.path.join(folder, secure_filename(filename))
-                with open(path, 'wb') as f:
-                    f.write(content)
-                log_cb("FILE", f"Added {filename}")
+        
+        # 🔥 If ZIP exists, extract it; otherwise skip.
+        if os.path.exists(zip_path):
+            log_cb("SYSTEM", "ZIP found, extracting...")
+            ok, msg = extract_zip(zip_path, folder)
+            if not ok:
+                log_cb("ERROR", f"Extraction failed: {msg}")
+                with get_db() as conn:
+                    conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?',
+                                 ('failed', deployment_id))
+                    conn.commit()
+                return
+            os.remove(zip_path)
+            log_cb("SUCCESS", "ZIP extracted successfully")
+        else:
+            log_cb("SYSTEM", "No ZIP file found, using uploaded files directly")
+        
+        # extra_files are already saved during upload, nothing to do here.
         size_used = calculate_folder_size(folder)
         with get_db() as conn:
             conn.execute('UPDATE websites SET storage_used = ?, website_size = ? WHERE id = ?',
@@ -746,53 +681,6 @@ def deploy_zip(website_id, extra_files=None):
                              ('failed', deployment_id))
                 conn.commit()
             log_cb("ERROR", f"Deployment failed: {msg}")
-
-            # ---- AUTO-RETRY: ONLY FOR WEBSITE ID = 1 ----
-            if website_id == 1:
-                # Check retry count
-                w = get_website_by_id(website_id)
-                if w and w['retry_count'] == 0 and w['source_type'] == 'zip':
-                    log_cb("RETRY", "🚀 Auto-retry triggered for first website (ID=1).")
-                    # Increment retry
-                    with get_db() as conn:
-                        conn.execute('UPDATE websites SET retry_count = 1 WHERE id = ?', (website_id,))
-                        conn.commit()
-                    # Save source data
-                    source_data = w['source_data']
-                    if source_data and os.path.exists(source_data):
-                        # Get owner
-                        owner_id = w['owner_id']
-                        # Delete current website
-                        delete_website_internal(website_id)
-                        # Create new website with same source
-                        slug = generate_website_slug('admin', 0)  # use admin as fallback, but we should use the username
-                        user = get_user_by_id(owner_id)
-                        if user:
-                            slug = generate_website_slug(user['username'], 0)
-                        # Ensure uniqueness
-                        if get_website_by_slug(slug):
-                            count = 1
-                            while get_website_by_slug(f"{user['username']}{count}"):
-                                count += 1
-                            slug = f"{user['username']}{count}"
-                        with get_db() as conn:
-                            cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, deployment_type, source_type, source_data, retry_count)
-                                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                                               (owner_id, slug, f"website_{0}", 'queued', 'zip', 'zip', source_data, 1))
-                            new_website_id = cur.lastrowid
-                            conn.commit()
-                        # Copy zip to new folder
-                        new_folder = os.path.join(UPLOAD_FOLDER, f"website_{new_website_id}")
-                        os.makedirs(new_folder, exist_ok=True)
-                        shutil.copy2(source_data, os.path.join(new_folder, 'upload.zip'))
-                        # Trigger new deploy
-                        log_cb("RETRY", f"🔄 New website {new_website_id} created. Deploying again...")
-                        threading.Thread(target=deploy_zip, args=(new_website_id,), kwargs={'extra_files': []}).start()
-                        return  # stop current deployment
-                    else:
-                        log_cb("RETRY", "❌ Source zip not found, cannot retry.")
-                else:
-                    log_cb("RETRY", "Retry not allowed (not ID=1, retry_count>0, or source missing).")
     except Exception as e:
         log_website(website_id, f"Deployment exception: {str(e)}", 'error')
         with get_db() as conn:
@@ -860,35 +748,6 @@ def deploy_github(website_id, repo_url, branch):
                              ('failed', deployment_id))
                 conn.commit()
             log_cb("ERROR", f"Deployment failed: {msg}")
-            # Auto-retry for github as well (only if ID=1)
-            if website_id == 1:
-                w = get_website_by_id(website_id)
-                if w and w['retry_count'] == 0 and w['source_type'] == 'github':
-                    log_cb("RETRY", "🚀 Auto-retry triggered for first website (ID=1) GitHub.")
-                    with get_db() as conn:
-                        conn.execute('UPDATE websites SET retry_count = 1 WHERE id = ?', (website_id,))
-                        conn.commit()
-                    owner_id = w['owner_id']
-                    repo = w['repo_url']
-                    br = w['branch']
-                    delete_website_internal(website_id)
-                    user = get_user_by_id(owner_id)
-                    if user:
-                        slug = generate_website_slug(user['username'], 0)
-                        if get_website_by_slug(slug):
-                            count = 1
-                            while get_website_by_slug(f"{user['username']}{count}"):
-                                count += 1
-                            slug = f"{user['username']}{count}"
-                        with get_db() as conn:
-                            cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, deployment_type, source_type, source_data, retry_count, repo_url, branch)
-                                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                                               (owner_id, slug, f"website_{0}", 'queued', 'github', 'github', repo, 1, repo, br))
-                            new_website_id = cur.lastrowid
-                            conn.commit()
-                        log_cb("RETRY", f"🔄 New website {new_website_id} created. Deploying again...")
-                        threading.Thread(target=deploy_github, args=(new_website_id, repo, br)).start()
-                        return
     except Exception as e:
         log_website(website_id, f"Deployment exception: {str(e)}", 'error')
         with get_db() as conn:
@@ -1014,7 +873,7 @@ def dashboard():
                                   base_url=base_url,
                                   user_obj=user)
 
-# ---------- Upload (ZIP + extra files) with single-file support ----------
+# 🔥 CHANGE: /upload now accepts any files, ZIP is optional
 @app.route('/upload', methods=['POST'])
 def upload_website():
     if 'user_id' not in session:
@@ -1028,8 +887,7 @@ def upload_website():
     files = request.files.getlist('files[]')
     if not files or all(f.filename == '' for f in files):
         return jsonify({'success': False, 'error': 'No valid files'}), 400
-    
-    # Check if any is a zip
+
     zip_file = None
     extra_files = []
     for f in files:
@@ -1037,85 +895,63 @@ def upload_website():
             zip_file = f
         else:
             extra_files.append(f)
-    
-    # If no zip, but exactly one file is uploaded, create a zip on the fly
-    if not zip_file and len(files) == 1:
-        # Single file upload: wrap it into a zip
-        single_file = files[0]
-        # Create an in-memory zip
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(single_file.filename, single_file.read())
-        zip_buffer.seek(0)
-        # Save as a temporary zip file
-        temp_zip_path = os.path.join(UPLOAD_FOLDER, f"temp_{int(time.time())}.zip")
-        with open(temp_zip_path, 'wb') as f:
-            f.write(zip_buffer.getvalue())
-        # Then treat it as zip_file
-        # We'll create a file-like object from path
-        from werkzeug.datastructures import FileStorage
-        zip_file = FileStorage(
-            stream=open(temp_zip_path, 'rb'),
-            filename=f"{secure_filename(single_file.filename)}.zip",
-            content_type='application/zip'
-        )
-        extra_files = []  # no extra files now
-    
-    if not zip_file:
-        return jsonify({'success': False, 'error': 'A ZIP file or a single file is required'}), 400
-    
-    # Continue with normal upload process
+
+    # 🔥 ZIP is no longer required; we proceed with whatever we have
     with get_db() as conn:
         count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ?', (user_id,)).fetchone()[0]
     slug = generate_website_slug(session['username'], count)
     if get_website_by_slug(slug):
         count += 1
         slug = generate_website_slug(session['username'], count)
+
     with get_db() as conn:
         cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, deployment_type)
                               VALUES (?, ?, ?, ?, ?)''',
                            (user_id, slug, f"website_{0}", 'uploaded', 'zip'))
         website_id = cur.lastrowid
         conn.commit()
+
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     try:
         os.makedirs(folder, exist_ok=True)
     except PermissionError:
         rollback_upload(website_id, folder)
         return jsonify({'success': False, 'error': 'Permission denied'}), 500
-    zip_path = os.path.join(folder, 'upload.zip')
-    try:
-        zip_file.save(zip_path)
-    except Exception as e:
-        rollback_upload(website_id, folder)
-        return jsonify({'success': False, 'error': f'Failed to save zip: {str(e)}'}), 500
-    valid, msg = validate_zip(zip_path)
-    if not valid:
-        rollback_upload(website_id, folder)
-        return jsonify({'success': False, 'error': msg}), 400
-    
-    # Save source zip permanently for auto-retry
-    source_dir = os.path.join(UPLOAD_FOLDER, 'source_zips')
-    os.makedirs(source_dir, exist_ok=True)
-    source_zip_path = os.path.join(source_dir, f"{website_id}.zip")
-    shutil.copy2(zip_path, source_zip_path)
-    with get_db() as conn:
-        conn.execute('UPDATE websites SET source_type = ?, source_data = ? WHERE id = ?',
-                     ('zip', source_zip_path, website_id))
-        conn.commit()
-    
-    extra_data = []
+
+    # Save ZIP if present
+    if zip_file:
+        zip_path = os.path.join(folder, 'upload.zip')
+        try:
+            zip_file.save(zip_path)
+        except Exception as e:
+            rollback_upload(website_id, folder)
+            return jsonify({'success': False, 'error': f'Failed to save zip: {str(e)}'}), 500
+        valid, msg = validate_zip(zip_path)
+        if not valid:
+            rollback_upload(website_id, folder)
+            return jsonify({'success': False, 'error': msg}), 400
+
+    # Save all extra files directly into the folder
     for f in extra_files:
         f.seek(0)
-        data = f.read()
-        extra_data.append((f.filename, data))
+        filename = secure_filename(f.filename)
+        save_path = os.path.join(folder, filename)
+        try:
+            f.save(save_path)
+        except Exception as e:
+            rollback_upload(website_id, folder)
+            return jsonify({'success': False, 'error': f'Failed to save file {filename}: {str(e)}'}), 500
+
+    # Fire background deployment (ZIP extraction if exists, else just start)
     def bg_deploy():
-        deploy_zip(website_id, extra_data)
+        deploy_zip(website_id)
+
     thread = threading.Thread(target=bg_deploy)
     thread.daemon = True
     thread.start()
-    log_website(website_id, f"Uploaded: {zip_file.filename} + {len(extra_files)} extra files")
-    log_activity(user_id, 'upload', f'Uploaded {zip_file.filename}', request.remote_addr)
+
+    log_website(website_id, f"Uploaded: {len(files)} file(s)")
+    log_activity(user_id, 'upload', f'Uploaded {len(files)} files', request.remote_addr)
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
 # ---------- GitHub Deploy ----------
@@ -1135,9 +971,9 @@ def github_deploy():
         count += 1
         slug = generate_website_slug(session['username'], count)
     with get_db() as conn:
-        cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, deployment_type, repo_url, branch, source_type, source_data)
-                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                           (user_id, slug, f"website_{0}", 'queued', 'github', repo_url, branch, 'github', repo_url))
+        cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, deployment_type, repo_url, branch)
+                              VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                           (user_id, slug, f"website_{0}", 'queued', 'github', repo_url, branch))
         website_id = cur.lastrowid
         conn.commit()
     def bg_deploy():
@@ -1289,7 +1125,19 @@ def delete_website(website_id):
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
             return jsonify({'success': False, 'error': 'Not found'}), 404
-    delete_website_internal(website_id)
+    if website['status'] in ['running', 'starting']:
+        stop_website_process(website_id)
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    shutil.rmtree(folder, ignore_errors=True)
+    for f in [f"website_{website_id}.log", f"website_{website_id}_install.log"]:
+        fp = os.path.join(LOG_FOLDER, f)
+        if os.path.exists(fp):
+            os.remove(fp)
+    with get_db() as conn:
+        conn.execute('DELETE FROM websites WHERE id = ?', (website_id,))
+        conn.execute('DELETE FROM logs WHERE website_id = ?', (website_id,))
+        conn.execute('DELETE FROM deployments WHERE website_id = ?', (website_id,))
+        conn.commit()
     log_activity(session['user_id'], 'delete', f'Deleted website {website_id}', request.remote_addr)
     return jsonify({'success': True})
 
@@ -1821,6 +1669,7 @@ REGISTER_TEMPLATE = """
 </html>
 """
 
+# 🔥 CHANGE: Updated dashboard template with new upload hint
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -1932,9 +1781,9 @@ body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-
 </div>
 </div>
 
-<!-- Upload ZIP -->
+<!-- Upload ZIP or individual files -->
 <div class="upload-box" id="dropZone">
-<h3>📤 Upload Website (ZIP + extra files)</h3>
+<h3>📤 Upload Website (ZIP or individual files)</h3>
 <p style="color:#889;font-size:0.9rem;margin-bottom:10px;">Drag & drop files here or click to select</p>
 <input type="file" id="zipFile" multiple accept=".zip,.py,.txt,.html,.js,.css,application/zip">
 <button class="btn" id="uploadBtn" style="margin-top:10px;">Upload & Deploy</button>
@@ -2028,7 +1877,7 @@ body:'name='+encodeURIComponent(val)
 // Upload
 document.getElementById('uploadBtn').onclick=function(){
 const files = document.getElementById('zipFile').files;
-if(!files.length)return alert('Select at least one file (ZIP or single file)');
+if(!files.length)return alert('Select at least one file (ZIP or individual)');
 const fd = new FormData();
 for(let f of files){ fd.append('files[]', f); }
 const st = document.getElementById('uploadStatus');
