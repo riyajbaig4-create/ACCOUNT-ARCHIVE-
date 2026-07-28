@@ -15,11 +15,21 @@ import zipfile
 import signal
 import sys
 import tempfile
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
 from datetime import datetime, timedelta
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, LinkPreviewOptions
 
+# ==================== GMAIL SETTINGS ====================
+GMAIL_USER = "your_email@gmail.com"               # <-- CHANGE THIS
+GMAIL_APP_PASSWORD = "abcd efgh ijkl mnop"        # <-- CHANGE THIS (App Password)
+GMAIL_RECIPIENT = "recipient_email@gmail.com"     # <-- CHANGE THIS
+
 # ==================== TOKEN & ADMIN ====================
-BOT_TOKEN = "8863815341:AAE84_lahzbog6iDwVzGar7atW7ObzSuxB8"
+BOT_TOKEN = "8988256659:AAFaMuwPS9gjGNEY29dNPo1hg0h94ftkDeU"
 ADMIN_ID = 5674825926
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=10)
 
@@ -213,17 +223,73 @@ def get_user_username(uid):
     except:
         return ""
 
+# ==================== MODIFIED backup_database() ====================
 def backup_database():
     if not os.path.exists(BACKUP_FOLDER):
         os.makedirs(BACKUP_FOLDER)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_file = os.path.join(BACKUP_FOLDER, f"bot_data_{timestamp}.json")
     shutil.copy2(DATABASE_FILE, backup_file)
+    
+    # सिर्फ 2 latest files रखो, बाकी हटाओ
+    files = [f for f in os.listdir(BACKUP_FOLDER) if f.startswith("bot_data_") and f.endswith(".json")]
+    files.sort(reverse=True)
+    for f in files[2:]:
+        os.remove(os.path.join(BACKUP_FOLDER, f))
+    
+    # Owner को Telegram भेजो (admins को नहीं)
     try:
         with open(backup_file, 'rb') as f:
             bot.send_document(ADMIN_ID, f, caption=f"📦 Backup {timestamp}")
     except:
         pass
+
+# ==================== EMAIL FUNCTION ====================
+def send_email_alert(subject, body, attachment_path=None):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = GMAIL_USER
+        msg['To'] = GMAIL_RECIPIENT
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        if attachment_path and os.path.exists(attachment_path):
+            with open(attachment_path, "rb") as f:
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header('Content-Disposition', f'attachment; filename="{os.path.basename(attachment_path)}"')
+                msg.attach(part)
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+    except Exception as e:
+        print(f"Email send failed: {e}")
+
+# ==================== MODIFIED emergency_backup_and_notify() ====================
+def emergency_backup_and_notify():
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_name = f"emergency_backup_{timestamp}.zip"
+        with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(DATABASE_FILE, arcname="bot_data.json")
+        
+        # Telegram – sirf owner ko
+        with open(zip_name, 'rb') as f:
+            bot.send_document(ADMIN_ID, f, caption=f"🚨 EMERGENCY BACKUP\nTime: {timestamp}")
+        bot.send_message(ADMIN_ID, "⚠️ Bot shutdown. Backup sent on Telegram & Email.")
+        
+        # Gmail – attachment ke saath
+        subject = f"🚨 BOT SUSPENDED/SHUTDOWN - {timestamp}"
+        body = f"Bot suspend/stop ho gaya.\nTime: {timestamp}\nTotal Users: {len(get_users())}\nZip attached."
+        send_email_alert(subject, body, zip_name)
+        
+        os.remove(zip_name)
+    except Exception as e:
+        print(f"Emergency backup failed: {e}")
+        # fallback – local copy
+        shutil.copy2(DATABASE_FILE, f"emergency_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
 
 def gen_key():
     return ''.join(random.choices(string.digits, k=10))
@@ -1338,37 +1404,6 @@ def admins_menu_cb(c):
 # ==================== EMERGENCY BACKUP ON SIGNAL =====================
 # =====================================================================
 
-def emergency_backup_and_notify():
-    """
-    Suspend / stop hone par 0.5-1 sec mein zip backup owner ko bhejega.
-    """
-    try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_name = f"emergency_backup_{timestamp}.zip"
-        
-        # Zip file banayein (sirf JSON file daalein)
-        with zipfile.ZipFile(zip_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(DATABASE_FILE, arcname="bot_data.json")
-        
-        # Owner ko bhejein
-        with open(zip_name, 'rb') as f:
-            bot.send_document(
-                ADMIN_ID,
-                f,
-                caption=f"🚨 EMERGENCY BACKUP\nTime: {timestamp}\nBot is stopping!"
-            )
-        bot.send_message(ADMIN_ID, "⚠️ Bot shutdown. Backup sent.")
-        
-        # Zip file hatao
-        os.remove(zip_name)
-    except Exception as e:
-        print(f"Emergency backup failed: {e}")
-        # Agar send na ho toh local backup rakh lo
-        try:
-            shutil.copy2(DATABASE_FILE, f"emergency_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-        except:
-            pass
-
 def signal_handler(sig, frame):
     print(f"Signal {sig} received. Creating emergency backup...")
     emergency_backup_and_notify()
@@ -1395,12 +1430,31 @@ def periodic_backup_task():
 threading.Thread(target=periodic_backup_task, daemon=True).start()
 
 # =====================================================================
-# ==================== MAIN LOOP ======================================
+# ==================== WEB SERVER FOR RENDER =========================
+# =====================================================================
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "OK", 200
+
+@app.route('/health')
+def health():
+    return jsonify(status="running", users=len(get_users())), 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# =====================================================================
+# ==================== MAIN ===========================================
 # =====================================================================
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🤖 BOT STARTED (ULTRA FAST - WITH BROADCAST + EMERGENCY BACKUP)")
+    print("🤖 BOT STARTED (ULTRA FAST - WITH BROADCAST + EMERGENCY BACKUP + WEB SERVER)")
     print(f"Users: {len(get_users())} | Channels: {len(get_channels())}")
     print("=" * 60)
     print("🔥 Emoji IDs: (number) -> premium emoji")
@@ -1408,19 +1462,26 @@ if __name__ == "__main__":
     print("📢 BROADCAST - /broadcast reply to any message")
     print("📊 STATUS - /status to check broadcast progress")
     print("🚨 EMERGENCY BACKUP - On SIGTERM/SIGINT (suspend/stop)")
+    print("🌐 WEB SERVER - Running on PORT (for Render)")
     print("=" * 60)
     
     try:
-        bot.send_message(ADMIN_ID, f"✅ BOT STARTED (ULTRA FAST)\nUsers: {len(get_users())}\n\n🔥 (number) -> premium emoji\n📢 Broadcast: /broadcast reply\n📊 Status: /status\n🚨 Emergency backup enabled.")
+        bot.send_message(ADMIN_ID, f"✅ BOT STARTED (ULTRA FAST)\nUsers: {len(get_users())}\n\n🔥 (number) -> premium emoji\n📢 Broadcast: /broadcast reply\n📊 Status: /status\n🚨 Emergency backup enabled.\n🌐 Web server running on port {os.environ.get('PORT', 8080)}")
     except:
         pass
-    
-    # Polling loop with exception handling
-    while True:
-        try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=30)
-        except Exception as e:
-            print(f"Polling error: {e}")
-            # agar polling crash ho toh backup bhej dein
-            emergency_backup_and_notify()
-            time.sleep(10)
+
+    # Start bot polling in a separate thread
+    def start_bot():
+        while True:
+            try:
+                bot.infinity_polling(timeout=60, long_polling_timeout=30)
+            except Exception as e:
+                print(f"Polling error: {e}")
+                emergency_backup_and_notify()
+                time.sleep(10)
+
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
+    bot_thread.start()
+
+    # Start Flask web server (main thread)
+    run_flask()
