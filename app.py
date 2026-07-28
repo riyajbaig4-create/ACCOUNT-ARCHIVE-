@@ -227,7 +227,6 @@ def detect_runtime_and_get_cmd(folder, port):
                 if 'start' in scripts:
                     cmd = ['npm', 'start']
                 else:
-                    # try common entry files
                     entry = None
                     for fname in ['server.js', 'index.js', 'app.js', 'main.js']:
                         if os.path.exists(os.path.join(folder, fname)):
@@ -242,13 +241,13 @@ def detect_runtime_and_get_cmd(folder, port):
         except:
             pass
     
-    # ----- Node.js (without package.json) – look for common JS files -----
+    # ----- Node.js (without package.json) -----
     js_files = ['server.js', 'index.js', 'app.js', 'main.js']
     for fname in js_files:
         if os.path.exists(os.path.join(folder, fname)):
             return ['node', fname], 'nodejs', {'PORT': str(port)}
     
-    # ----- If still no JS found, scan for any .js file in root (fallback) -----
+    # fallback: any .js file
     try:
         for f in os.listdir(folder):
             if f.endswith('.js') and os.path.isfile(os.path.join(folder, f)):
@@ -333,7 +332,6 @@ def install_dependencies(folder, runtime, log_callback=None):
             except:
                 pass
             return True, "Dependencies installed"
-        # If no package.json, nothing to install
         return True, "No dependencies to install (no package.json)"
     elif runtime == 'php':
         if os.path.exists(os.path.join(folder, 'composer.json')):
@@ -401,13 +399,11 @@ def install_dependencies(folder, runtime, log_callback=None):
 
 # ---------- Auto Port Detection & Health Check ----------
 def detect_port_from_log(log_file):
-    """Read log file and try to extract port number from common patterns."""
     if not os.path.exists(log_file):
         return None
     try:
         with open(log_file, 'r') as f:
             content = f.read()
-            # Patterns: listening on port 3000, localhost:3000, port 3000, :::3000, etc.
             patterns = [
                 r'port\s*[:=]\s*(\d+)',
                 r'listening\s+on\s+(\d+)',
@@ -417,7 +413,7 @@ def detect_port_from_log(log_file):
                 r'::\s*:\s*(\d+)',
                 r'port\s+(\d+)',
                 r'http://[^:]+:(\d+)',
-                r':(\d{4,5})'  # generic 4-5 digit number
+                r':(\d{4,5})'
             ]
             for pattern in patterns:
                 matches = re.findall(pattern, content, re.IGNORECASE)
@@ -430,16 +426,12 @@ def detect_port_from_log(log_file):
     return None
 
 def health_check_on_ports(port_list, max_retries=3, delay=2):
-    """Try health check on a list of ports."""
     for port in port_list:
         for attempt in range(max_retries):
             try:
                 response = requests.get(f"http://localhost:{port}", timeout=3)
                 if response.status_code < 500:
                     return True, port, f"OK (port {port})"
-                else:
-                    # If status code >=500, it's a server error, probably not the right port
-                    pass
             except:
                 pass
             time.sleep(delay)
@@ -456,7 +448,6 @@ def start_website_process(website_id, log_callback=None):
         update_website_status(website_id, 'failed')
         return False, "Folder not found"
     
-    # Allocate a port (will be used as primary, but we'll auto-detect)
     allocated_port = get_next_available_port()
     cmd, runtime, env_extra = detect_runtime_and_get_cmd(folder, allocated_port)
     if not cmd:
@@ -516,7 +507,6 @@ def start_website_process(website_id, log_callback=None):
         thread.daemon = True
         thread.start()
         
-        # Wait a bit for process to start and write logs
         time.sleep(3)
         if proc.poll() is not None:
             with open(log_file, 'r') as f:
@@ -527,7 +517,6 @@ def start_website_process(website_id, log_callback=None):
                 log_callback("ERROR", f"Process crashed: {error_lines}")
             return False, f"Process crashed: {error_lines}"
         
-        # Auto-detect port from log
         detected_port = detect_port_from_log(log_file)
         if detected_port:
             if log_callback:
@@ -536,21 +525,16 @@ def start_website_process(website_id, log_callback=None):
             if log_callback:
                 log_callback("PORT", "Could not detect port from logs, will try common ports")
         
-        # Build list of ports to try
         ports_to_try = []
         if detected_port:
             ports_to_try.append(detected_port)
-        # Always try the allocated port
         ports_to_try.append(allocated_port)
-        # Common default ports
         for p in [3000, 8080, 5000, 8000, 8081, 3001]:
             if p not in ports_to_try:
                 ports_to_try.append(p)
         
-        # Health check
         healthy, actual_port, health_msg = health_check_on_ports(ports_to_try, max_retries=5, delay=2)
         if healthy:
-            # Update database with actual port
             update_website_status(website_id, 'running', proc.pid, actual_port)
             log_website(website_id, f"Started on port {actual_port} (PID {proc.pid})")
             with get_db() as conn:
@@ -561,7 +545,6 @@ def start_website_process(website_id, log_callback=None):
                 log_callback("SUCCESS", f"Application running on port {actual_port}")
             return True, f"Running on port {actual_port}"
         else:
-            # Health check failed - kill process
             try:
                 if os.name == 'nt':
                     subprocess.run(['taskkill', '/PID', str(proc.pid), '/F'], capture_output=True)
@@ -987,73 +970,45 @@ def build_logs_page(website_id):
         return render_template_string(BUILD_LOGS_TEMPLATE, website=website, no_logs=True)
     return render_template_string(BUILD_LOGS_TEMPLATE, website=website, no_logs=False)
 
-@app.route('/deploy/<int:website_id>/logs')
-def deploy_logs_sse(website_id):
+# ---------- Polling endpoint for deployment logs ----------
+@app.route('/deploy/<int:website_id>/log_data')
+def deploy_log_data(website_id):
     if 'user_id' not in session:
-        return "Unauthorized", 401
+        return jsonify({'error': 'Unauthorized'}), 401
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
-            abort(404)
+            return jsonify({'error': 'Not found'}), 404
     with get_db() as conn:
         dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
     if not dep:
-        return "No deployment found", 404
+        return jsonify({'error': 'No deployment found'}), 404
     log_file = os.path.join(LOG_FOLDER, f"deploy_{dep['id']}.log")
-    def generate():
-        if os.path.exists(log_file):
-            with open(log_file, 'r') as f:
-                for line in f:
-                    yield f"data: {line.strip()}\n\n"
-        last_size = os.path.getsize(log_file) if os.path.exists(log_file) else 0
-        while True:
-            time.sleep(0.5)
-            if os.path.exists(log_file):
-                current_size = os.path.getsize(log_file)
-                if current_size > last_size:
-                    with open(log_file, 'r') as f:
-                        f.seek(last_size)
-                        new_lines = f.read()
-                        for line in new_lines.splitlines():
-                            yield f"data: {line}\n\n"
-                    last_size = current_size
-            with get_db() as conn:
-                dep_status = conn.execute('SELECT status FROM deployments WHERE id = ?', (dep['id'],)).fetchone()
-            if dep_status and dep_status['status'] in ('success', 'failed', 'stopped'):
-                yield f"data: [REFRESH]\n\n"
-                yield f"data: [SYSTEM] Deployment completed with status: {dep_status['status']}\n\n"
-                break
-    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+    logs = ""
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            logs = f.read()
+    return jsonify({
+        'logs': logs,
+        'status': dep['status'],
+        'finished': dep['status'] in ('success', 'failed', 'stopped')
+    })
 
-# ---------- Runtime Logs SSE (Live) ----------
-@app.route('/runtime/<int:website_id>/logs')
-def runtime_logs_sse(website_id):
+# ---------- Runtime Logs Polling ----------
+@app.route('/runtime/<int:website_id>/log_data')
+def runtime_log_data(website_id):
     if 'user_id' not in session:
-        return "Unauthorized", 401
+        return jsonify({'error': 'Unauthorized'}), 401
     website = get_website_by_id(website_id)
     if not website or website['owner_id'] != session['user_id']:
         if session.get('role') != 'admin':
-            abort(404)
+            return jsonify({'error': 'Not found'}), 404
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
-    def generate():
-        if os.path.exists(log_file):
-            with open(log_file, 'r') as f:
-                for line in f:
-                    yield f"data: {line.strip()}\n\n"
-        last_size = os.path.getsize(log_file) if os.path.exists(log_file) else 0
-        while True:
-            time.sleep(0.5)
-            if os.path.exists(log_file):
-                current_size = os.path.getsize(log_file)
-                if current_size > last_size:
-                    with open(log_file, 'r') as f:
-                        f.seek(last_size)
-                        new_lines = f.read()
-                        for line in new_lines.splitlines():
-                            yield f"data: {line}\n\n"
-                    last_size = current_size
-            time.sleep(0.3)
-    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+    logs = ""
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            logs = f.read()
+    return jsonify({'logs': logs})
 
 # ---------- Website Management Routes ----------
 @app.route('/website/<int:website_id>/start', methods=['POST'])
@@ -1364,7 +1319,7 @@ def unzip_file_website(website_id):
     os.remove(full)
     return jsonify({'success': True})
 
-# ---------- Logs View (with Live Runtime Logs) ----------
+# ---------- Logs View (with polling for live runtime logs) ----------
 @app.route('/website/<int:website_id>/logs')
 def view_logs(website_id):
     if 'user_id' not in session:
@@ -1906,47 +1861,64 @@ showLogs(d.website_id);
 .catch(()=>st.innerHTML='❌ Network error');
 };
 
-// Inline Logs
-let currentEventSource = null;
+// Inline Logs (Polling)
+let pollIntervalId = null;
 const logContainer = document.getElementById('logContainer');
 const logContent = document.getElementById('logContent');
+let lastLogs = '';
 
 function showLogs(websiteId) {
-    if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
+    if (pollIntervalId) clearInterval(pollIntervalId);
     logContent.innerHTML = '';
     logContainer.style.display = 'block';
     logContainer.scrollTop = 0;
-    const evtSource = new EventSource('/deploy/' + websiteId + '/logs');
-    currentEventSource = evtSource;
     let autoScroll = true;
-    evtSource.onmessage = function(event) {
-        const data = event.data;
-        if (!data) return;
-        if (data === '[REFRESH]') {
-            setTimeout(() => { location.reload(); }, 2000);
-            return;
-        }
-        const lineDiv = document.createElement('div');
-        lineDiv.className = 'line';
-        const match = data.match(/^\[(\d{2}:\d{2}:\d{2})\] \[([A-Z]+)\] (.*)$/);
-        if (match) {
-            const [, ts, step, msg] = match;
-            lineDiv.innerHTML = `<span class="ts">[${ts}]</span><span class="step">[${step}]</span>${msg}`;
-            lineDiv.classList.add(step);
-        } else {
-            lineDiv.textContent = data;
-        }
-        logContent.appendChild(lineDiv);
-        if (autoScroll) logContainer.scrollTop = logContainer.scrollHeight;
-        if (data.includes('Deployment completed with status:')) {
-            setTimeout(() => {
-                logContainer.style.display = 'none';
-                if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
-                location.reload();
-            }, 3000);
-        }
-    };
-    evtSource.onerror = function() {};
+
+    function fetchLogs() {
+        fetch('/deploy/' + websiteId + '/log_data')
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    logContent.innerHTML = '<div class="line ERROR"><span class="ts">[ERROR]</span>' + data.error + '</div>';
+                    return;
+                }
+                const logs = data.logs || '';
+                if (logs !== lastLogs) {
+                    logContent.innerHTML = '';
+                    const lines = logs.split('\n');
+                    for (let line of lines) {
+                        if (line.trim() === '') continue;
+                        const lineDiv = document.createElement('div');
+                        lineDiv.className = 'line';
+                        const match = line.match(/^\[(\d{2}:\d{2}:\d{2})\] \[([A-Z]+)\] (.*)$/);
+                        if (match) {
+                            const [, ts, step, msg] = match;
+                            lineDiv.innerHTML = `<span class="ts">[${ts}]</span><span class="step">[${step}]</span>${msg}`;
+                            lineDiv.classList.add(step);
+                        } else {
+                            lineDiv.textContent = line;
+                        }
+                        logContent.appendChild(lineDiv);
+                    }
+                    lastLogs = logs;
+                    if (autoScroll) logContainer.scrollTop = logContainer.scrollHeight;
+                }
+                // Check if deployment finished
+                if (data.finished) {
+                    clearInterval(pollIntervalId);
+                    pollIntervalId = null;
+                    setTimeout(() => {
+                        logContainer.style.display = 'none';
+                        location.reload();
+                    }, 3000);
+                }
+            })
+            .catch(err => console.error('Polling error:', err));
+    }
+
+    fetchLogs();
+    pollIntervalId = setInterval(fetchLogs, 2000);
+
     logContainer.addEventListener('scroll', function() {
         if (logContainer.scrollTop < logContainer.scrollHeight - logContainer.clientHeight - 10) autoScroll = false;
         else autoScroll = true;
@@ -2129,7 +2101,7 @@ pre{background:rgba(0,0,0,0.4);padding:15px;border-radius:15px;max-height:400px;
     <pre>{{ install_log if install_log else 'No build logs.' }}</pre>
 </div>
 <div id="runtime" class="tab-content">
-    <h3>🖥️ Runtime Log (Live)</h3>
+    <h3>🖥️ Runtime Log (Live - polling)</h3>
     <div id="runtimeLogContainer" style="background:rgba(0,0,0,0.4);padding:15px;border-radius:15px;max-height:400px;overflow-y:auto;border:1px solid rgba(255,255,255,0.05);font-family:'Courier New',monospace;font-size:12px;white-space:pre-wrap;color:#aab;"></div>
 </div>
 <div id="error" class="tab-content">
@@ -2146,39 +2118,38 @@ document.querySelectorAll('.tab').forEach(tab => {
         document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
         document.getElementById(this.dataset.target).classList.add('active');
         if (this.dataset.target === 'runtime') {
-            startRuntimeLogs();
+            startRuntimePolling();
         }
     });
 });
 
-let runtimeEventSource = null;
-function startRuntimeLogs() {
-    if (runtimeEventSource) {
-        runtimeEventSource.close();
-        runtimeEventSource = null;
-    }
+let runtimeInterval = null;
+function startRuntimePolling() {
+    if (runtimeInterval) clearInterval(runtimeInterval);
     const container = document.getElementById('runtimeLogContainer');
     container.innerHTML = 'Connecting to runtime logs...';
-    runtimeEventSource = new EventSource('/runtime/{{ website.id }}/logs');
-    let autoScroll = true;
-    runtimeEventSource.onmessage = function(event) {
-        const data = event.data;
-        if (!data) return;
-        const lineDiv = document.createElement('div');
-        lineDiv.textContent = data;
-        container.appendChild(lineDiv);
-        if (autoScroll) {
-            container.scrollTop = container.scrollHeight;
-        }
-    };
-    runtimeEventSource.onerror = function() {};
-    container.addEventListener('scroll', function() {
-        if (container.scrollTop < container.scrollHeight - container.clientHeight - 10) {
-            autoScroll = false;
-        } else {
-            autoScroll = true;
-        }
-    });
+    let lastLogs = '';
+    function fetchRuntime() {
+        fetch('/runtime/{{ website.id }}/log_data')
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    container.innerHTML = 'Error fetching runtime logs';
+                    return;
+                }
+                const logs = data.logs || '';
+                if (logs !== lastLogs) {
+                    container.innerHTML = logs.split('\n').join('<br>');
+                    lastLogs = logs;
+                    container.scrollTop = container.scrollHeight;
+                }
+            })
+            .catch(err => {
+                console.error('Runtime polling error:', err);
+            });
+    }
+    fetchRuntime();
+    runtimeInterval = setInterval(fetchRuntime, 2000);
 }
 </script>
 </body>
@@ -2287,62 +2258,65 @@ const logContainer = document.getElementById('logContainer');
 const statusBadge = document.getElementById('statusBadge');
 
 {% if not no_logs %}
-const evtSource = new EventSource('/deploy/{{ website.id }}/logs');
-let autoScroll = true;
+// Polling
+let lastLogs = '';
+let finished = false;
+let pollInterval = 2000;
 
-evtSource.onmessage = function(event) {
-    const data = event.data;
-    if (!data) return;
-    if (data === '[REFRESH]') {
-        location.reload();
-        return;
-    }
-    const lineDiv = document.createElement('div');
-    lineDiv.className = 'line';
-    const match = data.match(/^\[(\d{2}:\d{2}:\d{2})\] \[([A-Z]+)\] (.*)$/);
-    if (match) {
-        const [, ts, step, msg] = match;
-        lineDiv.innerHTML = `<span class="timestamp">[${ts}]</span><span class="step">[${step}]</span>${msg}`;
-        lineDiv.classList.add(step);
-    } else {
-        lineDiv.textContent = data;
-    }
-    logContainer.appendChild(lineDiv);
-    if (autoScroll) {
-        terminal.scrollTop = terminal.scrollHeight;
-    }
-    if (data.includes('Deployment Successful')) {
-        statusBadge.textContent = '✅ Success';
-        statusBadge.className = 'status-indicator success';
-        evtSource.close();
-    } else if (data.includes('Deployment failed') || data.includes('ERROR')) {
-        statusBadge.textContent = '❌ Failed';
-        statusBadge.className = 'status-indicator failed';
-    }
-    if (data.includes('Deployment completed with status:')) {
-        if (data.includes('success')) {
-            statusBadge.textContent = '✅ Success';
-            statusBadge.className = 'status-indicator success';
-        } else {
-            statusBadge.textContent = '❌ Failed';
-            statusBadge.className = 'status-indicator failed';
-        }
-        evtSource.close();
-    }
-};
-evtSource.onerror = function() {
-    setTimeout(() => {
-        if (evtSource.readyState === EventSource.CLOSED) {
-        }
-    }, 2000);
-};
-terminal.addEventListener('scroll', function() {
-    if (terminal.scrollTop < terminal.scrollHeight - terminal.clientHeight - 10) {
-        autoScroll = false;
-    } else {
-        autoScroll = true;
-    }
-});
+function fetchLogs() {
+    fetch('/deploy/{{ website.id }}/log_data')
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                console.error(data.error);
+                return;
+            }
+            const logs = data.logs || '';
+            if (logs !== lastLogs) {
+                logContainer.innerHTML = '';
+                const lines = logs.split('\n');
+                for (let line of lines) {
+                    if (line.trim() === '') continue;
+                    const lineDiv = document.createElement('div');
+                    lineDiv.className = 'line';
+                    const match = line.match(/^\[(\d{2}:\d{2}:\d{2})\] \[([A-Z]+)\] (.*)$/);
+                    if (match) {
+                        const [, ts, step, msg] = match;
+                        lineDiv.innerHTML = `<span class="timestamp">[${ts}]</span><span class="step">[${step}]</span>${msg}`;
+                        lineDiv.classList.add(step);
+                    } else {
+                        lineDiv.textContent = line;
+                    }
+                    logContainer.appendChild(lineDiv);
+                }
+                lastLogs = logs;
+                terminal.scrollTop = terminal.scrollHeight;
+            }
+            const status = data.status || 'queued';
+            if (status === 'success') {
+                statusBadge.textContent = '✅ Success';
+                statusBadge.className = 'status-indicator success';
+                finished = true;
+            } else if (status === 'failed') {
+                statusBadge.textContent = '❌ Failed';
+                statusBadge.className = 'status-indicator failed';
+                finished = true;
+            } else {
+                statusBadge.textContent = '⏳ ' + status.toUpperCase();
+                statusBadge.className = 'status-indicator running';
+            }
+            if (finished) {
+                clearInterval(intervalId);
+                setTimeout(() => {
+                    window.location.href = '/dashboard';
+                }, 3000);
+            }
+        })
+        .catch(err => console.error('Polling error:', err));
+}
+
+fetchLogs();
+const intervalId = setInterval(fetchLogs, pollInterval);
 {% endif %}
 </script>
 </body>
