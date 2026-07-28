@@ -14,7 +14,7 @@ import signal
 import sys
 import socket
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, url_for, send_from_directory, session, jsonify, abort, Response
+from flask import Flask, render_template_string, request, redirect, url_for, send_from_directory, session, jsonify, abort, Response, stream_with_context
 
 app = Flask(__name__)
 app.secret_key = 'super-secret-key-12345'
@@ -74,7 +74,7 @@ def extract_zip(zip_path, extract_to):
         zip_ref.extractall(extract_to)
     os.remove(zip_path)
 
-def wait_for_port(port, timeout=10):
+def wait_for_port(port, timeout=30):
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -88,10 +88,16 @@ def wait_for_port(port, timeout=10):
 # ---------- PROCESS MANAGER ----------
 processes = load_processes()
 process_handles = {}
+status_callbacks = {}
+
+def append_log(username, line):
+    log_file = get_user_log_file(username)
+    with open(log_file, 'a') as f:
+        f.write(line + '\n')
 
 def start_user_app(username, folder):
-    # Check for Python files
-    app_files = ['app.py', 'main.py', 'index.py', 'server.py']
+    # Detect main file
+    app_files = ['app.py', 'main.py', 'server.py', 'index.py']
     main_file = None
     for f in app_files:
         if os.path.exists(os.path.join(folder, f)):
@@ -99,23 +105,49 @@ def start_user_app(username, folder):
             break
 
     if not main_file:
-        # Static website - no process needed
+        # Static site
+        processes[username] = {'status': 'static', 'port': None}
+        save_processes(processes)
         return None, None
+
+    # Install requirements if exists
+    req_file = os.path.join(folder, 'requirements.txt')
+    if os.path.exists(req_file):
+        append_log(username, "📦 Installing dependencies from requirements.txt...")
+        try:
+            proc = subprocess.Popen(
+                ['pip', 'install', '-r', 'requirements.txt'],
+                cwd=folder,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            for line in proc.stdout:
+                append_log(username, line.strip())
+            proc.wait()
+            if proc.returncode != 0:
+                append_log(username, "❌ Dependency installation failed.")
+                processes[username] = {'status': 'failed', 'error': 'pip install failed'}
+                save_processes(processes)
+                return None, "pip install failed"
+        except Exception as e:
+            append_log(username, f"❌ Error installing dependencies: {e}")
+            return None, str(e)
 
     # Find free port
     port = find_free_port()
     log_file = get_user_log_file(username)
-    
+
     # Clear previous log
     with open(log_file, 'w') as f:
         f.write(f"--- Starting {main_file} at {datetime.now()} ---\n")
-    
-    # Start subprocess with output redirection
+
+    # Start subprocess
     try:
         env = os.environ.copy()
         env['PORT'] = str(port)
         env['HOST'] = '0.0.0.0'
-        
+
         with open(log_file, 'a') as log_f:
             proc = subprocess.Popen(
                 ['python3', main_file],
@@ -125,8 +157,7 @@ def start_user_app(username, folder):
                 env=env,
                 preexec_fn=os.setsid if os.name != 'nt' else None
             )
-        
-        # Save process info
+
         processes[username] = {
             'pid': proc.pid,
             'port': port,
@@ -136,11 +167,15 @@ def start_user_app(username, folder):
         }
         process_handles[username] = proc
         save_processes(processes)
-        
+
+        append_log(username, f"✅ Process started with PID {proc.pid} on port {port}")
+        append_log(username, "⏳ Waiting for server to become ready...")
+
         # Wait for port to be ready
-        if wait_for_port(port, timeout=10):
+        if wait_for_port(port, timeout=30):
             processes[username]['status'] = 'running'
             save_processes(processes)
+            append_log(username, "✅ Server is running and ready!")
             return port, None
         else:
             # Timeout - check if process is still alive
@@ -156,10 +191,12 @@ def start_user_app(username, folder):
                 proc.wait(timeout=2)
             processes[username]['status'] = 'failed'
             save_processes(processes)
-            return None, "App failed to start (port not listening)"
+            append_log(username, "❌ Server failed to start: port not listening within 30s")
+            return None, "Server failed to start (port not listening)"
     except Exception as e:
         processes[username] = {'status': 'error', 'error': str(e)}
         save_processes(processes)
+        append_log(username, f"❌ Error: {e}")
         return None, str(e)
 
 def stop_user_app(username):
@@ -177,6 +214,7 @@ def stop_user_app(username):
     if username in processes:
         del processes[username]
         save_processes(processes)
+    append_log(username, "🛑 App stopped.")
     return True
 
 def is_app_running(username):
@@ -187,17 +225,19 @@ def get_log_content(username):
     if os.path.exists(log_file):
         with open(log_file, 'r') as f:
             return f.read()
-    return "No logs yet."
+    return ""
 
 # ---------- REVERSE PROXY ----------
 def proxy_request(username, path, method, headers, data, query_string):
     if username not in processes:
         return None, "App not found"
     port = processes[username]['port']
+    if port is None:
+        return None, "No port assigned"
     target_url = f"http://localhost:{port}/{path}"
     if query_string:
         target_url += "?" + query_string
-    
+
     try:
         headers.pop('Host', None)
         headers.pop('Content-Length', None)
@@ -241,30 +281,36 @@ def logout():
     session.clear()
     return redirect(url_for('main_login'))
 
-# ---------- UPLOAD ----------
+# ---------- DEPLOY ----------
 @app.route('/deploy', methods=['POST'])
 def deploy():
     if not session.get('logged_in'):
         return jsonify({'error': 'Unauthorized'}), 401
-    
+
     username = request.form.get('username', '').strip()
     if not username:
         username = str(uuid.uuid4())[:8]
-    
+
     if username in users_db:
         return jsonify({'error': 'Username already taken.'}), 400
-    
+
     files = request.files.getlist('files')
     if not files or all(f.filename == '' for f in files):
         return jsonify({'error': 'No files uploaded.'}), 400
-    
+
     if username in processes:
         stop_user_app(username)
-    
+
     user_folder = get_user_folder(username)
     shutil.rmtree(user_folder, ignore_errors=True)
     os.makedirs(user_folder)
-    
+
+    # Clear log
+    log_file = get_user_log_file(username)
+    if os.path.exists(log_file):
+        os.remove(log_file)
+
+    # Save files
     for file in files:
         if file.filename == '':
             continue
@@ -274,32 +320,57 @@ def deploy():
             extract_zip(temp_path, user_folder)
         else:
             file.save(os.path.join(user_folder, file.filename))
-    
+
     users_db[username] = {
         'created_at': datetime.now().isoformat(),
         'folder': user_folder
     }
     save_users(users_db)
-    
-    port, error = start_user_app(username, user_folder)
-    
-    link = request.host_url + username
-    if port:
-        status = f"✅ Running on port {port}"
-    elif error:
-        status = f"❌ Failed: {error}"
-    else:
-        status = "📁 Static site (no server process)"
-    
+
+    # Start app in background to allow streaming logs
+    def run_deployment():
+        start_user_app(username, user_folder)
+
+    threading.Thread(target=run_deployment).start()
+
+    # Return immediately with username so frontend can poll status
     return jsonify({
-        'success': True if port or error is None else False,
+        'success': True,
         'username': username,
-        'link': link,
-        'status': status,
-        'port': port,
-        'error': error
+        'message': 'Deployment started. Check status.'
     })
 
+# ---------- STATUS API (polling) ----------
+@app.route('/status/<username>')
+def status(username):
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Unauthorized'}), 401
+    if username not in users_db:
+        return jsonify({'error': 'User not found'}), 404
+
+    proc_info = processes.get(username, {})
+    status = proc_info.get('status', 'unknown')
+    port = proc_info.get('port')
+    error = proc_info.get('error')
+    logs = get_log_content(username)
+
+    # Also check if process is still alive for 'running' status
+    if status == 'running' and not is_app_running(username):
+        status = 'failed'
+        proc_info['status'] = 'failed'
+        save_processes(processes)
+        append_log(username, "❌ Process died unexpectedly.")
+
+    return jsonify({
+        'username': username,
+        'status': status,
+        'port': port,
+        'error': error,
+        'logs': logs,
+        'link': request.host_url + username if status == 'running' else None
+    })
+
+# ---------- STOP / RESTART / DELETE ----------
 @app.route('/stop/<username>', methods=['POST'])
 def stop_app(username):
     if not session.get('logged_in'):
@@ -317,8 +388,8 @@ def restart_app(username):
         return jsonify({'error': 'User not found'}), 404
     stop_user_app(username)
     folder = get_user_folder(username)
-    port, error = start_user_app(username, folder)
-    return jsonify({'success': True if port else False, 'port': port, 'error': error})
+    threading.Thread(target=start_user_app, args=(username, folder)).start()
+    return jsonify({'success': True, 'message': 'Restart initiated.'})
 
 @app.route('/delete/<username>', methods=['POST'])
 def delete_app(username):
@@ -328,7 +399,6 @@ def delete_app(username):
         return jsonify({'error': 'User not found'}), 404
     stop_user_app(username)
     shutil.rmtree(get_user_folder(username), ignore_errors=True)
-    # Delete log file
     log_file = get_user_log_file(username)
     if os.path.exists(log_file):
         os.remove(log_file)
@@ -336,33 +406,22 @@ def delete_app(username):
     save_users(users_db)
     return jsonify({'success': True})
 
-@app.route('/logs/<username>', methods=['GET'])
-def view_logs(username):
-    if not session.get('logged_in'):
-        return jsonify({'error': 'Unauthorized'}), 401
-    if username not in users_db:
-        return jsonify({'error': 'User not found'}), 404
-    log_content = get_log_content(username)
-    return jsonify({'logs': log_content})
-
 # ---------- PROXY ROUTE ----------
 @app.route('/<username>/', defaults={'path': ''})
 @app.route('/<username>/<path:path>')
 def serve_user_site(username, path):
     if username not in users_db:
         return "User site not found", 404
-    
-    if username in processes and is_app_running(username):
+
+    proc_info = processes.get(username, {})
+    if proc_info.get('status') == 'running' and is_app_running(username):
         method = request.method
         headers = dict(request.headers)
         data = request.get_data()
         query_string = request.query_string.decode('utf-8')
-        
+
         resp, err = proxy_request(username, path, method, headers, data, query_string)
         if err:
-            # Log error
-            with open(get_user_log_file(username), 'a') as f:
-                f.write(f"Proxy error: {err}\n")
             return f"Proxy error: {err}", 502
         if resp:
             response = Response(resp.content, resp.status_code)
@@ -374,7 +433,7 @@ def serve_user_site(username, path):
         else:
             return "App not reachable", 502
     else:
-        # Static or failed app
+        # Static or failed
         user_folder = get_user_folder(username)
         if path == '':
             if os.path.exists(os.path.join(user_folder, 'index.html')):
@@ -394,7 +453,7 @@ def serve_user_site(username, path):
                 return redirect(url_for('serve_user_site', username=username, path=path + '/'))
             return send_from_directory(user_folder, path)
 
-# ---------- HTML TEMPLATES ----------
+# ---------- HTML (Dashboard with live logs) ----------
 LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
@@ -447,17 +506,21 @@ DASHBOARD_HTML = """
         .status { padding: 4px 12px; border-radius: 20px; font-size: 12px; }
         .status.running { background: #00ff6a33; color: #00ff6a; border: 1px solid #00ff6a; }
         .status.failed { background: #ff4d4d33; color: #ff4d4d; border: 1px solid #ff4d4d; }
+        .status.starting { background: #ffaa0033; color: #ffaa00; border: 1px solid #ffaa00; }
         .status.static { background: #333; color: #aaa; border: 1px solid #555; }
         .logout { float: right; color: #ff4d4d; text-decoration: none; }
         .input-group { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
         .input-group input { flex: 1; padding: 12px; background: #0c1018; border: 1px solid #2b3240; color: white; border-radius: 8px; min-width: 150px; }
         #fileList { margin: 10px 0; color: #aaa; }
-        #result { margin-top: 20px; padding: 15px; background: #0c1018; border-radius: 8px; border: 1px solid #2b3240; }
+        #deployStatus { margin-top: 20px; padding: 15px; background: #0c1018; border-radius: 8px; border: 1px solid #2b3240; display: none; }
+        #logOutput { background: #000; color: #00ff6a; padding: 10px; border-radius: 5px; max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 12px; white-space: pre-wrap; margin-top: 10px; }
+        .btn-group { display: flex; gap: 5px; flex-wrap: wrap; }
         .log-popup { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 9999; justify-content: center; align-items: center; }
         .log-popup-content { background: #0c1018; border: 1px solid #2b3240; border-radius: 15px; padding: 30px; max-width: 90%; max-height: 80%; overflow: auto; width: 800px; }
         .log-popup-content pre { background: #000; color: #00ff6a; padding: 15px; border-radius: 8px; font-size: 12px; max-height: 500px; overflow: auto; white-space: pre-wrap; }
         .close-btn { float: right; background: #ff4d4d; color: #fff; border: none; padding: 8px 16px; border-radius: 5px; cursor: pointer; }
-        .btn-group { display: flex; gap: 5px; flex-wrap: wrap; }
+        .spinner { border: 4px solid rgba(0, 229, 255, 0.1); border-left: 4px solid #00e5ff; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; display: inline-block; margin-right: 10px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
@@ -476,7 +539,11 @@ DASHBOARD_HTML = """
             <input type="text" id="usernameInput" placeholder="Username (leave blank for auto)" />
             <button class="btn" id="deployBtn">🚀 Deploy</button>
         </div>
-        <div id="result"></div>
+        <div id="deployStatus">
+            <h4>Deployment Logs</h4>
+            <div id="logOutput"></div>
+            <div id="deployResult" style="margin-top:10px;"></div>
+        </div>
     </div>
 
     <div class="card">
@@ -523,9 +590,12 @@ DASHBOARD_HTML = """
     const fileInput = document.getElementById('fileInput');
     const fileList = document.getElementById('fileList');
     const deployBtn = document.getElementById('deployBtn');
-    const resultDiv = document.getElementById('result');
+    const deployStatus = document.getElementById('deployStatus');
+    const logOutput = document.getElementById('logOutput');
+    const deployResult = document.getElementById('deployResult');
     const usernameInput = document.getElementById('usernameInput');
     let selectedFiles = [];
+    let pollInterval = null;
 
     dropZone.addEventListener('click', () => fileInput.click());
     dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.borderColor = '#fff'; });
@@ -563,31 +633,67 @@ DASHBOARD_HTML = """
 
         deployBtn.disabled = true;
         deployBtn.textContent = 'Deploying...';
-        resultDiv.innerHTML = '<p>⏳ Uploading...</p>';
+        deployStatus.style.display = 'block';
+        logOutput.textContent = '⏳ Uploading...';
+        deployResult.innerHTML = '';
 
         try {
             const res = await fetch('/deploy', { method: 'POST', body: formData });
             const data = await res.json();
             if (data.success) {
-                resultDiv.innerHTML = `
-                    <p style="color:#00ff6a;">✅ Deployed successfully!</p>
-                    <p><strong>Username:</strong> ${data.username}</p>
-                    <p><strong>Link:</strong> <a href="${data.link}" target="_blank" class="link">${data.link}</a></p>
-                    <p><strong>Status:</strong> ${data.status}</p>
-                    ${data.error ? `<p style="color:#ff4d4d;">Error: ${data.error}</p>` : ''}
-                `;
-                setTimeout(() => location.reload(), 2000);
+                logOutput.textContent += '\n✅ Upload complete. Starting deployment...';
+                // Start polling status
+                const uname = data.username;
+                let attempts = 0;
+                if (pollInterval) clearInterval(pollInterval);
+                pollInterval = setInterval(async () => {
+                    try {
+                        const statusRes = await fetch(`/status/${uname}`);
+                        const statusData = await statusRes.json();
+                        logOutput.textContent = statusData.logs || 'No logs yet.';
+                        logOutput.scrollTop = logOutput.scrollHeight;
+
+                        if (statusData.status === 'running') {
+                            clearInterval(pollInterval);
+                            deployResult.innerHTML = `
+                                <p style="color:#00ff6a;">✅ Deployment successful!</p>
+                                <p><strong>Username:</strong> ${statusData.username}</p>
+                                <p><strong>Link:</strong> <a href="${statusData.link}" target="_blank" class="link">${statusData.link}</a></p>
+                            `;
+                            deployBtn.disabled = false;
+                            deployBtn.textContent = '🚀 Deploy';
+                            // Reload site list
+                            setTimeout(() => location.reload(), 1500);
+                        } else if (statusData.status === 'failed' || statusData.status === 'error') {
+                            clearInterval(pollInterval);
+                            deployResult.innerHTML = `<p style="color:#ff4d4d;">❌ Deployment failed. Check logs above for details.</p>`;
+                            deployBtn.disabled = false;
+                            deployBtn.textContent = '🚀 Deploy';
+                        } else if (statusData.status === 'unknown' && attempts > 60) {
+                            // timeout after 2 minutes
+                            clearInterval(pollInterval);
+                            deployResult.innerHTML = `<p style="color:#ffaa00;">⏳ Deployment taking too long. Check logs.</p>`;
+                            deployBtn.disabled = false;
+                            deployBtn.textContent = '🚀 Deploy';
+                        }
+                        attempts++;
+                    } catch (e) {
+                        console.error('Polling error:', e);
+                    }
+                }, 2000);
             } else {
-                resultDiv.innerHTML = `<p style="color:#ff4d4d;">❌ Error: ${data.error}</p>`;
+                logOutput.textContent = '❌ Error: ' + data.error;
+                deployBtn.disabled = false;
+                deployBtn.textContent = '🚀 Deploy';
             }
         } catch(e) {
-            resultDiv.innerHTML = `<p style="color:#ff4d4d;">❌ Network Error: ${e.message}</p>`;
+            logOutput.textContent = '❌ Network Error: ' + e.message;
+            deployBtn.disabled = false;
+            deployBtn.textContent = '🚀 Deploy';
         }
-        deployBtn.disabled = false;
-        deployBtn.textContent = '🚀 Deploy';
     });
 
-    // Action buttons
+    // Action buttons (stop, restart, delete)
     document.querySelectorAll('.stop-btn').forEach(btn => {
         btn.addEventListener('click', async (e) => {
             if (!confirm('Stop this app?')) return;
@@ -626,7 +732,7 @@ DASHBOARD_HTML = """
             logContent.textContent = 'Loading...';
             logPopup.style.display = 'flex';
             try {
-                const res = await fetch(`/logs/${username}`);
+                const res = await fetch(`/status/${username}`);
                 const data = await res.json();
                 logContent.textContent = data.logs || 'No logs.';
             } catch(e) {
@@ -659,11 +765,11 @@ atexit.register(cleanup_processes)
 # ---------- RUN ----------
 if __name__ == '__main__':
     print("="*60)
-    print("🌐 ADVANCED WEBSITE HOSTING PANEL")
+    print("🌐 ADVANCED WEBSITE HOSTING PANEL (Live Logs)")
     print("🔑 Main Login: admin / admin")
     print("📁 Uploads folder:", UPLOAD_FOLDER)
     print("📜 Logs folder:", LOGS_FOLDER)
     print("🚀 Running at http://0.0.0.0:5000")
-    print("⚡ Supports Flask, Static HTML, and more!")
+    print("⚡ Live deployment logs, auto-install requirements, auto-detect Python/Static")
     print("="*60)
     app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
