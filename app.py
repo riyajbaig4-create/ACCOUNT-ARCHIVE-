@@ -1,855 +1,770 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import sys
-import json
-import sqlite3
-import uuid
-import shutil
 import zipfile
+import shutil
 import subprocess
 import threading
 import time
-import signal
-import socket
-import requests
+import json
+import hashlib
+import secrets
+import tempfile
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, send_from_directory, Response, abort
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
+from flask import (
+    Flask, render_template_string, request, redirect, url_for, 
+    session, send_from_directory, jsonify, Response, abort
+)
+import sqlite3
+import requests
+
+# ------------------ कॉन्फ़िगरेशन ------------------
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_FOLDER = BASE_DIR / 'uploads'
+LOGS_FOLDER = BASE_DIR / 'logs'
+DB_PATH = BASE_DIR / 'hosting.db'
+SECRET_KEY = secrets.token_hex(16)
+DEBUG = False  # प्रोडक्शन के लिए False
+
+# सुनिश्चित करें कि फोल्डर्स मौजूद हैं
+UPLOAD_FOLDER.mkdir(exist_ok=True)
+LOGS_FOLDER.mkdir(exist_ok=True)
+
+# ------------------ डेटाबेस ------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # Users
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    ''')
+    # Websites
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS websites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            runtime TEXT,
+            status TEXT DEFAULT 'Stopped',
+            upload_date TEXT,
+            port INTEGER,
+            pid INTEGER,
+            folder_path TEXT,
+            startup_file TEXT
+        )
+    ''')
+    # Logs (build/deploy logs)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            website_id INTEGER,
+            log_text TEXT,
+            timestamp TEXT,
+            FOREIGN KEY(website_id) REFERENCES websites(id)
+        )
+    ''')
+    # डिफ़ॉल्ट admin यूज़र डालें
+    c.execute("SELECT * FROM users WHERE username='admin'")
+    if not c.fetchone():
+        hashed = hashlib.sha256('admin'.encode()).hexdigest()
+        c.execute("INSERT INTO users (username, password) VALUES (?, ?)", ('admin', hashed))
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ------------------ Flask ऐप ------------------
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'change-this-secret-key-in-production')
+app.secret_key = SECRET_KEY
+app.config['UPLOAD_FOLDER'] = str(UPLOAD_FOLDER)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB
 
-# ---------- CONFIG ----------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-LOGS_FOLDER = os.path.join(BASE_DIR, 'logs')
-DB_PATH = os.path.join(BASE_DIR, 'hosting.db')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(LOGS_FOLDER, exist_ok=True)
-
-# ---------- DATABASE ----------
+# हेल्पर फ़ंक्शंस
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-def init_db():
-    with get_db() as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS websites (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                slug TEXT UNIQUE NOT NULL,
-                runtime TEXT,
-                status TEXT DEFAULT 'stopped',
-                port INTEGER,
-                pid INTEGER,
-                upload_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                folder_path TEXT
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                website_id INTEGER,
-                log_text TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (website_id) REFERENCES websites(id)
-            )
-        ''')
-        # insert default admin if not exists
-        cur = conn.execute("SELECT * FROM users WHERE username='admin'")
-        if not cur.fetchone():
-            conn.execute("INSERT INTO users (username, password) VALUES ('admin', 'admin')")
-        conn.commit()
-init_db()
+def get_website_by_slug(slug):
+    conn = get_db()
+    site = conn.execute("SELECT * FROM websites WHERE slug=?", (slug,)).fetchone()
+    conn.close()
+    return site
 
-# ---------- HELPERS ----------
-def get_user_folder(slug):
-    folder = os.path.join(UPLOAD_FOLDER, slug)
-    os.makedirs(folder, exist_ok=True)
-    return folder
+def update_website_status(slug, status, pid=None, port=None):
+    conn = get_db()
+    if pid is not None:
+        conn.execute("UPDATE websites SET status=?, pid=?, port=? WHERE slug=?", (status, pid, port, slug))
+    else:
+        conn.execute("UPDATE websites SET status=? WHERE slug=?", (status, slug))
+    conn.commit()
+    conn.close()
 
-def get_log_file(slug):
-    return os.path.join(LOGS_FOLDER, f"{slug}.log")
+def log_message(website_id, msg):
+    conn = get_db()
+    now = datetime.now().isoformat()
+    conn.execute("INSERT INTO logs (website_id, log_text, timestamp) VALUES (?, ?, ?)",
+                 (website_id, msg, now))
+    conn.commit()
+    conn.close()
 
-def write_log(slug, text):
-    log_file = get_log_file(slug)
-    with open(log_file, 'a', encoding='utf-8') as f:
-        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {text}\n")
+def get_latest_logs(website_id, limit=100):
+    conn = get_db()
+    rows = conn.execute("SELECT log_text, timestamp FROM logs WHERE website_id=? ORDER BY id DESC LIMIT ?", (website_id, limit)).fetchall()
+    conn.close()
+    return list(reversed(rows))  # पुराने से नए
 
-def read_log(slug):
-    log_file = get_log_file(slug)
-    if os.path.exists(log_file):
-        with open(log_file, 'r', encoding='utf-8') as f:
-            return f.read()
-    return ""
+def generate_slug(name):
+    # स्लग बनाएं: name + नंबर
+    base = ''.join(e for e in name if e.isalnum()).lower()
+    if not base:
+        base = 'site'
+    conn = get_db()
+    # check existing slugs
+    count = conn.execute("SELECT COUNT(*) FROM websites WHERE slug LIKE ?", (base + '%',)).fetchone()[0]
+    conn.close()
+    if count == 0:
+        return base
+    else:
+        return f"{base}{count}"
 
 def find_free_port():
+    import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
         return s.getsockname()[1]
 
-def is_port_open(port, timeout=5):
+def detect_runtime(folder_path):
+    # Python detect: check for requirements.txt or .py files
+    path = Path(folder_path)
+    has_req = (path / 'requirements.txt').exists()
+    has_py = any(path.glob('*.py'))
+    if has_req or has_py:
+        # find startup file
+        candidates = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
+        for cand in candidates:
+            if (path / cand).exists():
+                return 'python', cand
+        # if no candidate, take first .py
+        py_files = list(path.glob('*.py'))
+        if py_files:
+            return 'python', py_files[0].name
+        else:
+            return 'python', None
+    else:
+        # Static HTML
+        return 'html', None
+
+def install_requirements(folder_path, log_callback):
+    req_file = Path(folder_path) / 'requirements.txt'
+    if not req_file.exists():
+        log_callback("No requirements.txt found.")
+        return True
+    log_callback("Installing requirements from requirements.txt...")
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect(('localhost', port))
-            return True
-    except:
+        # use pip install -r
+        proc = subprocess.Popen(
+            [sys.executable, '-m', 'pip', 'install', '-r', str(req_file)],
+            cwd=folder_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        for line in proc.stdout:
+            log_callback(line.strip())
+        proc.wait()
+        if proc.returncode != 0:
+            log_callback(f"pip install failed with code {proc.returncode}")
+            return False
+        log_callback("Requirements installed successfully.")
+        return True
+    except Exception as e:
+        log_callback(f"Error installing requirements: {str(e)}")
         return False
 
-# ---------- PROCESS MANAGEMENT ----------
-processes = {}  # slug -> subprocess.Popen
-
-def start_website_process(slug, port):
-    folder = get_user_folder(slug)
-    runtime = detect_runtime(folder)
-    if not runtime:
-        return None, "No runtime detected"
-
-    if runtime == 'python':
-        start_file = detect_python_start_file(folder)
-        if not start_file:
-            return None, "No Python start file found"
-        # install requirements
-        req_file = os.path.join(folder, 'requirements.txt')
-        if os.path.exists(req_file):
-            write_log(slug, "📦 Installing requirements...")
-            try:
-                proc = subprocess.Popen(
-                    ['pip', 'install', '-r', 'requirements.txt'],
-                    cwd=folder,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True
-                )
-                for line in proc.stdout:
-                    write_log(slug, line.strip())
-                proc.wait()
-                if proc.returncode != 0:
-                    write_log(slug, "❌ pip install failed")
-                    return None, "pip install failed"
-                write_log(slug, "✅ Requirements installed")
-            except Exception as e:
-                write_log(slug, f"❌ pip install error: {e}")
-                return None, str(e)
-
-        env = os.environ.copy()
-        env['PORT'] = str(port)
-        env['HOST'] = '0.0.0.0'
-        log_file = get_log_file(slug)
-        try:
-            proc = subprocess.Popen(
-                ['python3', start_file],
-                cwd=folder,
-                stdout=open(log_file, 'a'),
-                stderr=subprocess.STDOUT,
-                env=env,
-                preexec_fn=os.setsid if os.name != 'nt' else None
-            )
-            processes[slug] = proc
-            write_log(slug, f"✅ Process started with PID {proc.pid} on port {port}")
-            # wait for port to be open
-            for _ in range(30):
-                if is_port_open(port):
-                    write_log(slug, "✅ Server is ready")
-                    return proc.pid, None
-                time.sleep(1)
-            # timeout
-            write_log(slug, "❌ Timeout waiting for server to start")
-            stop_website_process(slug)
-            return None, "Timeout waiting for server"
-        except Exception as e:
-            write_log(slug, f"❌ Error starting process: {e}")
-            return None, str(e)
-
-    elif runtime == 'static':
-        # no process needed, just serve static
-        write_log(slug, "📁 Static website (no process)")
-        return 0, None  # pid = 0 means static
-
-    return None, "Unsupported runtime"
-
-def stop_website_process(slug):
-    if slug in processes:
-        proc = processes[slug]
-        try:
-            if os.name != 'nt':
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            else:
-                proc.terminate()
-            proc.wait(timeout=5)
-        except:
-            pass
-        del processes[slug]
-    write_log(slug, "🛑 Process stopped")
+def start_python_app(slug, folder_path, startup_file, log_callback):
+    # find free port
+    port = find_free_port()
+    log_callback(f"Starting Python app on port {port}")
+    # run python startup_file
+    cmd = [sys.executable, startup_file]
+    log_file_path = LOGS_FOLDER / f"{slug}_app.log"
+    with open(log_file_path, 'w') as f:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=folder_path,
+            stdout=f,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env={**os.environ, 'PORT': str(port)}  # some apps use PORT
+        )
+    pid = proc.pid
+    # update DB
+    conn = get_db()
+    conn.execute("UPDATE websites SET port=?, pid=?, status='Running' WHERE slug=?", (port, pid, slug))
+    conn.commit()
+    conn.close()
+    log_callback(f"App started with PID {pid}")
     return True
 
-def detect_runtime(folder):
-    if os.path.exists(os.path.join(folder, 'index.html')):
-        return 'static'
-    # check for python files
-    python_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
-    for f in python_files:
-        if os.path.exists(os.path.join(folder, f)):
-            return 'python'
-    return None
+def start_static_server(slug, folder_path, log_callback):
+    # For static, we just serve via Flask proxy, no external process
+    # We'll set port=0, pid=0, and status='Running'
+    conn = get_db()
+    conn.execute("UPDATE websites SET port=0, pid=0, status='Running' WHERE slug=?", (slug,))
+    conn.commit()
+    conn.close()
+    log_callback("Static site is ready.")
+    return True
 
-def detect_python_start_file(folder):
-    python_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
-    for f in python_files:
-        if os.path.exists(os.path.join(folder, f)):
-            return f
-    return None
+def deploy_website(slug, folder_path, name, log_callback):
+    # detect runtime
+    runtime, startup = detect_runtime(folder_path)
+    log_callback(f"Detected runtime: {runtime}")
+    if runtime == 'python':
+        log_callback(f"Startup file: {startup}")
+        # install requirements
+        if not install_requirements(folder_path, log_callback):
+            # update status to failed
+            conn = get_db()
+            conn.execute("UPDATE websites SET status='Failed', runtime='python' WHERE slug=?", (slug,))
+            conn.commit()
+            conn.close()
+            log_callback("Deployment failed due to requirements installation.")
+            return False
+        # start app
+        if start_python_app(slug, folder_path, startup, log_callback):
+            log_callback(f"Website started successfully at {url_for('serve_website', slug=slug, _external=True)}")
+            return True
+        else:
+            conn = get_db()
+            conn.execute("UPDATE websites SET status='Failed' WHERE slug=?", (slug,))
+            conn.commit()
+            conn.close()
+            return False
+    else:  # html
+        log_callback("Static HTML site detected.")
+        if start_static_server(slug, folder_path, log_callback):
+            log_callback(f"Website available at {url_for('serve_website', slug=slug, _external=True)}")
+            return True
+        else:
+            conn = get_db()
+            conn.execute("UPDATE websites SET status='Failed' WHERE slug=?", (slug,))
+            conn.commit()
+            conn.close()
+            return False
 
-# ---------- ROUTES ----------
-@app.route('/', methods=['GET', 'POST'])
+# ------------------ रूट्स ------------------
+@app.route('/')
+def index():
+    if 'user_id' in session:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
+
+@app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
-        with get_db() as conn:
-            cur = conn.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password))
-            user = cur.fetchone()
-            if user:
-                session['user_id'] = user['id']
-                session['username'] = user['username']
-                return redirect('/dashboard')
-        return render_template_string(LOGIN_HTML, error="Invalid credentials")
-    if 'user_id' in session:
-        return redirect('/dashboard')
-    return render_template_string(LOGIN_HTML, error=None)
-
-@app.route('/dashboard')
-def dashboard():
-    if 'user_id' not in session:
-        return redirect('/')
-    with get_db() as conn:
-        websites = conn.execute("SELECT * FROM websites ORDER BY upload_date DESC").fetchall()
-    return render_template_string(DASHBOARD_HTML, websites=websites, host_url=request.host_url)
+        hashed = hashlib.sha256(password.encode()).hexdigest()
+        conn = get_db()
+        user = conn.execute("SELECT * FROM users WHERE username=? AND password=?", (username, hashed)).fetchone()
+        conn.close()
+        if user:
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            return redirect(url_for('dashboard'))
+        else:
+            return render_template_string(LOGIN_TEMPLATE, error="Invalid credentials")
+    return render_template_string(LOGIN_TEMPLATE, error=None)
 
 @app.route('/logout')
 def logout():
     session.clear()
-    return redirect('/')
+    return redirect(url_for('login'))
 
-# ---------- UPLOAD ----------
-@app.route('/upload', methods=['POST'])
+@app.route('/dashboard')
+def dashboard():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    conn = get_db()
+    sites = conn.execute("SELECT * FROM websites ORDER BY id DESC").fetchall()
+    conn.close()
+    # प्रत्येक साइट के लिए लिंक जनरेट करें
+    site_list = []
+    for site in sites:
+        link = url_for('serve_website', slug=site['slug'], _external=True)
+        site_dict = dict(site)
+        site_dict['link'] = link
+        site_list.append(site_dict)
+    return render_template_string(DASHBOARD_TEMPLATE, sites=site_list, username=session.get('username'))
+
+@app.route('/upload', methods=['GET', 'POST'])
 def upload():
     if 'user_id' not in session:
-        return jsonify({'error': 'Unauthorized'}), 401
-
-    if 'files' not in request.files:
-        return jsonify({'error': 'No files'}), 400
-
-    files = request.files.getlist('files')
-    if not files or all(f.filename == '' for f in files):
-        return jsonify({'error': 'No files selected'}), 400
-
-    # generate slug
-    slug = request.form.get('slug', '').strip()
-    if not slug:
-        slug = str(uuid.uuid4())[:8]
-    else:
-        # sanitize
-        slug = ''.join(c for c in slug if c.isalnum() or c in '-_')
-        if not slug:
-            slug = str(uuid.uuid4())[:8]
-
-    # check if slug exists
-    with get_db() as conn:
-        cur = conn.execute("SELECT id FROM websites WHERE slug=?", (slug,))
-        if cur.fetchone():
-            return jsonify({'error': 'Slug already taken'}), 400
-
-    # create folder
-    folder = get_user_folder(slug)
-    shutil.rmtree(folder, ignore_errors=True)
-    os.makedirs(folder)
-
-    # clear log
-    log_file = get_log_file(slug)
-    if os.path.exists(log_file):
-        os.remove(log_file)
-
-    write_log(slug, "📤 Upload started")
-
-    # save files
-    for file in files:
-        if file.filename == '':
-            continue
-        if file.filename.lower().endswith('.zip'):
-            temp_path = os.path.join(folder, file.filename)
-            file.save(temp_path)
-            write_log(slug, f"📦 Extracting {file.filename}...")
-            try:
-                with zipfile.ZipFile(temp_path, 'r') as z:
-                    z.extractall(folder)
-                os.remove(temp_path)
-                write_log(slug, "✅ ZIP extracted")
-            except Exception as e:
-                write_log(slug, f"❌ ZIP extract failed: {e}")
-                shutil.rmtree(folder, ignore_errors=True)
-                return jsonify({'error': f'ZIP extract failed: {e}'}), 400
+        return redirect(url_for('login'))
+    if request.method == 'POST':
+        # चेक करें कि फाइलें हैं
+        if 'zipfile' in request.files and request.files['zipfile'].filename != '':
+            zip_file = request.files['zipfile']
+            name = request.form.get('name', 'my_site')
+            # create temp dir
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = Path(tmpdir) / 'upload.zip'
+                zip_file.save(str(zip_path))
+                # extract
+                extract_path = Path(tmpdir) / 'extracted'
+                extract_path.mkdir()
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    zf.extractall(extract_path)
+                # move to final location
+                slug = generate_slug(name)
+                dest_folder = UPLOAD_FOLDER / slug
+                shutil.copytree(extract_path, dest_folder)
+            # create website record
+            conn = get_db()
+            now = datetime.now().isoformat()
+            conn.execute(
+                "INSERT INTO websites (slug, name, status, upload_date, folder_path) VALUES (?, ?, ?, ?, ?)",
+                (slug, name, 'Building', now, str(dest_folder))
+            )
+            site_id = conn.lastrowid
+            conn.commit()
+            conn.close()
+            # start deployment in background
+            def deploy_thread():
+                log_callback = lambda msg: log_message(site_id, msg)
+                log_callback(f"Deployment started for {slug}")
+                deploy_website(slug, str(dest_folder), name, log_callback)
+            thread = threading.Thread(target=deploy_thread)
+            thread.daemon = True
+            thread.start()
+            return redirect(url_for('build_logs', slug=slug))
+        elif 'files[]' in request.files:
+            files = request.files.getlist('files[]')
+            if not files or files[0].filename == '':
+                return "No files selected", 400
+            name = request.form.get('name', 'my_site')
+            slug = generate_slug(name)
+            dest_folder = UPLOAD_FOLDER / slug
+            dest_folder.mkdir(parents=True, exist_ok=True)
+            # save files preserving structure
+            for file in files:
+                if file.filename == '':
+                    continue
+                # secure filename but keep relative paths? We'll use full path relative to upload root?
+                # We'll use filename as relative path
+                rel_path = file.filename
+                # prevent path traversal
+                rel_path = os.path.normpath(rel_path)
+                if rel_path.startswith('..'):
+                    continue
+                target = dest_folder / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                file.save(str(target))
+            # create record
+            conn = get_db()
+            now = datetime.now().isoformat()
+            conn.execute(
+                "INSERT INTO websites (slug, name, status, upload_date, folder_path) VALUES (?, ?, ?, ?, ?)",
+                (slug, name, 'Building', now, str(dest_folder))
+            )
+            site_id = conn.lastrowid
+            conn.commit()
+            conn.close()
+            # deploy
+            def deploy_thread():
+                log_callback = lambda msg: log_message(site_id, msg)
+                log_callback(f"Deployment started for {slug}")
+                deploy_website(slug, str(dest_folder), name, log_callback)
+            thread = threading.Thread(target=deploy_thread)
+            thread.daemon = True
+            thread.start()
+            return redirect(url_for('build_logs', slug=slug))
         else:
-            file.save(os.path.join(folder, file.filename))
+            return "No file uploaded", 400
+    return render_template_string(UPLOAD_TEMPLATE)
 
-    # detect runtime
-    runtime = detect_runtime(folder)
-    if not runtime:
-        write_log(slug, "❌ No index.html or Python file found")
-        shutil.rmtree(folder, ignore_errors=True)
-        return jsonify({'error': 'No index.html or Python file found'}), 400
+@app.route('/build_logs/<slug>')
+def build_logs(slug):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    site = get_website_by_slug(slug)
+    if not site:
+        abort(404)
+    return render_template_string(LOGS_TEMPLATE, slug=slug, site_name=site['name'])
 
-    write_log(slug, f"🔍 Runtime detected: {runtime}")
-
-    # insert into DB
-    with get_db() as conn:
-        cur = conn.execute(
-            "INSERT INTO websites (name, slug, runtime, status, folder_path) VALUES (?, ?, ?, ?, ?)",
-            (slug, slug, runtime, 'building', folder)
-        )
-        website_id = cur.lastrowid
-        conn.commit()
-
-    # start deployment in background
-    def deploy():
-        try:
-            if runtime == 'python':
-                write_log(slug, "🐍 Python detected")
-                port = find_free_port()
-                write_log(slug, f"🔌 Using port {port}")
-                pid, error = start_website_process(slug, port)
-                if pid is None:
-                    write_log(slug, f"❌ Start failed: {error}")
-                    with get_db() as conn:
-                        conn.execute("UPDATE websites SET status='failed', port=?, pid=? WHERE id=?", (port, None, website_id))
-                        conn.commit()
-                    return
-                # update DB
-                with get_db() as conn:
-                    conn.execute("UPDATE websites SET status='running', port=?, pid=?, folder_path=? WHERE id=?",
-                                 (port, pid, folder, website_id))
-                    conn.commit()
-                write_log(slug, f"✅ Website started successfully!")
-                write_log(slug, f"🔗 URL: {request.host_url}{slug}/")
-            elif runtime == 'static':
-                write_log(slug, "📁 Static website")
-                with get_db() as conn:
-                    conn.execute("UPDATE websites SET status='running', port=0, pid=0 WHERE id=?", (website_id,))
-                    conn.commit()
-                write_log(slug, "✅ Static site ready")
-                write_log(slug, f"🔗 URL: {request.host_url}{slug}/")
-        except Exception as e:
-            write_log(slug, f"❌ Deployment error: {e}")
-            with get_db() as conn:
-                conn.execute("UPDATE websites SET status='failed' WHERE id=?", (website_id,))
-                conn.commit()
-
-    threading.Thread(target=deploy, daemon=True).start()
-
-    # return slug so frontend can poll
-    return jsonify({'success': True, 'slug': slug, 'message': 'Deployment started'})
-
-# ---------- STATUS / LOGS ----------
-@app.route('/status/<slug>')
-def status(slug):
+@app.route('/api/logs/<slug>')
+def api_logs(slug):
+    # return latest logs as JSON
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    with get_db() as conn:
-        website = conn.execute("SELECT * FROM websites WHERE slug=?", (slug,)).fetchone()
-        if not website:
-            return jsonify({'error': 'Not found'}), 404
-    return jsonify({
-        'status': website['status'],
-        'runtime': website['runtime'],
-        'port': website['port'],
-        'pid': website['pid'],
-        'logs': read_log(slug),
-        'url': f"{request.host_url}{slug}/" if website['status'] == 'running' else None
-    })
+    site = get_website_by_slug(slug)
+    if not site:
+        return jsonify({'error': 'Not found'}), 404
+    logs = get_latest_logs(site['id'], limit=200)
+    return jsonify(logs)
 
-@app.route('/logs/<slug>')
-def logs(slug):
-    if 'user_id' not in session:
-        return abort(401)
-    return jsonify({'logs': read_log(slug)})
-
-# ---------- START / STOP / DELETE ----------
 @app.route('/start/<slug>', methods=['POST'])
-def start_website(slug):
+def start_site(slug):
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    with get_db() as conn:
-        website = conn.execute("SELECT * FROM websites WHERE slug=?", (slug,)).fetchone()
-        if not website:
-            return jsonify({'error': 'Not found'}), 404
-        if website['status'] == 'running':
-            return jsonify({'error': 'Already running'}), 400
-
-        # if static, just mark running
-        if website['runtime'] == 'static':
-            conn.execute("UPDATE websites SET status='running' WHERE id=?", (website['id'],))
-            conn.commit()
-            return jsonify({'success': True})
-
-        # python: start process
-        folder = website['folder_path']
-        port = find_free_port()
-        write_log(slug, f"🔄 Starting manually...")
-        pid, error = start_website_process(slug, port)
-        if pid is None:
-            write_log(slug, f"❌ Start failed: {error}")
-            conn.execute("UPDATE websites SET status='failed', port=?, pid=? WHERE id=?", (port, None, website['id']))
-            conn.commit()
-            return jsonify({'error': error}), 500
-        conn.execute("UPDATE websites SET status='running', port=?, pid=?, folder_path=? WHERE id=?",
-                     (port, pid, folder, website['id']))
-        conn.commit()
-        write_log(slug, f"✅ Website started")
-        return jsonify({'success': True})
+    site = get_website_by_slug(slug)
+    if not site:
+        return jsonify({'error': 'Not found'}), 404
+    # only if not running
+    if site['status'] == 'Running':
+        return jsonify({'error': 'Already running'}), 400
+    # start in background
+    def start_thread():
+        log_callback = lambda msg: log_message(site['id'], msg)
+        log_callback(f"Manual start requested for {slug}")
+        folder_path = site['folder_path']
+        # detect runtime again
+        runtime, startup = detect_runtime(folder_path)
+        if runtime == 'python':
+            if not install_requirements(folder_path, log_callback):
+                update_website_status(slug, 'Failed')
+                log_callback("Start failed due to requirements.")
+                return
+            if start_python_app(slug, folder_path, startup, log_callback):
+                update_website_status(slug, 'Running')
+                log_callback("Started successfully.")
+            else:
+                update_website_status(slug, 'Failed')
+                log_callback("Start failed.")
+        else:
+            if start_static_server(slug, folder_path, log_callback):
+                update_website_status(slug, 'Running')
+                log_callback("Started successfully.")
+            else:
+                update_website_status(slug, 'Failed')
+                log_callback("Start failed.")
+    threading.Thread(target=start_thread, daemon=True).start()
+    return jsonify({'status': 'ok'})
 
 @app.route('/stop/<slug>', methods=['POST'])
-def stop_website(slug):
+def stop_site(slug):
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    with get_db() as conn:
-        website = conn.execute("SELECT * FROM websites WHERE slug=?", (slug,)).fetchone()
-        if not website:
-            return jsonify({'error': 'Not found'}), 404
-        if website['status'] != 'running':
-            return jsonify({'error': 'Not running'}), 400
-
-        if website['runtime'] == 'python':
-            stop_website_process(slug)
-        # update status
-        conn.execute("UPDATE websites SET status='stopped', port=0, pid=0 WHERE id=?", (website['id'],))
-        conn.commit()
-        write_log(slug, "⏹ Stopped manually")
-        return jsonify({'success': True})
+    site = get_website_by_slug(slug)
+    if not site:
+        return jsonify({'error': 'Not found'}), 404
+    if site['status'] != 'Running':
+        return jsonify({'error': 'Not running'}), 400
+    pid = site['pid']
+    if pid:
+        try:
+            os.kill(pid, 15)  # SIGTERM
+            # wait a bit
+            time.sleep(1)
+            # check if still alive
+            try:
+                os.kill(pid, 0)
+                # still alive, kill with SIGKILL
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        except Exception as e:
+            pass
+    update_website_status(slug, 'Stopped', pid=None, port=None)
+    return jsonify({'status': 'ok'})
 
 @app.route('/delete/<slug>', methods=['POST'])
-def delete_website(slug):
+def delete_site(slug):
     if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    with get_db() as conn:
-        website = conn.execute("SELECT * FROM websites WHERE slug=?", (slug,)).fetchone()
-        if not website:
-            return jsonify({'error': 'Not found'}), 404
+    site = get_website_by_slug(slug)
+    if not site:
+        return jsonify({'error': 'Not found'}), 404
+    # stop if running
+    if site['status'] == 'Running':
+        pid = site['pid']
+        if pid:
+            try:
+                os.kill(pid, 15)
+                time.sleep(0.5)
+                os.kill(pid, 9)
+            except:
+                pass
+    # delete files
+    folder = Path(site['folder_path'])
+    if folder.exists():
+        shutil.rmtree(folder)
+    # delete logs from DB
+    conn = get_db()
+    conn.execute("DELETE FROM logs WHERE website_id=?", (site['id'],))
+    conn.execute("DELETE FROM websites WHERE slug=?", (slug,))
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'ok'})
 
-        # stop if running
-        if website['status'] == 'running':
-            stop_website_process(slug)
-
-        # delete files
-        folder = website['folder_path']
-        if os.path.exists(folder):
-            shutil.rmtree(folder, ignore_errors=True)
-        log_file = get_log_file(slug)
-        if os.path.exists(log_file):
-            os.remove(log_file)
-
-        # delete DB record
-        conn.execute("DELETE FROM websites WHERE id=?", (website['id'],))
-        conn.commit()
-        return jsonify({'success': True})
-
-# ---------- STATIC / PROXY ----------
+# प्रॉक्सी / स्टैटिक सर्विंग
 @app.route('/<slug>/', defaults={'path': ''})
 @app.route('/<slug>/<path:path>')
-def serve_site(slug, path):
-    # check if exists
-    with get_db() as conn:
-        website = conn.execute("SELECT * FROM websites WHERE slug=?", (slug,)).fetchone()
-        if not website:
-            return "Website not found", 404
-
-    # if running python, proxy
-    if website['runtime'] == 'python' and website['status'] == 'running':
-        port = website['port']
+def serve_website(slug, path):
+    # check if website exists
+    site = get_website_by_slug(slug)
+    if not site:
+        abort(404)
+    # if status is not Running, show placeholder
+    if site['status'] != 'Running':
+        return render_template_string(SITE_OFF_TEMPLATE, slug=slug), 503
+    # if runtime is html, serve static files
+    if site['runtime'] == 'html' or site['runtime'] == 'HTML':
+        folder = Path(site['folder_path'])
+        if path == '':
+            # try index.html
+            if (folder / 'index.html').exists():
+                return send_from_directory(folder, 'index.html')
+            else:
+                # list directory? or 404
+                return "No index.html", 404
+        else:
+            # security: ensure path doesn't escape
+            safe_path = os.path.normpath(path)
+            if safe_path.startswith('..'):
+                abort(403)
+            full_path = folder / safe_path
+            if not full_path.exists():
+                abort(404)
+            if full_path.is_dir():
+                # maybe serve index inside that dir
+                if (full_path / 'index.html').exists():
+                    return send_from_directory(full_path, 'index.html')
+                else:
+                    return "Directory listing not allowed", 403
+            return send_from_directory(folder, safe_path)
+    else:
+        # Python app: proxy to localhost:port
+        port = site['port']
         if not port:
-            return "Port not assigned", 500
-        target = f"http://localhost:{port}/{path}"
+            return "App not running on port", 500
+        # forward request to localhost:port
+        target_url = f"http://localhost:{port}/{path}"
         if request.query_string:
-            target += "?" + request.query_string.decode('utf-8')
+            target_url += '?' + request.query_string.decode()
         try:
-            headers = {k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']}
             resp = requests.request(
                 method=request.method,
-                url=target,
-                headers=headers,
+                url=target_url,
+                headers={key: value for key, value in request.headers if key != 'Host'},
                 data=request.get_data(),
-                allow_redirects=False,
+                stream=True,
                 timeout=30
             )
-            # forward response
-            response = Response(resp.content, resp.status_code)
-            for k, v in resp.headers.items():
-                if k.lower() not in ['content-encoding', 'content-length', 'transfer-encoding', 'connection']:
-                    response.headers[k] = v
-            return response
+            # return response
+            excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+            headers = [(name, value) for name, value in resp.raw.headers.items()
+                       if name.lower() not in excluded_headers]
+            return Response(resp.raw, status=resp.status_code, headers=headers)
         except Exception as e:
-            return f"Proxy error: {e}", 502
+            return f"Proxy error: {str(e)}", 502
 
-    # static or stopped
-    folder = website['folder_path']
-    if not path:
-        if os.path.exists(os.path.join(folder, 'index.html')):
-            return send_from_directory(folder, 'index.html')
-        # list files
-        if os.path.isdir(folder):
-            files = os.listdir(folder)
-            html = f"<h2>Files for {slug}</h2><ul>"
-            for f in files:
-                html += f'<li><a href="{f}">{f}</a></li>'
-            html += "</ul>"
-            return html
-        return "No index.html", 404
-    else:
-        return send_from_directory(folder, path)
-
-# ---------- HTML TEMPLATES ----------
-LOGIN_HTML = """
+# ------------------ टेम्पलेट्स (इनलाइन) ------------------
+LOGIN_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hosting Panel - Login</title>
+    <title>Login - Hosting Panel</title>
     <style>
         body { font-family: Arial, sans-serif; background: #f5f5f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .login-box { background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 350px; }
-        h2 { text-align: center; margin-bottom: 30px; color: #333; }
-        input { width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-        button { width: 100%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
-        button:hover { background: #0056b3; }
-        .error { color: red; text-align: center; margin: 10px 0; }
+        .login-box { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 300px; }
+        h2 { margin-top: 0; }
+        label { display: block; margin: 10px 0 5px; }
+        input { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ddd; border-radius: 4px; }
+        button { width: 100%; padding: 10px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .error { color: red; }
     </style>
 </head>
 <body>
     <div class="login-box">
-        <h2>🔐 Login</h2>
-        <form method="POST">
-            <input type="text" name="username" placeholder="Username" value="admin" required>
-            <input type="password" name="password" placeholder="Password" value="admin" required>
+        <h2>Login</h2>
+        {% if error %}
+        <p class="error">{{ error }}</p>
+        {% endif %}
+        <form method="post">
+            <label>Username</label>
+            <input type="text" name="username" value="admin" required>
+            <label>Password</label>
+            <input type="password" name="password" value="admin" required>
             <button type="submit">Login</button>
         </form>
-        {% if error %}<div class="error">{{ error }}</div>{% endif %}
     </div>
 </body>
 </html>
-"""
+'''
 
-DASHBOARD_HTML = """
+DASHBOARD_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hosting Panel - Dashboard</title>
+    <title>Dashboard - Hosting Panel</title>
     <style>
-        body { font-family: Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        header { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
-        .btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
-        .btn-primary { background: #007bff; color: white; }
-        .btn-success { background: #28a745; color: white; }
-        .btn-danger { background: #dc3545; color: white; }
-        .btn-warning { background: #ffc107; color: #333; }
-        .btn-secondary { background: #6c757d; color: white; }
-        .btn-sm { padding: 4px 10px; font-size: 12px; }
-        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .upload-area { border: 2px dashed #ccc; padding: 30px; text-align: center; border-radius: 8px; cursor: pointer; transition: 0.3s; }
-        .upload-area.dragover { border-color: #007bff; background: #e9f5ff; }
-        .website-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
-        .website-card { background: white; border-radius: 8px; padding: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.08); border-left: 4px solid #007bff; }
-        .website-card .name { font-size: 18px; font-weight: bold; margin-bottom: 8px; }
-        .website-card .status { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
-        .status-running { background: #d4edda; color: #155724; }
-        .status-stopped { background: #e2e3e5; color: #383d41; }
-        .status-building { background: #fff3cd; color: #856404; }
-        .status-failed { background: #f8d7da; color: #721c24; }
-        .website-card .actions { margin-top: 12px; display: flex; gap: 5px; flex-wrap: wrap; }
-        .website-card .info { font-size: 14px; color: #555; margin: 4px 0; }
-        .website-card .link { color: #007bff; text-decoration: none; }
-        .website-card .link:hover { text-decoration: underline; }
-        .file-list { margin: 10px 0; }
-        #buildLogs { background: #1e1e1e; color: #d4d4d4; padding: 12px; border-radius: 4px; max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 13px; margin-top: 10px; display: none; }
-        .log-line { margin: 2px 0; }
-        .log-error { color: #f48771; }
-        .log-success { color: #6a9955; }
-        .log-info { color: #569cd6; }
-        .log-warn { color: #dcdcaa; }
-        .upload-controls { display: flex; gap: 10px; flex-wrap: wrap; margin: 15px 0; }
-        .upload-controls input[type="text"] { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; min-width: 150px; }
-        .file-list-item { display: inline-block; background: #eee; padding: 4px 10px; margin: 4px; border-radius: 12px; font-size: 13px; }
-        @media (max-width: 600px) { .website-grid { grid-template-columns: 1fr; } }
+        body { font-family: Arial, sans-serif; background: #f9f9f9; margin: 0; padding: 20px; }
+        .header { background: white; padding: 15px 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .header a { margin-left: 15px; text-decoration: none; color: #007bff; }
+        .btn { background: #007bff; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-block; }
+        .btn-danger { background: #dc3545; }
+        .btn-warning { background: #ffc107; color: #212529; }
+        .btn-success { background: #28a745; }
+        .btn-secondary { background: #6c757d; }
+        .card { background: white; border-radius: 8px; padding: 15px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .card h3 { margin: 0 0 10px; }
+        .card .info { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 10px; }
+        .card .info span { background: #f1f1f1; padding: 4px 10px; border-radius: 12px; font-size: 0.9em; }
+        .card .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+        .card .actions form { display: inline; }
+        .status-Running { color: #28a745; font-weight: bold; }
+        .status-Stopped { color: #6c757d; }
+        .status-Building { color: #ffc107; }
+        .status-Failed { color: #dc3545; }
+        .link { word-break: break-all; }
     </style>
 </head>
 <body>
-<div class="container">
-    <header>
-        <h2>🚀 Hosting Panel</h2>
+    <div class="header">
+        <h2>Hosting Panel</h2>
         <div>
-            <span style="margin-right: 15px;">👤 {{ session.username }}</span>
-            <a href="/logout" class="btn btn-danger">Logout</a>
-        </div>
-    </header>
-
-    <!-- Upload Section -->
-    <div class="card">
-        <h3>📤 Upload Website</h3>
-        <div class="upload-area" id="dropZone">
-            <p style="font-size: 24px;">📂</p>
-            <p>Drag & drop ZIP or files here, or click to browse</p>
-            <p style="font-size: 12px; color: #777;">Supports .zip, .html, .py, .css, .js, etc.</p>
-        </div>
-        <input type="file" id="fileInput" multiple style="display:none;">
-        <div id="fileList" class="file-list"></div>
-        <div class="upload-controls">
-            <input type="text" id="slugInput" placeholder="Custom slug (optional)">
-            <button class="btn btn-primary" id="deployBtn">🚀 Deploy</button>
-        </div>
-        <div id="buildLogs"></div>
-        <div id="deployResult" style="margin-top: 10px;"></div>
-    </div>
-
-    <!-- Website List -->
-    <div class="card">
-        <h3>📋 Deployed Websites</h3>
-        <div class="website-grid" id="websiteGrid">
-            {% for website in websites %}
-                <div class="website-card" data-slug="{{ website.slug }}">
-                    <div class="name">{{ website.name }}</div>
-                    <div class="info">Runtime: {{ website.runtime }}</div>
-                    <div class="info">
-                        Status: <span class="status status-{{ website.status }}">{{ website.status }}</span>
-                    </div>
-                    <div class="info">Uploaded: {{ website.upload_date }}</div>
-                    <div class="info">
-                        Link: 
-                        {% if website.status == 'running' %}
-                            <a href="{{ host_url }}{{ website.slug }}/" target="_blank" class="link">{{ host_url }}{{ website.slug }}/</a>
-                        {% else %}
-                            <span style="color: #999;">Not running</span>
-                        {% endif %}
-                    </div>
-                    <div class="actions">
-                        <button class="btn btn-success btn-sm start-btn" data-slug="{{ website.slug }}">▶ Start</button>
-                        <button class="btn btn-warning btn-sm stop-btn" data-slug="{{ website.slug }}">⏹ Stop</button>
-                        <button class="btn btn-secondary btn-sm logs-btn" data-slug="{{ website.slug }}">📜 Logs</button>
-                        <button class="btn btn-danger btn-sm delete-btn" data-slug="{{ website.slug }}">🗑 Delete</button>
-                    </div>
-                </div>
-            {% else %}
-                <p>No websites deployed yet.</p>
-            {% endfor %}
+            <a href="{{ url_for('upload') }}" class="btn">Upload Website</a>
+            <a href="#" class="btn btn-secondary">GitHub Deploy</a>
+            <a href="{{ url_for('logout') }}" class="btn btn-danger">Logout</a>
+            <span>Welcome, {{ username }}</span>
         </div>
     </div>
-</div>
 
-<!-- Log Modal -->
-<div id="logModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
-    <div style="background:white; border-radius:8px; padding:20px; max-width:800px; width:90%; max-height:80%; overflow:auto;">
-        <h3>📜 Build Logs <span id="logSlug" style="font-weight:normal;font-size:14px;color:#555;"></span></h3>
-        <pre id="logContent" style="background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:4px;white-space:pre-wrap;word-wrap:break-word;max-height:400px;overflow:auto;"></pre>
-        <button class="btn btn-danger" id="closeLogModal">Close</button>
-    </div>
-</div>
-
-<script>
-    // ---------- UPLOAD ----------
-    const dropZone = document.getElementById('dropZone');
-    const fileInput = document.getElementById('fileInput');
-    const fileList = document.getElementById('fileList');
-    const slugInput = document.getElementById('slugInput');
-    const deployBtn = document.getElementById('deployBtn');
-    const buildLogs = document.getElementById('buildLogs');
-    const deployResult = document.getElementById('deployResult');
-    let selectedFiles = [];
-    let pollInterval = null;
-    let currentSlug = null;
-
-    dropZone.addEventListener('click', () => fileInput.click());
-    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
-    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-    dropZone.addEventListener('drop', (e) => {
-        e.preventDefault();
-        dropZone.classList.remove('dragover');
-        if (e.dataTransfer.files.length) {
-            selectedFiles = Array.from(e.dataTransfer.files);
-            updateFileList();
-        }
-    });
-    fileInput.addEventListener('change', () => {
-        if (fileInput.files.length) {
-            selectedFiles = Array.from(fileInput.files);
-            updateFileList();
-        }
-    });
-
-    function updateFileList() {
-        if (selectedFiles.length === 0) { fileList.innerHTML = ''; return; }
-        let html = '<strong>Selected files:</strong> ';
-        selectedFiles.forEach(f => html += `<span class="file-list-item">${f.name} (${(f.size/1024).toFixed(1)} KB)</span>`);
-        fileList.innerHTML = html;
-    }
-
-    deployBtn.addEventListener('click', async () => {
-        if (selectedFiles.length === 0) { alert('Select files first.'); return; }
-        const slug = slugInput.value.trim();
-
-        const formData = new FormData();
-        selectedFiles.forEach(f => formData.append('files', f));
-        formData.append('slug', slug);
-
-        deployBtn.disabled = true;
-        deployBtn.textContent = '⏳ Deploying...';
-        buildLogs.style.display = 'block';
-        buildLogs.innerHTML = '<div class="log-line log-info">⏳ Starting deployment...</div>';
-        deployResult.innerHTML = '';
-
-        try {
-            const res = await fetch('/upload', { method: 'POST', body: formData });
-            const data = await res.json();
-            if (data.success) {
-                currentSlug = data.slug;
-                buildLogs.innerHTML += `<div class="log-line log-success">✅ Upload complete. Slug: ${data.slug}</div>`;
-                // start polling
-                if (pollInterval) clearInterval(pollInterval);
-                pollInterval = setInterval(pollStatus, 1500);
-                setTimeout(pollStatus, 500);
-            } else {
-                buildLogs.innerHTML += `<div class="log-line log-error">❌ Error: ${data.error}</div>`;
-                deployBtn.disabled = false;
-                deployBtn.textContent = '🚀 Deploy';
-            }
-        } catch (e) {
-            buildLogs.innerHTML += `<div class="log-line log-error">❌ Network error: ${e.message}</div>`;
-            deployBtn.disabled = false;
-            deployBtn.textContent = '🚀 Deploy';
-        }
-    });
-
-    function pollStatus() {
-        if (!currentSlug) return;
-        fetch(`/status/${currentSlug}`)
-            .then(res => res.json())
-            .then(data => {
-                // Update logs
-                if (data.logs) {
-                    const lines = data.logs.split('\n');
-                    let html = '';
-                    for (let line of lines) {
-                        if (line.includes('❌')) html += `<div class="log-line log-error">${escapeHtml(line)}</div>`;
-                        else if (line.includes('✅') || line.includes('success') || line.includes('ready')) html += `<div class="log-line log-success">${escapeHtml(line)}</div>`;
-                        else if (line.includes('⏳') || line.includes('Waiting') || line.includes('Starting')) html += `<div class="log-line log-info">${escapeHtml(line)}</div>`;
-                        else if (line.includes('⚠️')) html += `<div class="log-line log-warn">${escapeHtml(line)}</div>`;
-                        else if (line.trim()) html += `<div class="log-line">${escapeHtml(line)}</div>`;
-                    }
-                    buildLogs.innerHTML = html || '<div class="log-line log-info">⏳ No logs yet...</div>';
-                    buildLogs.scrollTop = buildLogs.scrollHeight;
-                }
-
-                if (data.status === 'running') {
-                    clearInterval(pollInterval);
-                    deployResult.innerHTML = `
-                        <div style="color: #28a745; font-weight: bold;">✅ Deployment successful!</div>
-                        <div>Link: <a href="${data.url}" target="_blank">${data.url}</a></div>
-                    `;
-                    deployBtn.disabled = false;
-                    deployBtn.textContent = '🚀 Deploy';
-                    // reload page after 2s to update list
-                    setTimeout(() => location.reload(), 2000);
-                } else if (data.status === 'failed') {
-                    clearInterval(pollInterval);
-                    deployResult.innerHTML = `<div style="color: #dc3545; font-weight: bold;">❌ Deployment failed. Check logs above.</div>`;
-                    deployBtn.disabled = false;
-                    deployBtn.textContent = '🚀 Deploy';
-                }
-            })
-            .catch(err => console.error('Poll error:', err));
-    }
-
-    function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-    }
-
-    // ---------- LOG MODAL ----------
-    const logModal = document.getElementById('logModal');
-    const logContent = document.getElementById('logContent');
-    const logSlug = document.getElementById('logSlug');
-    const closeLogModal = document.getElementById('closeLogModal');
-
-    document.querySelectorAll('.logs-btn').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            const slug = e.target.dataset.slug;
-            logSlug.textContent = `(${slug})`;
-            logContent.textContent = 'Loading...';
-            logModal.style.display = 'flex';
-            try {
-                const res = await fetch(`/logs/${slug}`);
-                const data = await res.json();
-                logContent.textContent = data.logs || 'No logs.';
-            } catch (err) {
-                logContent.textContent = 'Error loading logs.';
-            }
-        });
-    });
-    closeLogModal.addEventListener('click', () => { logModal.style.display = 'none'; });
-    logModal.addEventListener('click', (e) => { if (e.target === logModal) logModal.style.display = 'none'; });
-
-    // ---------- ACTION BUTTONS ----------
-    document.querySelectorAll('.start-btn').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            const slug = e.target.dataset.slug;
-            if (!confirm(`Start ${slug}?`)) return;
-            const res = await fetch(`/start/${slug}`, { method: 'POST' });
-            if (res.ok) location.reload();
-        });
-    });
-
-    document.querySelectorAll('.stop-btn').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            const slug = e.target.dataset.slug;
-            if (!confirm(`Stop ${slug}?`)) return;
-            const res = await fetch(`/stop/${slug}`, { method: 'POST' });
-            if (res.ok) location.reload();
-        });
-    });
-
-    document.querySelectorAll('.delete-btn').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            const slug = e.target.dataset.slug;
-            if (!confirm(`Delete ${slug} permanently?`)) return;
-            const res = await fetch(`/delete/${slug}`, { method: 'POST' });
-            if (res.ok) location.reload();
-        });
-    });
-</script>
+    <h3>Your Websites</h3>
+    {% if sites %}
+        {% for site in sites %}
+        <div class="card">
+            <div class="info">
+                <h3>{{ site.name }}</h3>
+                <span>Runtime: {{ site.runtime or 'N/A' }}</span>
+                <span class="status-{{ site.status }}">Status: {{ site.status }}</span>
+                <span>Uploaded: {{ site.upload_date }}</span>
+            </div>
+            <div class="link"><a href="{{ site.link }}" target="_blank">{{ site.link }}</a></div>
+            <div class="actions">
+                <form action="{{ url_for('start_site', slug=site.slug) }}" method="post" style="display:inline;">
+                    <button type="submit" class="btn btn-success">Start</button>
+                </form>
+                <form action="{{ url_for('stop_site', slug=site.slug) }}" method="post" style="display:inline;">
+                    <button type="submit" class="btn btn-warning">Stop</button>
+                </form>
+                <form action="{{ url_for('delete_site', slug=site.slug) }}" method="post" style="display:inline;" onsubmit="return confirm('Delete this website?');">
+                    <button type="submit" class="btn btn-danger">Delete</button>
+                </form>
+                <a href="{{ url_for('build_logs', slug=site.slug) }}" class="btn btn-secondary">Build Logs</a>
+            </div>
+        </div>
+        {% endfor %}
+    {% else %}
+        <p>No websites uploaded yet.</p>
+    {% endif %}
 </body>
 </html>
-"""
+'''
 
-# ---------- MAIN ----------
+UPLOAD_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Upload Website</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f9f9f9; padding: 20px; }
+        .container { max-width: 600px; margin: auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        label { display: block; margin: 15px 0 5px; }
+        input[type="text"], input[type="file"] { width: 100%; padding: 8px; box-sizing: border-box; border: 1px solid #ddd; border-radius: 4px; }
+        .btn { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+        .back { display: inline-block; margin-top: 15px; color: #007bff; text-decoration: none; }
+        .note { color: #6c757d; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Upload Website</h2>
+        <form method="post" enctype="multipart/form-data">
+            <label>Website Name</label>
+            <input type="text" name="name" placeholder="e.g., my-app" required>
+
+            <label>Upload ZIP file</label>
+            <input type="file" name="zipfile" accept=".zip">
+            <p class="note">Or upload multiple files/folders (select all files in your project directory)</p>
+            <input type="file" name="files[]" multiple webkitdirectory directory>
+            <br><br>
+            <button type="submit" class="btn">Upload & Deploy</button>
+        </form>
+        <a href="{{ url_for('dashboard') }}" class="back">← Back to Dashboard</a>
+    </div>
+</body>
+</html>
+'''
+
+LOGS_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Build Logs - {{ site_name }}</title>
+    <style>
+        body { font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; }
+        .container { max-width: 900px; margin: auto; }
+        h2 { color: #fff; }
+        pre { background: #2d2d2d; padding: 15px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; max-height: 600px; overflow-y: auto; }
+        .back { color: #4a9eff; text-decoration: none; display: inline-block; margin-top: 10px; }
+        .status { color: #ffcc00; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Build Logs for {{ site_name }}</h2>
+        <div id="logs"><pre>Loading logs...</pre></div>
+        <a href="{{ url_for('dashboard') }}" class="back">← Back to Dashboard</a>
+    </div>
+    <script>
+        function fetchLogs() {
+            fetch('/api/logs/{{ slug }}')
+                .then(res => res.json())
+                .then(data => {
+                    let html = '';
+                    if (data.length === 0) html = 'No logs yet.';
+                    else {
+                        data.forEach(item => {
+                            html += item.timestamp + ' - ' + item.log_text + '\\n';
+                        });
+                    }
+                    document.getElementById('logs').innerHTML = '<pre>' + html + '</pre>';
+                })
+                .catch(err => console.error(err));
+        }
+        fetchLogs();
+        setInterval(fetchLogs, 3000);
+    </script>
+</body>
+</html>
+'''
+
+SITE_OFF_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head><title>Site Offline</title></head>
+<body>
+    <h1>Website is not running</h1>
+    <p>The site {{ slug }} is currently stopped or failed. Please start it from the dashboard.</p>
+</body>
+</html>
+'''
+
+# ------------------ मुख्य ------------------
 if __name__ == '__main__':
+    # सेटिंग्स: हम production के लिए 0.0.0.0 पर सुनेंगे
+    # Use environment variable PORT if set
     port = int(os.environ.get('PORT', 5000))
-    print("="*60)
-    print("🌐 Website Hosting Panel Started")
-    print(f"🔗 Visit: http://localhost:{port}")
-    print("🔑 Login: admin / admin")
-    print("📁 Upload folder:", UPLOAD_FOLDER)
-    print("📜 Logs folder:", LOGS_FOLDER)
-    print("="*60)
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    # For development, debug=True but we set debug=False for production
+    app.run(host='0.0.0.0', port=port, debug=DEBUG)
