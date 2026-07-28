@@ -2,122 +2,128 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import json
+import sqlite3
 import uuid
 import shutil
 import zipfile
 import subprocess
-import time
 import threading
-import socket
+import time
 import signal
+import socket
 import requests
 from datetime import datetime
-from flask import Flask, request, jsonify, session, render_template_string, send_from_directory, Response
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, send_from_directory, Response, abort
 
 app = Flask(__name__)
-app.secret_key = 'secret-key-change-me'
+app.secret_key = os.environ.get('SECRET_KEY', 'change-this-secret-key-in-production')
 
 # ---------- CONFIG ----------
-ADMIN_USER = "admin"
-ADMIN_PASS = "admin"
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 LOGS_FOLDER = os.path.join(BASE_DIR, 'logs')
-DB_FILE = os.path.join(BASE_DIR, 'deployments.json')
-
+DB_PATH = os.path.join(BASE_DIR, 'hosting.db')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOGS_FOLDER, exist_ok=True)
 
 # ---------- DATABASE ----------
-def load_db():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, 'r') as f:
-            return json.load(f)
-    return {}
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def save_db(db):
-    with open(DB_FILE, 'w') as f:
-        json.dump(db, f, indent=2)
-
-db = load_db()
+def init_db():
+    with get_db() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS websites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                slug TEXT UNIQUE NOT NULL,
+                runtime TEXT,
+                status TEXT DEFAULT 'stopped',
+                port INTEGER,
+                pid INTEGER,
+                upload_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                folder_path TEXT
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                website_id INTEGER,
+                log_text TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (website_id) REFERENCES websites(id)
+            )
+        ''')
+        # insert default admin if not exists
+        cur = conn.execute("SELECT * FROM users WHERE username='admin'")
+        if not cur.fetchone():
+            conn.execute("INSERT INTO users (username, password) VALUES ('admin', 'admin')")
+        conn.commit()
+init_db()
 
 # ---------- HELPERS ----------
-def get_user_folder(username):
-    folder = os.path.join(UPLOAD_FOLDER, username)
+def get_user_folder(slug):
+    folder = os.path.join(UPLOAD_FOLDER, slug)
     os.makedirs(folder, exist_ok=True)
     return folder
 
-def get_log_file(username):
-    return os.path.join(LOGS_FOLDER, f"{username}.log")
+def get_log_file(slug):
+    return os.path.join(LOGS_FOLDER, f"{slug}.log")
+
+def write_log(slug, text):
+    log_file = get_log_file(slug)
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {text}\n")
+
+def read_log(slug):
+    log_file = get_log_file(slug)
+    if os.path.exists(log_file):
+        with open(log_file, 'r', encoding='utf-8') as f:
+            return f.read()
+    return ""
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
         return s.getsockname()[1]
 
-def extract_zip(zip_path, dest):
-    with zipfile.ZipFile(zip_path, 'r') as z:
-        z.extractall(dest)
-    os.remove(zip_path)
-
-def detect_main_file(folder):
-    candidates = ['app.py', 'main.py', 'server.py', 'index.py', 'bot.py']
-    for f in candidates:
-        if os.path.exists(os.path.join(folder, f)):
-            return f
-    return None
-
-def wait_for_port(port, timeout=30):
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect(('localhost', port))
-                return True
-        except:
-            time.sleep(0.5)
-    return False
-
-# ---------- PROCESS TRACKING ----------
-processes = {}  # username -> subprocess.Popen
-
-def log_append(username, line):
-    log_file = get_log_file(username)
-    with open(log_file, 'a') as f:
-        f.write(line + '\n')
-
-def get_log_content(username):
-    log_file = get_log_file(username)
-    if os.path.exists(log_file):
-        with open(log_file, 'r') as f:
-            return f.read()
-    return ""
-
-# ---------- DEPLOYMENT ENGINE ----------
-def deploy_app(username, folder):
-    """Background thread function"""
+def is_port_open(port, timeout=5):
     try:
-        log_append(username, f"🚀 Deployment started for {username} at {datetime.now()}")
-        log_append(username, f"📁 Folder: {folder}")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(('localhost', port))
+            return True
+    except:
+        return False
 
-        # 1. Detect main file
-        main_file = detect_main_file(folder)
-        if not main_file:
-            # Static site - no process needed
-            log_append(username, "📄 Static site detected (no Python file found)")
-            db[username]['status'] = 'static'
-            db[username]['link'] = f"/{username}"
-            save_db(db)
-            return
+# ---------- PROCESS MANAGEMENT ----------
+processes = {}  # slug -> subprocess.Popen
 
-        log_append(username, f"🐍 Python app detected: {main_file}")
+def start_website_process(slug, port):
+    folder = get_user_folder(slug)
+    runtime = detect_runtime(folder)
+    if not runtime:
+        return None, "No runtime detected"
 
-        # 2. Install requirements
+    if runtime == 'python':
+        start_file = detect_python_start_file(folder)
+        if not start_file:
+            return None, "No Python start file found"
+        # install requirements
         req_file = os.path.join(folder, 'requirements.txt')
         if os.path.exists(req_file):
-            log_append(username, "📦 Installing dependencies...")
+            write_log(slug, "📦 Installing requirements...")
             try:
                 proc = subprocess.Popen(
                     ['pip', 'install', '-r', 'requirements.txt'],
@@ -127,295 +133,355 @@ def deploy_app(username, folder):
                     text=True
                 )
                 for line in proc.stdout:
-                    log_append(username, f"  {line.strip()}")
+                    write_log(slug, line.strip())
                 proc.wait()
                 if proc.returncode != 0:
-                    log_append(username, "❌ pip install failed")
-                    db[username]['status'] = 'failed'
-                    db[username]['error'] = 'pip install failed'
-                    save_db(db)
-                    return
-                log_append(username, "✅ Dependencies installed")
+                    write_log(slug, "❌ pip install failed")
+                    return None, "pip install failed"
+                write_log(slug, "✅ Requirements installed")
             except Exception as e:
-                log_append(username, f"❌ pip install error: {e}")
-                db[username]['status'] = 'failed'
-                db[username]['error'] = str(e)
-                save_db(db)
-                return
+                write_log(slug, f"❌ pip install error: {e}")
+                return None, str(e)
 
-        # 3. Find free port
-        port = find_free_port()
-        log_append(username, f"🔌 Using port: {port}")
-
-        # 4. Start the app
         env = os.environ.copy()
         env['PORT'] = str(port)
         env['HOST'] = '0.0.0.0'
-
-        log_file = get_log_file(username)
-
+        log_file = get_log_file(slug)
         try:
             proc = subprocess.Popen(
-                ['python3', main_file],
+                ['python3', start_file],
                 cwd=folder,
                 stdout=open(log_file, 'a'),
                 stderr=subprocess.STDOUT,
                 env=env,
                 preexec_fn=os.setsid if os.name != 'nt' else None
             )
-
-            processes[username] = proc
-            db[username]['pid'] = proc.pid
-            db[username]['port'] = port
-            db[username]['status'] = 'starting'
-            db[username]['started_at'] = datetime.now().isoformat()
-            save_db(db)
-
-            log_append(username, f"✅ Process started with PID {proc.pid}")
-            log_append(username, "⏳ Waiting for server to be ready...")
-
-            # 5. Wait for port
-            if wait_for_port(port, timeout=30):
-                log_append(username, "✅ Server is ready!")
-                db[username]['status'] = 'running'
-                db[username]['link'] = f"/{username}"
-                save_db(db)
-                log_append(username, f"🔗 Link: /{username}")
-            else:
-                # Check if process died
-                if proc.poll() is not None:
-                    log_append(username, f"❌ Process died with code {proc.returncode}")
-                else:
-                    log_append(username, "❌ Timeout waiting for server")
-                    # Kill it
-                    try:
-                        if os.name != 'nt':
-                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                        else:
-                            proc.terminate()
-                    except:
-                        pass
-                db[username]['status'] = 'failed'
-                db[username]['error'] = 'Server failed to start (timeout)'
-                save_db(db)
-
+            processes[slug] = proc
+            write_log(slug, f"✅ Process started with PID {proc.pid} on port {port}")
+            # wait for port to be open
+            for _ in range(30):
+                if is_port_open(port):
+                    write_log(slug, "✅ Server is ready")
+                    return proc.pid, None
+                time.sleep(1)
+            # timeout
+            write_log(slug, "❌ Timeout waiting for server to start")
+            stop_website_process(slug)
+            return None, "Timeout waiting for server"
         except Exception as e:
-            log_append(username, f"❌ Error starting process: {e}")
-            db[username]['status'] = 'failed'
-            db[username]['error'] = str(e)
-            save_db(db)
+            write_log(slug, f"❌ Error starting process: {e}")
+            return None, str(e)
 
-    except Exception as e:
-        log_append(username, f"❌ Deployment error: {e}")
-        db[username]['status'] = 'failed'
-        db[username]['error'] = str(e)
-        save_db(db)
+    elif runtime == 'static':
+        # no process needed, just serve static
+        write_log(slug, "📁 Static website (no process)")
+        return 0, None  # pid = 0 means static
 
-def stop_app(username):
-    if username in processes:
+    return None, "Unsupported runtime"
+
+def stop_website_process(slug):
+    if slug in processes:
+        proc = processes[slug]
         try:
-            proc = processes[username]
-            if proc.poll() is None:
-                if os.name != 'nt':
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                else:
-                    proc.terminate()
-                proc.wait(timeout=5)
-            del processes[username]
+            if os.name != 'nt':
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            else:
+                proc.terminate()
+            proc.wait(timeout=5)
         except:
             pass
-    if username in db:
-        db[username]['status'] = 'stopped'
-        db[username]['pid'] = None
-        save_db(db)
-    log_append(username, "🛑 App stopped")
+        del processes[slug]
+    write_log(slug, "🛑 Process stopped")
+    return True
 
-# ---------- CLEANUP ON EXIT ----------
-def cleanup():
-    for username in list(processes.keys()):
-        try:
-            proc = processes[username]
-            if proc.poll() is None:
-                if os.name != 'nt':
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                else:
-                    proc.terminate()
-        except:
-            pass
+def detect_runtime(folder):
+    if os.path.exists(os.path.join(folder, 'index.html')):
+        return 'static'
+    # check for python files
+    python_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
+    for f in python_files:
+        if os.path.exists(os.path.join(folder, f)):
+            return 'python'
+    return None
 
-import atexit
-atexit.register(cleanup)
+def detect_python_start_file(folder):
+    python_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
+    for f in python_files:
+        if os.path.exists(os.path.join(folder, f)):
+            return f
+    return None
 
 # ---------- ROUTES ----------
 @app.route('/', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        u = request.form.get('username')
-        p = request.form.get('password')
-        if u == ADMIN_USER and p == ADMIN_PASS:
-            session['logged_in'] = True
-            return redirect('/dashboard')
+        username = request.form.get('username')
+        password = request.form.get('password')
+        with get_db() as conn:
+            cur = conn.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password))
+            user = cur.fetchone()
+            if user:
+                session['user_id'] = user['id']
+                session['username'] = user['username']
+                return redirect('/dashboard')
         return render_template_string(LOGIN_HTML, error="Invalid credentials")
-    if session.get('logged_in'):
+    if 'user_id' in session:
         return redirect('/dashboard')
     return render_template_string(LOGIN_HTML, error=None)
 
 @app.route('/dashboard')
 def dashboard():
-    if not session.get('logged_in'):
+    if 'user_id' not in session:
         return redirect('/')
-    return render_template_string(DASHBOARD_HTML, deployments=db)
+    with get_db() as conn:
+        websites = conn.execute("SELECT * FROM websites ORDER BY upload_date DESC").fetchall()
+    return render_template_string(DASHBOARD_HTML, websites=websites, host_url=request.host_url)
 
 @app.route('/logout')
 def logout():
     session.clear()
     return redirect('/')
 
-# ---------- DEPLOY ----------
-@app.route('/deploy', methods=['POST'])
-def deploy():
-    if not session.get('logged_in'):
+# ---------- UPLOAD ----------
+@app.route('/upload', methods=['POST'])
+def upload():
+    if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
 
-    username = request.form.get('username', '').strip()
-    if not username:
-        username = str(uuid.uuid4())[:8]
-
-    if username in db:
-        return jsonify({'error': 'Username already taken'}), 400
+    if 'files' not in request.files:
+        return jsonify({'error': 'No files'}), 400
 
     files = request.files.getlist('files')
     if not files or all(f.filename == '' for f in files):
-        return jsonify({'error': 'No files uploaded'}), 400
+        return jsonify({'error': 'No files selected'}), 400
 
-    # Stop any existing
-    if username in processes:
-        stop_app(username)
+    # generate slug
+    slug = request.form.get('slug', '').strip()
+    if not slug:
+        slug = str(uuid.uuid4())[:8]
+    else:
+        # sanitize
+        slug = ''.join(c for c in slug if c.isalnum() or c in '-_')
+        if not slug:
+            slug = str(uuid.uuid4())[:8]
 
-    # Create folder
-    folder = get_user_folder(username)
+    # check if slug exists
+    with get_db() as conn:
+        cur = conn.execute("SELECT id FROM websites WHERE slug=?", (slug,))
+        if cur.fetchone():
+            return jsonify({'error': 'Slug already taken'}), 400
+
+    # create folder
+    folder = get_user_folder(slug)
     shutil.rmtree(folder, ignore_errors=True)
     os.makedirs(folder)
 
-    # Clear log
-    log_file = get_log_file(username)
+    # clear log
+    log_file = get_log_file(slug)
     if os.path.exists(log_file):
         os.remove(log_file)
 
-    # Save files
+    write_log(slug, "📤 Upload started")
+
+    # save files
     for file in files:
         if file.filename == '':
             continue
         if file.filename.lower().endswith('.zip'):
-            temp = os.path.join(folder, file.filename)
-            file.save(temp)
-            extract_zip(temp, folder)
+            temp_path = os.path.join(folder, file.filename)
+            file.save(temp_path)
+            write_log(slug, f"📦 Extracting {file.filename}...")
+            try:
+                with zipfile.ZipFile(temp_path, 'r') as z:
+                    z.extractall(folder)
+                os.remove(temp_path)
+                write_log(slug, "✅ ZIP extracted")
+            except Exception as e:
+                write_log(slug, f"❌ ZIP extract failed: {e}")
+                shutil.rmtree(folder, ignore_errors=True)
+                return jsonify({'error': f'ZIP extract failed: {e}'}), 400
         else:
             file.save(os.path.join(folder, file.filename))
 
-    # Create DB entry
-    db[username] = {
-        'username': username,
-        'created_at': datetime.now().isoformat(),
-        'status': 'uploaded',
-        'port': None,
-        'pid': None,
-        'link': None,
-        'error': None,
-        'folder': folder
-    }
-    save_db(db)
+    # detect runtime
+    runtime = detect_runtime(folder)
+    if not runtime:
+        write_log(slug, "❌ No index.html or Python file found")
+        shutil.rmtree(folder, ignore_errors=True)
+        return jsonify({'error': 'No index.html or Python file found'}), 400
 
-    log_append(username, f"📁 Files saved to {folder}")
+    write_log(slug, f"🔍 Runtime detected: {runtime}")
 
-    # Start deployment in background
-    threading.Thread(target=deploy_app, args=(username, folder), daemon=True).start()
+    # insert into DB
+    with get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO websites (name, slug, runtime, status, folder_path) VALUES (?, ?, ?, ?, ?)",
+            (slug, slug, runtime, 'building', folder)
+        )
+        website_id = cur.lastrowid
+        conn.commit()
 
+    # start deployment in background
+    def deploy():
+        try:
+            if runtime == 'python':
+                write_log(slug, "🐍 Python detected")
+                port = find_free_port()
+                write_log(slug, f"🔌 Using port {port}")
+                pid, error = start_website_process(slug, port)
+                if pid is None:
+                    write_log(slug, f"❌ Start failed: {error}")
+                    with get_db() as conn:
+                        conn.execute("UPDATE websites SET status='failed', port=?, pid=? WHERE id=?", (port, None, website_id))
+                        conn.commit()
+                    return
+                # update DB
+                with get_db() as conn:
+                    conn.execute("UPDATE websites SET status='running', port=?, pid=?, folder_path=? WHERE id=?",
+                                 (port, pid, folder, website_id))
+                    conn.commit()
+                write_log(slug, f"✅ Website started successfully!")
+                write_log(slug, f"🔗 URL: {request.host_url}{slug}/")
+            elif runtime == 'static':
+                write_log(slug, "📁 Static website")
+                with get_db() as conn:
+                    conn.execute("UPDATE websites SET status='running', port=0, pid=0 WHERE id=?", (website_id,))
+                    conn.commit()
+                write_log(slug, "✅ Static site ready")
+                write_log(slug, f"🔗 URL: {request.host_url}{slug}/")
+        except Exception as e:
+            write_log(slug, f"❌ Deployment error: {e}")
+            with get_db() as conn:
+                conn.execute("UPDATE websites SET status='failed' WHERE id=?", (website_id,))
+                conn.commit()
+
+    threading.Thread(target=deploy, daemon=True).start()
+
+    # return slug so frontend can poll
+    return jsonify({'success': True, 'slug': slug, 'message': 'Deployment started'})
+
+# ---------- STATUS / LOGS ----------
+@app.route('/status/<slug>')
+def status(slug):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    with get_db() as conn:
+        website = conn.execute("SELECT * FROM websites WHERE slug=?", (slug,)).fetchone()
+        if not website:
+            return jsonify({'error': 'Not found'}), 404
     return jsonify({
-        'success': True,
-        'username': username,
-        'message': 'Deployment started'
+        'status': website['status'],
+        'runtime': website['runtime'],
+        'port': website['port'],
+        'pid': website['pid'],
+        'logs': read_log(slug),
+        'url': f"{request.host_url}{slug}/" if website['status'] == 'running' else None
     })
 
-# ---------- STATUS (for polling) ----------
-@app.route('/status/<username>')
-def status(username):
-    if not session.get('logged_in'):
+@app.route('/logs/<slug>')
+def logs(slug):
+    if 'user_id' not in session:
+        return abort(401)
+    return jsonify({'logs': read_log(slug)})
+
+# ---------- START / STOP / DELETE ----------
+@app.route('/start/<slug>', methods=['POST'])
+def start_website(slug):
+    if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    if username not in db:
-        return jsonify({'error': 'Not found'}), 404
+    with get_db() as conn:
+        website = conn.execute("SELECT * FROM websites WHERE slug=?", (slug,)).fetchone()
+        if not website:
+            return jsonify({'error': 'Not found'}), 404
+        if website['status'] == 'running':
+            return jsonify({'error': 'Already running'}), 400
 
-    data = db[username].copy()
-    data['logs'] = get_log_content(username)
-    data['link'] = data.get('link', '')
-    data['is_running'] = username in processes and processes[username].poll() is None
+        # if static, just mark running
+        if website['runtime'] == 'static':
+            conn.execute("UPDATE websites SET status='running' WHERE id=?", (website['id'],))
+            conn.commit()
+            return jsonify({'success': True})
 
-    # Check if process died
-    if data['status'] == 'running' and username in processes and processes[username].poll() is not None:
-        data['status'] = 'failed'
-        data['error'] = f"Process died with code {processes[username].returncode}"
-        db[username]['status'] = 'failed'
-        save_db(db)
+        # python: start process
+        folder = website['folder_path']
+        port = find_free_port()
+        write_log(slug, f"🔄 Starting manually...")
+        pid, error = start_website_process(slug, port)
+        if pid is None:
+            write_log(slug, f"❌ Start failed: {error}")
+            conn.execute("UPDATE websites SET status='failed', port=?, pid=? WHERE id=?", (port, None, website['id']))
+            conn.commit()
+            return jsonify({'error': error}), 500
+        conn.execute("UPDATE websites SET status='running', port=?, pid=?, folder_path=? WHERE id=?",
+                     (port, pid, folder, website['id']))
+        conn.commit()
+        write_log(slug, f"✅ Website started")
+        return jsonify({'success': True})
 
-    return jsonify(data)
-
-# ---------- STOP / RESTART / DELETE ----------
-@app.route('/stop/<username>', methods=['POST'])
-def stop_route(username):
-    if not session.get('logged_in'):
+@app.route('/stop/<slug>', methods=['POST'])
+def stop_website(slug):
+    if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    if username not in db:
-        return jsonify({'error': 'Not found'}), 404
-    stop_app(username)
-    return jsonify({'success': True})
+    with get_db() as conn:
+        website = conn.execute("SELECT * FROM websites WHERE slug=?", (slug,)).fetchone()
+        if not website:
+            return jsonify({'error': 'Not found'}), 404
+        if website['status'] != 'running':
+            return jsonify({'error': 'Not running'}), 400
 
-@app.route('/restart/<username>', methods=['POST'])
-def restart_route(username):
-    if not session.get('logged_in'):
+        if website['runtime'] == 'python':
+            stop_website_process(slug)
+        # update status
+        conn.execute("UPDATE websites SET status='stopped', port=0, pid=0 WHERE id=?", (website['id'],))
+        conn.commit()
+        write_log(slug, "⏹ Stopped manually")
+        return jsonify({'success': True})
+
+@app.route('/delete/<slug>', methods=['POST'])
+def delete_website(slug):
+    if 'user_id' not in session:
         return jsonify({'error': 'Unauthorized'}), 401
-    if username not in db:
-        return jsonify({'error': 'Not found'}), 404
-    stop_app(username)
-    folder = get_user_folder(username)
-    threading.Thread(target=deploy_app, args=(username, folder), daemon=True).start()
-    return jsonify({'success': True})
+    with get_db() as conn:
+        website = conn.execute("SELECT * FROM websites WHERE slug=?", (slug,)).fetchone()
+        if not website:
+            return jsonify({'error': 'Not found'}), 404
 
-@app.route('/delete/<username>', methods=['POST'])
-def delete_route(username):
-    if not session.get('logged_in'):
-        return jsonify({'error': 'Unauthorized'}), 401
-    if username not in db:
-        return jsonify({'error': 'Not found'}), 404
-    stop_app(username)
-    shutil.rmtree(get_user_folder(username), ignore_errors=True)
-    log_file = get_log_file(username)
-    if os.path.exists(log_file):
-        os.remove(log_file)
-    del db[username]
-    save_db(db)
-    return jsonify({'success': True})
+        # stop if running
+        if website['status'] == 'running':
+            stop_website_process(slug)
 
-# ---------- PROXY / STATIC SERVE ----------
-@app.route('/<username>/', defaults={'path': ''})
-@app.route('/<username>/<path:path>')
-def serve_user(username, path):
-    if username not in db:
-        return "User not found", 404
+        # delete files
+        folder = website['folder_path']
+        if os.path.exists(folder):
+            shutil.rmtree(folder, ignore_errors=True)
+        log_file = get_log_file(slug)
+        if os.path.exists(log_file):
+            os.remove(log_file)
 
-    data = db[username]
+        # delete DB record
+        conn.execute("DELETE FROM websites WHERE id=?", (website['id'],))
+        conn.commit()
+        return jsonify({'success': True})
 
-    # If app is running, proxy everything
-    if data.get('status') == 'running' and username in processes and processes[username].poll() is None:
-        port = data.get('port')
+# ---------- STATIC / PROXY ----------
+@app.route('/<slug>/', defaults={'path': ''})
+@app.route('/<slug>/<path:path>')
+def serve_site(slug, path):
+    # check if exists
+    with get_db() as conn:
+        website = conn.execute("SELECT * FROM websites WHERE slug=?", (slug,)).fetchone()
+        if not website:
+            return "Website not found", 404
+
+    # if running python, proxy
+    if website['runtime'] == 'python' and website['status'] == 'running':
+        port = website['port']
         if not port:
-            return "No port assigned", 500
-
+            return "Port not assigned", 500
         target = f"http://localhost:{port}/{path}"
         if request.query_string:
             target += "?" + request.query_string.decode('utf-8')
-
         try:
-            # Forward request
             headers = {k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']}
             resp = requests.request(
                 method=request.method,
@@ -425,32 +491,31 @@ def serve_user(username, path):
                 allow_redirects=False,
                 timeout=30
             )
+            # forward response
             response = Response(resp.content, resp.status_code)
             for k, v in resp.headers.items():
                 if k.lower() not in ['content-encoding', 'content-length', 'transfer-encoding', 'connection']:
                     response.headers[k] = v
             return response
-        except requests.exceptions.ConnectionError:
-            return "App not responding", 502
         except Exception as e:
-            return f"Proxy error: {e}", 500
+            return f"Proxy error: {e}", 502
 
-    # Static serve
-    folder = get_user_folder(username)
-    if path == '':
+    # static or stopped
+    folder = website['folder_path']
+    if not path:
         if os.path.exists(os.path.join(folder, 'index.html')):
             return send_from_directory(folder, 'index.html')
-        else:
+        # list files
+        if os.path.isdir(folder):
             files = os.listdir(folder)
-            html = f"<h2>📁 Files for {username}</h2><ul>"
+            html = f"<h2>Files for {slug}</h2><ul>"
             for f in files:
                 html += f'<li><a href="{f}">{f}</a></li>'
             html += "</ul>"
             return html
-
-    if not os.path.exists(os.path.join(folder, path)):
-        return "File not found", 404
-    return send_from_directory(folder, path)
+        return "No index.html", 404
+    else:
+        return send_from_directory(folder, path)
 
 # ---------- HTML TEMPLATES ----------
 LOGIN_HTML = """
@@ -459,26 +524,27 @@ LOGIN_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hosting Panel</title>
+    <title>Hosting Panel - Login</title>
     <style>
-        body { background: #0c1018; color: #fff; font-family: Arial; display: flex; justify-content: center; align-items: center; height: 100vh; margin:0; }
-        .box { background: #161b25; padding: 40px; border-radius: 20px; border: 1px solid #2b3240; width: 350px; }
-        h2 { text-align: center; color: #00e5ff; }
-        input { width: 100%; padding: 14px; margin: 10px 0; background: #0c1018; border: 1px solid #2b3240; color: white; border-radius: 8px; }
-        .btn { width: 100%; padding: 14px; background: #00e5ff; color: #000; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; }
-        .error { color: #ff4d4d; text-align: center; margin-top: 10px; }
+        body { font-family: Arial, sans-serif; background: #f5f5f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .login-box { background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 350px; }
+        h2 { text-align: center; margin-bottom: 30px; color: #333; }
+        input { width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #0056b3; }
+        .error { color: red; text-align: center; margin: 10px 0; }
     </style>
 </head>
 <body>
-<div class="box">
-    <h2>🔐 Admin Panel</h2>
-    <form method="POST">
-        <input type="text" name="username" placeholder="Username" value="admin" />
-        <input type="password" name="password" placeholder="Password" value="admin" />
-        <button class="btn">Login</button>
-    </form>
-    {% if error %}<div class="error">{{ error }}</div>{% endif %}
-</div>
+    <div class="login-box">
+        <h2>🔐 Login</h2>
+        <form method="POST">
+            <input type="text" name="username" placeholder="Username" value="admin" required>
+            <input type="password" name="password" placeholder="Password" value="admin" required>
+            <button type="submit">Login</button>
+        </form>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    </div>
 </body>
 </html>
 """
@@ -489,127 +555,114 @@ DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hosting Panel</title>
+    <title>Hosting Panel - Dashboard</title>
     <style>
-        * { box-sizing: border-box; }
-        body { background: #0c1018; color: #fff; font-family: Arial; padding: 20px; }
-        .container { max-width: 1000px; margin: 0 auto; }
-        h1 { color: #00e5ff; }
-        .card { background: #161b25; border: 1px solid #2b3240; border-radius: 15px; padding: 20px; margin: 20px 0; }
-        .logout { float: right; color: #ff4d4d; text-decoration: none; }
-        .drop-zone { border: 2px dashed #00e5ff; border-radius: 15px; padding: 40px; text-align: center; cursor: pointer; margin: 10px 0; transition: 0.3s; }
-        .drop-zone.dragover { background: #1a2a3a; border-color: #fff; }
-        .input-group { display: flex; gap: 10px; flex-wrap: wrap; margin: 15px 0; }
-        .input-group input { flex: 1; padding: 12px; background: #0c1018; border: 1px solid #2b3240; color: white; border-radius: 8px; min-width: 150px; }
-        .btn { background: #00e5ff; color: #000; border: none; padding: 12px 24px; border-radius: 8px; font-weight: bold; cursor: pointer; }
-        .btn:hover { opacity: 0.85; }
-        .btn-danger { background: #ff4d4d; color: #fff; }
-        .btn-success { background: #00ff6a; color: #000; }
-        .btn-info { background: #4d88ff; color: #fff; }
-
-        /* Build Logs */
-        #buildLogs { background: #000; color: #00ff6a; padding: 15px; border-radius: 8px; max-height: 350px; overflow-y: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; margin-top: 10px; border: 1px solid #2b3240; display: none; }
-        #buildLogs .log-line { margin: 0; }
-        #buildLogs .error { color: #ff4d4d; }
-        #buildLogs .success { color: #00ff6a; }
-        #buildLogs .info { color: #00e5ff; }
-        #buildLogs .warn { color: #ffaa00; }
-
-        #deployResult { margin-top: 15px; padding: 15px; background: #0c1018; border-radius: 8px; border: 1px solid #2b3240; display: none; }
-
-        /* Status badge */
-        .status { padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; }
-        .status.running { background: #00ff6a33; color: #00ff6a; border: 1px solid #00ff6a; }
-        .status.failed { background: #ff4d4d33; color: #ff4d4d; border: 1px solid #ff4d4d; }
-        .status.starting { background: #ffaa0033; color: #ffaa00; border: 1px solid #ffaa00; }
-        .status.static { background: #333; color: #aaa; border: 1px solid #555; }
-        .status.stopped { background: #555; color: #aaa; border: 1px solid #666; }
-
-        .app-item { background: #0c1018; padding: 15px; border-radius: 10px; margin: 10px 0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; border: 1px solid #1a1f2b; }
-        .app-item .info { display: flex; flex-direction: column; gap: 5px; }
-        .app-item .info .name { font-weight: bold; font-size: 16px; }
-        .app-item .info .link { color: #00e5ff; word-break: break-all; }
-        .app-item .actions { display: flex; gap: 5px; flex-wrap: wrap; }
-
-        .btn-sm { padding: 6px 12px; font-size: 12px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; }
-        .btn-sm:hover { opacity: 0.8; }
-
-        #fileList { margin: 10px 0; color: #aaa; font-size: 14px; }
-
-        .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #00e5ff33; border-top: 2px solid #00e5ff; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 8px; vertical-align: middle; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-
-        @media (max-width: 600px) { .app-item { flex-direction: column; align-items: stretch; } }
+        body { font-family: Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+        .btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
+        .btn-primary { background: #007bff; color: white; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-warning { background: #ffc107; color: #333; }
+        .btn-secondary { background: #6c757d; color: white; }
+        .btn-sm { padding: 4px 10px; font-size: 12px; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .upload-area { border: 2px dashed #ccc; padding: 30px; text-align: center; border-radius: 8px; cursor: pointer; transition: 0.3s; }
+        .upload-area.dragover { border-color: #007bff; background: #e9f5ff; }
+        .website-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+        .website-card { background: white; border-radius: 8px; padding: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.08); border-left: 4px solid #007bff; }
+        .website-card .name { font-size: 18px; font-weight: bold; margin-bottom: 8px; }
+        .website-card .status { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+        .status-running { background: #d4edda; color: #155724; }
+        .status-stopped { background: #e2e3e5; color: #383d41; }
+        .status-building { background: #fff3cd; color: #856404; }
+        .status-failed { background: #f8d7da; color: #721c24; }
+        .website-card .actions { margin-top: 12px; display: flex; gap: 5px; flex-wrap: wrap; }
+        .website-card .info { font-size: 14px; color: #555; margin: 4px 0; }
+        .website-card .link { color: #007bff; text-decoration: none; }
+        .website-card .link:hover { text-decoration: underline; }
+        .file-list { margin: 10px 0; }
+        #buildLogs { background: #1e1e1e; color: #d4d4d4; padding: 12px; border-radius: 4px; max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 13px; margin-top: 10px; display: none; }
+        .log-line { margin: 2px 0; }
+        .log-error { color: #f48771; }
+        .log-success { color: #6a9955; }
+        .log-info { color: #569cd6; }
+        .log-warn { color: #dcdcaa; }
+        .upload-controls { display: flex; gap: 10px; flex-wrap: wrap; margin: 15px 0; }
+        .upload-controls input[type="text"] { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; min-width: 150px; }
+        .file-list-item { display: inline-block; background: #eee; padding: 4px 10px; margin: 4px; border-radius: 12px; font-size: 13px; }
+        @media (max-width: 600px) { .website-grid { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
 <div class="container">
-    <h1>🚀 Hosting Panel <a href="/logout" class="logout">Logout</a></h1>
+    <header>
+        <h2>🚀 Hosting Panel</h2>
+        <div>
+            <span style="margin-right: 15px;">👤 {{ session.username }}</span>
+            <a href="/logout" class="btn btn-danger">Logout</a>
+        </div>
+    </header>
 
     <!-- Upload Section -->
     <div class="card">
-        <h3>📤 Upload New Website</h3>
-        <div class="drop-zone" id="dropZone">
-            <p style="font-size:24px;">📂</p>
-            <p>Drag & drop files here, or click to browse</p>
-            <p style="font-size:12px;color:#555;">Supports .zip, .html, .py, .js, .css, .json, .txt</p>
+        <h3>📤 Upload Website</h3>
+        <div class="upload-area" id="dropZone">
+            <p style="font-size: 24px;">📂</p>
+            <p>Drag & drop ZIP or files here, or click to browse</p>
+            <p style="font-size: 12px; color: #777;">Supports .zip, .html, .py, .css, .js, etc.</p>
         </div>
         <input type="file" id="fileInput" multiple style="display:none;">
-        <div id="fileList"></div>
-        <div class="input-group">
-            <input type="text" id="usernameInput" placeholder="Username (leave blank for auto-gen)" />
-            <button class="btn" id="deployBtn">🚀 Deploy</button>
+        <div id="fileList" class="file-list"></div>
+        <div class="upload-controls">
+            <input type="text" id="slugInput" placeholder="Custom slug (optional)">
+            <button class="btn btn-primary" id="deployBtn">🚀 Deploy</button>
         </div>
-
-        <!-- Build Logs -->
         <div id="buildLogs"></div>
-        <div id="deployResult"></div>
+        <div id="deployResult" style="margin-top: 10px;"></div>
     </div>
 
-    <!-- Deployed Sites -->
+    <!-- Website List -->
     <div class="card">
-        <h3>📋 Deployed Sites</h3>
-        <div id="siteList">
-            {% for username, data in deployments.items() %}
-                <div class="app-item" data-username="{{ username }}">
+        <h3>📋 Deployed Websites</h3>
+        <div class="website-grid" id="websiteGrid">
+            {% for website in websites %}
+                <div class="website-card" data-slug="{{ website.slug }}">
+                    <div class="name">{{ website.name }}</div>
+                    <div class="info">Runtime: {{ website.runtime }}</div>
                     <div class="info">
-                        <span class="name">{{ username }}</span>
-                        <span class="link">
-                            {% if data.link %}
-                                <a href="{{ data.link }}" target="_blank">{{ data.link }}</a>
-                            {% else %}
-                                <span style="color:#555;">No link yet</span>
-                            {% endif %}
-                        </span>
-                        <span class="status {{ data.status }}">
-                            {% if data.status == 'running' %}🟢 Running
-                            {% elif data.status == 'starting' %}🔄 Starting...
-                            {% elif data.status == 'failed' %}❌ Failed
-                            {% elif data.status == 'static' %}📁 Static
-                            {% elif data.status == 'stopped' %}⏹ Stopped
-                            {% else %}⚪ {{ data.status }}{% endif %}
-                        </span>
-                        {% if data.error %}
-                            <span style="color:#ff4d4d;font-size:12px;">Error: {{ data.error }}</span>
+                        Status: <span class="status status-{{ website.status }}">{{ website.status }}</span>
+                    </div>
+                    <div class="info">Uploaded: {{ website.upload_date }}</div>
+                    <div class="info">
+                        Link: 
+                        {% if website.status == 'running' %}
+                            <a href="{{ host_url }}{{ website.slug }}/" target="_blank" class="link">{{ host_url }}{{ website.slug }}/</a>
+                        {% else %}
+                            <span style="color: #999;">Not running</span>
                         {% endif %}
                     </div>
                     <div class="actions">
-                        {% if data.status == 'running' %}
-                            <button class="btn-sm btn-danger stop-btn" data-username="{{ username }}">⏹ Stop</button>
-                            <button class="btn-sm btn-info restart-btn" data-username="{{ username }}">🔄 Restart</button>
-                        {% elif data.status == 'starting' %}
-                            <button class="btn-sm btn-info" disabled>⏳ Starting...</button>
-                        {% elif data.status == 'failed' or data.status == 'stopped' %}
-                            <button class="btn-sm btn-info restart-btn" data-username="{{ username }}">🔄 Restart</button>
-                        {% endif %}
-                        <button class="btn-sm btn-danger delete-btn" data-username="{{ username }}">🗑 Delete</button>
-                        <button class="btn-sm btn-info log-btn" data-username="{{ username }}">📜 Logs</button>
+                        <button class="btn btn-success btn-sm start-btn" data-slug="{{ website.slug }}">▶ Start</button>
+                        <button class="btn btn-warning btn-sm stop-btn" data-slug="{{ website.slug }}">⏹ Stop</button>
+                        <button class="btn btn-secondary btn-sm logs-btn" data-slug="{{ website.slug }}">📜 Logs</button>
+                        <button class="btn btn-danger btn-sm delete-btn" data-slug="{{ website.slug }}">🗑 Delete</button>
                     </div>
                 </div>
             {% else %}
-                <p style="color:#555;">No sites deployed yet.</p>
+                <p>No websites deployed yet.</p>
             {% endfor %}
         </div>
+    </div>
+</div>
+
+<!-- Log Modal -->
+<div id="logModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
+    <div style="background:white; border-radius:8px; padding:20px; max-width:800px; width:90%; max-height:80%; overflow:auto;">
+        <h3>📜 Build Logs <span id="logSlug" style="font-weight:normal;font-size:14px;color:#555;"></span></h3>
+        <pre id="logContent" style="background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:4px;white-space:pre-wrap;word-wrap:break-word;max-height:400px;overflow:auto;"></pre>
+        <button class="btn btn-danger" id="closeLogModal">Close</button>
     </div>
 </div>
 
@@ -618,13 +671,13 @@ DASHBOARD_HTML = """
     const dropZone = document.getElementById('dropZone');
     const fileInput = document.getElementById('fileInput');
     const fileList = document.getElementById('fileList');
+    const slugInput = document.getElementById('slugInput');
     const deployBtn = document.getElementById('deployBtn');
-    const usernameInput = document.getElementById('usernameInput');
     const buildLogs = document.getElementById('buildLogs');
     const deployResult = document.getElementById('deployResult');
     let selectedFiles = [];
     let pollInterval = null;
-    let currentUsername = null;
+    let currentSlug = null;
 
     dropZone.addEventListener('click', () => fileInput.click());
     dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
@@ -646,56 +699,50 @@ DASHBOARD_HTML = """
 
     function updateFileList() {
         if (selectedFiles.length === 0) { fileList.innerHTML = ''; return; }
-        let html = '<strong>Selected:</strong><ul style="margin:5px 0;padding-left:20px;">';
-        selectedFiles.forEach(f => html += `<li>${f.name} (${(f.size/1024).toFixed(1)} KB)</li>`);
-        html += '</ul>';
+        let html = '<strong>Selected files:</strong> ';
+        selectedFiles.forEach(f => html += `<span class="file-list-item">${f.name} (${(f.size/1024).toFixed(1)} KB)</span>`);
         fileList.innerHTML = html;
     }
 
     deployBtn.addEventListener('click', async () => {
         if (selectedFiles.length === 0) { alert('Select files first.'); return; }
-        const username = usernameInput.value.trim() || '';
+        const slug = slugInput.value.trim();
 
         const formData = new FormData();
         selectedFiles.forEach(f => formData.append('files', f));
-        formData.append('username', username);
+        formData.append('slug', slug);
 
         deployBtn.disabled = true;
         deployBtn.textContent = '⏳ Deploying...';
         buildLogs.style.display = 'block';
-        buildLogs.innerHTML = '<div class="log-line info">⏳ Uploading and starting deployment...</div>';
-        deployResult.style.display = 'none';
+        buildLogs.innerHTML = '<div class="log-line log-info">⏳ Starting deployment...</div>';
+        deployResult.innerHTML = '';
 
         try {
-            const res = await fetch('/deploy', { method: 'POST', body: formData });
+            const res = await fetch('/upload', { method: 'POST', body: formData });
             const data = await res.json();
-
             if (data.success) {
-                currentUsername = data.username;
-                buildLogs.innerHTML += `<div class="log-line success">✅ Upload complete. Username: ${data.username}</div>`;
-                buildLogs.innerHTML += `<div class="log-line info">⏳ Waiting for build logs...</div>`;
-                buildLogs.scrollTop = buildLogs.scrollHeight;
-
-                // Start polling
+                currentSlug = data.slug;
+                buildLogs.innerHTML += `<div class="log-line log-success">✅ Upload complete. Slug: ${data.slug}</div>`;
+                // start polling
                 if (pollInterval) clearInterval(pollInterval);
                 pollInterval = setInterval(pollStatus, 1500);
-                // Poll immediately
                 setTimeout(pollStatus, 500);
             } else {
-                buildLogs.innerHTML += `<div class="log-line error">❌ Error: ${data.error}</div>`;
+                buildLogs.innerHTML += `<div class="log-line log-error">❌ Error: ${data.error}</div>`;
                 deployBtn.disabled = false;
                 deployBtn.textContent = '🚀 Deploy';
             }
         } catch (e) {
-            buildLogs.innerHTML += `<div class="log-line error">❌ Network error: ${e.message}</div>`;
+            buildLogs.innerHTML += `<div class="log-line log-error">❌ Network error: ${e.message}</div>`;
             deployBtn.disabled = false;
             deployBtn.textContent = '🚀 Deploy';
         }
     });
 
     function pollStatus() {
-        if (!currentUsername) return;
-        fetch(`/status/${currentUsername}`)
+        if (!currentSlug) return;
+        fetch(`/status/${currentSlug}`)
             .then(res => res.json())
             .then(data => {
                 // Update logs
@@ -703,97 +750,91 @@ DASHBOARD_HTML = """
                     const lines = data.logs.split('\n');
                     let html = '';
                     for (let line of lines) {
-                        if (line.includes('❌')) html += `<div class="log-line error">${escapeHtml(line)}</div>`;
-                        else if (line.includes('✅') || line.includes('success') || line.includes('ready')) html += `<div class="log-line success">${escapeHtml(line)}</div>`;
-                        else if (line.includes('⏳') || line.includes('Waiting') || line.includes('Starting')) html += `<div class="log-line info">${escapeHtml(line)}</div>`;
-                        else if (line.includes('⚠️')) html += `<div class="log-line warn">${escapeHtml(line)}</div>`;
+                        if (line.includes('❌')) html += `<div class="log-line log-error">${escapeHtml(line)}</div>`;
+                        else if (line.includes('✅') || line.includes('success') || line.includes('ready')) html += `<div class="log-line log-success">${escapeHtml(line)}</div>`;
+                        else if (line.includes('⏳') || line.includes('Waiting') || line.includes('Starting')) html += `<div class="log-line log-info">${escapeHtml(line)}</div>`;
+                        else if (line.includes('⚠️')) html += `<div class="log-line log-warn">${escapeHtml(line)}</div>`;
                         else if (line.trim()) html += `<div class="log-line">${escapeHtml(line)}</div>`;
                     }
-                    buildLogs.innerHTML = html || '<div class="log-line info">⏳ No logs yet...</div>';
+                    buildLogs.innerHTML = html || '<div class="log-line log-info">⏳ No logs yet...</div>';
                     buildLogs.scrollTop = buildLogs.scrollHeight;
                 }
 
-                // Check status
                 if (data.status === 'running') {
                     clearInterval(pollInterval);
-                    deployResult.style.display = 'block';
                     deployResult.innerHTML = `
-                        <p style="color:#00ff6a;font-size:18px;">✅ Deployment successful!</p>
-                        <p><strong>Username:</strong> ${data.username}</p>
-                        <p><strong>Link:</strong> <a href="${data.link}" target="_blank" style="color:#00e5ff;">${window.location.origin}${data.link}</a></p>
+                        <div style="color: #28a745; font-weight: bold;">✅ Deployment successful!</div>
+                        <div>Link: <a href="${data.url}" target="_blank">${data.url}</a></div>
                     `;
                     deployBtn.disabled = false;
                     deployBtn.textContent = '🚀 Deploy';
-                    // Reload site list
+                    // reload page after 2s to update list
                     setTimeout(() => location.reload(), 2000);
-                } else if (data.status === 'failed' || data.status === 'error') {
+                } else if (data.status === 'failed') {
                     clearInterval(pollInterval);
-                    deployResult.style.display = 'block';
-                    deployResult.innerHTML = `
-                        <p style="color:#ff4d4d;font-size:18px;">❌ Deployment failed!</p>
-                        <p style="color:#ff4d4d;">Error: ${data.error || 'Unknown error'}</p>
-                        <p style="color:#aaa;">Check logs above for details.</p>
-                    `;
+                    deployResult.innerHTML = `<div style="color: #dc3545; font-weight: bold;">❌ Deployment failed. Check logs above.</div>`;
                     deployBtn.disabled = false;
                     deployBtn.textContent = '🚀 Deploy';
-                } else if (data.status === 'static') {
-                    clearInterval(pollInterval);
-                    deployResult.style.display = 'block';
-                    deployResult.innerHTML = `
-                        <p style="color:#00ff6a;font-size:18px;">✅ Static site deployed!</p>
-                        <p><strong>Username:</strong> ${data.username}</p>
-                        <p><strong>Link:</strong> <a href="${data.link}" target="_blank" style="color:#00e5ff;">${window.location.origin}${data.link}</a></p>
-                    `;
-                    deployBtn.disabled = false;
-                    deployBtn.textContent = '🚀 Deploy';
-                    setTimeout(() => location.reload(), 2000);
                 }
             })
-            .catch(err => {
-                console.error('Poll error:', err);
-            });
+            .catch(err => console.error('Poll error:', err));
     }
 
-    function escapeHtml(str) {
+    function escapeHtml(text) {
         const div = document.createElement('div');
-        div.textContent = str;
+        div.textContent = text;
         return div.innerHTML;
     }
 
-    // ---------- ACTION BUTTONS ----------
-    document.querySelectorAll('.stop-btn').forEach(btn => {
+    // ---------- LOG MODAL ----------
+    const logModal = document.getElementById('logModal');
+    const logContent = document.getElementById('logContent');
+    const logSlug = document.getElementById('logSlug');
+    const closeLogModal = document.getElementById('closeLogModal');
+
+    document.querySelectorAll('.logs-btn').forEach(btn => {
         btn.addEventListener('click', async (e) => {
-            if (!confirm('Stop this app?')) return;
-            const username = btn.dataset.username;
-            await fetch(`/stop/${username}`, { method: 'POST' });
-            location.reload();
+            const slug = e.target.dataset.slug;
+            logSlug.textContent = `(${slug})`;
+            logContent.textContent = 'Loading...';
+            logModal.style.display = 'flex';
+            try {
+                const res = await fetch(`/logs/${slug}`);
+                const data = await res.json();
+                logContent.textContent = data.logs || 'No logs.';
+            } catch (err) {
+                logContent.textContent = 'Error loading logs.';
+            }
+        });
+    });
+    closeLogModal.addEventListener('click', () => { logModal.style.display = 'none'; });
+    logModal.addEventListener('click', (e) => { if (e.target === logModal) logModal.style.display = 'none'; });
+
+    // ---------- ACTION BUTTONS ----------
+    document.querySelectorAll('.start-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            const slug = e.target.dataset.slug;
+            if (!confirm(`Start ${slug}?`)) return;
+            const res = await fetch(`/start/${slug}`, { method: 'POST' });
+            if (res.ok) location.reload();
         });
     });
 
-    document.querySelectorAll('.restart-btn').forEach(btn => {
+    document.querySelectorAll('.stop-btn').forEach(btn => {
         btn.addEventListener('click', async (e) => {
-            if (!confirm('Restart this app?')) return;
-            const username = btn.dataset.username;
-            await fetch(`/restart/${username}`, { method: 'POST' });
-            location.reload();
+            const slug = e.target.dataset.slug;
+            if (!confirm(`Stop ${slug}?`)) return;
+            const res = await fetch(`/stop/${slug}`, { method: 'POST' });
+            if (res.ok) location.reload();
         });
     });
 
     document.querySelectorAll('.delete-btn').forEach(btn => {
         btn.addEventListener('click', async (e) => {
-            if (!confirm('Delete this site permanently?')) return;
-            const username = btn.dataset.username;
-            await fetch(`/delete/${username}`, { method: 'POST' });
-            location.reload();
-        });
-    });
-
-    document.querySelectorAll('.log-btn').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            const username = btn.dataset.username;
-            const res = await fetch(`/status/${username}`);
-            const data = await res.json();
-            alert(`📜 Logs for ${username}:\n\n${data.logs || 'No logs.'}`);
+            const slug = e.target.dataset.slug;
+            if (!confirm(`Delete ${slug} permanently?`)) return;
+            const res = await fetch(`/delete/${slug}`, { method: 'POST' });
+            if (res.ok) location.reload();
         });
     });
 </script>
@@ -801,14 +842,14 @@ DASHBOARD_HTML = """
 </html>
 """
 
-# ---------- RUN ----------
+# ---------- MAIN ----------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("="*60)
-    print("🌐 HOSTING PANEL (Live Build Logs)")
+    print("🌐 Website Hosting Panel Started")
+    print(f"🔗 Visit: http://localhost:{port}")
     print("🔑 Login: admin / admin")
-    print("📁 Uploads:", UPLOAD_FOLDER)
-    print("📜 Logs:", LOGS_FOLDER)
-    print("🚀 Running on port", port)
+    print("📁 Upload folder:", UPLOAD_FOLDER)
+    print("📜 Logs folder:", LOGS_FOLDER)
     print("="*60)
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
