@@ -1,71 +1,60 @@
 import os
 import sqlite3
-import shutil
 import zipfile
+import shutil
 import subprocess
 import threading
 import time
 import signal
 import requests
-import sys
 from datetime import datetime
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort
+from flask import (
+    Flask, render_template_string, request, redirect,
+    url_for, session, jsonify, Response, stream_with_context
+)
 from werkzeug.utils import secure_filename
-from werkzeug.middleware.proxy_fix import ProxyFix
 
-# ------------------------------------------------------------
-# App Configuration
-# ------------------------------------------------------------
-app = Flask(__name__)
-app.secret_key = 'super-secret-key-change-in-production'
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-
+# ---------- Configuration ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 LOGS_FOLDER = os.path.join(BASE_DIR, 'logs')
 DB_PATH = os.path.join(BASE_DIR, 'panel.db')
-
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOGS_FOLDER, exist_ok=True)
 
-# ------------------------------------------------------------
-# Database Setup
-# ------------------------------------------------------------
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE,
-                    password TEXT
-                )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS projects (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE,
-                    runtime TEXT,
-                    status TEXT,
-                    folder_path TEXT,
-                    created_at TEXT,
-                    port INTEGER,
-                    pid INTEGER,
-                    url TEXT
-                )''')
-    c.execute("SELECT * FROM users WHERE username='admin'")
-    if not c.fetchone():
-        c.execute("INSERT INTO users (username, password) VALUES ('admin', 'admin')")
-    conn.commit()
-    conn.close()
+app = Flask(__name__)
+app.secret_key = 'change-this-in-production'
 
-init_db()
-
-# ------------------------------------------------------------
-# Helper Functions
-# ------------------------------------------------------------
+# ---------- Database ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+def init_db():
+    with get_db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password TEXT
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            runtime TEXT,
+            status TEXT,
+            folder_path TEXT,
+            created_at TEXT,
+            port INTEGER,
+            pid INTEGER,
+            url TEXT
+        )''')
+        # Default admin account
+        conn.execute("INSERT OR IGNORE INTO users (username, password) VALUES ('admin', 'admin')")
+        conn.commit()
+init_db()
+
+# ---------- Helpers ----------
 def get_free_port(start=5001):
     import socket
     port = start
@@ -81,64 +70,53 @@ def log_message(project_id, message):
     with open(log_file, 'a', encoding='utf-8') as f:
         f.write(f'{timestamp} {message}\n')
 
-def update_project_status(project_id, status):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE projects SET status = ? WHERE id = ?", (status, project_id))
-    conn.commit()
-    conn.close()
-
-def update_project_pid(project_id, pid):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE projects SET pid = ? WHERE id = ?", (pid, project_id))
-    conn.commit()
-    conn.close()
-
-def update_project_port(project_id, port):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE projects SET port = ? WHERE id = ?", (port, project_id))
-    conn.commit()
-    conn.close()
-
-def update_project_url(project_id, url):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE projects SET url = ? WHERE id = ?", (url, project_id))
-    conn.commit()
-    conn.close()
+def update_project_status(project_id, status, pid=None, port=None, url=None):
+    with get_db() as conn:
+        if pid is not None:
+            conn.execute("UPDATE projects SET pid = ? WHERE id = ?", (pid, project_id))
+        if port is not None:
+            conn.execute("UPDATE projects SET port = ? WHERE id = ?", (port, project_id))
+        if url is not None:
+            conn.execute("UPDATE projects SET url = ? WHERE id = ?", (url, project_id))
+        conn.execute("UPDATE projects SET status = ? WHERE id = ?", (status, project_id))
+        conn.commit()
 
 def get_project(project_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
+    with get_db() as conn:
+        return conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
 
 def get_all_projects():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM projects ORDER BY created_at DESC")
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    with get_db() as conn:
+        return conn.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
 
 def detect_runtime(folder_path):
-    """Detect runtime: 'python' if requirements.txt and startup file exist, else 'html' if index.html exists."""
+    """Return (runtime, startup_file) or (None, None)."""
     files = os.listdir(folder_path)
+    # Python
     if 'requirements.txt' in files:
-        startup_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
-        for sf in startup_files:
+        for sf in ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']:
             if sf in files:
                 return 'python', sf
+    # Static HTML
     if 'index.html' in files:
         return 'html', 'index.html'
     return None, None
 
+# ---------- Process Management (global dict) ----------
+processes = {}
+
+def stop_process(project_id):
+    if project_id in processes:
+        proc = processes[project_id]
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+        del processes[project_id]
+    update_project_status(project_id, 'Stopped', pid=0, port=None, url='')
+    log_message(project_id, "Process stopped.")
+
+# ---------- Build & Start ----------
 def build_project(project_id):
-    """Background thread to build and start the project."""
     project = get_project(project_id)
     if not project:
         return
@@ -152,154 +130,85 @@ def build_project(project_id):
         update_project_status(project_id, 'Failed')
         return
 
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE projects SET runtime = ? WHERE id = ?", (runtime, project_id))
-    conn.commit()
-    conn.close()
+    # Update runtime in DB
+    with get_db() as conn:
+        conn.execute("UPDATE projects SET runtime = ? WHERE id = ?", (runtime, project_id))
+        conn.commit()
 
     log_message(project_id, f"Runtime detected: {runtime}")
 
+    # Install dependencies (if Python)
     if runtime == 'python':
-        # Install requirements
-        requirements_path = os.path.join(folder_path, 'requirements.txt')
-        if os.path.exists(requirements_path):
+        req_path = os.path.join(folder_path, 'requirements.txt')
+        if os.path.exists(req_path):
             log_message(project_id, "Installing requirements...")
             try:
-                subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', requirements_path],
-                               cwd=folder_path, check=True, capture_output=True, text=True)
-                log_message(project_id, "Requirements installed successfully.")
+                subprocess.run(
+                    [os.sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt'],
+                    cwd=folder_path, check=True, capture_output=True, text=True
+                )
+                log_message(project_id, "Requirements installed.")
             except subprocess.CalledProcessError as e:
-                log_message(project_id, f"ERROR: Requirements installation failed.\n{e.stderr}")
+                log_message(project_id, f"ERROR: pip install failed.\n{e.stderr}")
                 update_project_status(project_id, 'Failed')
                 return
         else:
-            log_message(project_id, "No requirements.txt found, skipping.")
+            log_message(project_id, "No requirements.txt, skipping.")
 
-        # Start Python app
-        port = get_free_port()
-        log_message(project_id, f"Starting Python app on port {port}...")
+    # Start process
+    port = get_free_port()
+    log_message(project_id, f"Starting on port {port}...")
+
+    if runtime == 'python':
         env = os.environ.copy()
+        env['FLASK_APP'] = startup_file
+        env['FLASK_ENV'] = 'production'
         env['PORT'] = str(port)
-        try:
-            proc = subprocess.Popen([sys.executable, startup_file],
-                                    cwd=folder_path, env=env,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True)
-            time.sleep(2)
-            if proc.poll() is not None:
-                out, _ = proc.communicate()
-                log_message(project_id, f"ERROR: App failed to start.\n{out}")
-                update_project_status(project_id, 'Failed')
-                return
-            update_project_port(project_id, port)
-            update_project_pid(project_id, proc.pid)
-            with app.app_context():
-                base_url = request.host_url.rstrip('/')
-                project_name = project['name']
-                url = f"{base_url}/sites/{project_name}/"
-                update_project_url(project_id, url)
-            log_message(project_id, f"Website started successfully on {url}")
-            update_project_status(project_id, 'Running')
-            processes[project_id] = proc
-        except Exception as e:
-            log_message(project_id, f"ERROR: Failed to start app: {str(e)}")
+        cmd = [os.sys.executable, '-m', 'flask', 'run', '--host=0.0.0.0', f'--port={port}']
+    else:  # html
+        cmd = [os.sys.executable, '-m', 'http.server', str(port)]
+
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=folder_path, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True
+        )
+        # Wait a moment to see if it starts
+        time.sleep(2)
+        if proc.poll() is not None:
+            out, _ = proc.communicate()
+            log_message(project_id, f"ERROR: Process exited immediately.\n{out}")
             update_project_status(project_id, 'Failed')
+            return
 
-    elif runtime == 'html':
-        port = get_free_port()
-        log_message(project_id, f"Starting static server on port {port}...")
-        try:
-            proc = subprocess.Popen([sys.executable, '-m', 'http.server', str(port)],
-                                    cwd=folder_path,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True)
-            time.sleep(1)
-            if proc.poll() is not None:
-                out, _ = proc.communicate()
-                log_message(project_id, f"ERROR: Static server failed to start.\n{out}")
-                update_project_status(project_id, 'Failed')
-                return
-            update_project_port(project_id, port)
-            update_project_pid(project_id, proc.pid)
-            with app.app_context():
-                base_url = request.host_url.rstrip('/')
-                project_name = project['name']
-                url = f"{base_url}/sites/{project_name}/"
-                update_project_url(project_id, url)
-            log_message(project_id, f"Website started successfully on {url}")
-            update_project_status(project_id, 'Running')
-            processes[project_id] = proc
-        except Exception as e:
-            log_message(project_id, f"ERROR: Failed to start static server: {str(e)}")
-            update_project_status(project_id, 'Failed')
+        # Generate public URL
+        with app.app_context():
+            base_url = request.host_url.rstrip('/')
+            project_name = project['name']
+            url = f"{base_url}/sites/{project_name}/"
+            update_project_status(project_id, 'Running', pid=proc.pid, port=port, url=url)
+        processes[project_id] = proc
+        log_message(project_id, f"Website running at {url}")
+    except Exception as e:
+        log_message(project_id, f"ERROR: {str(e)}")
+        update_project_status(project_id, 'Failed')
 
-# ------------------------------------------------------------
-# Process Management
-# ------------------------------------------------------------
-processes = {}  # project_id -> subprocess.Popen
-
-def stop_process(project_id):
-    if project_id in processes:
-        proc = processes[project_id]
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
-        del processes[project_id]
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE projects SET pid = 0, status = 'Stopped', url = '' WHERE id = ?", (project_id,))
-    conn.commit()
-    conn.close()
-    log_message(project_id, "Process stopped.")
-
-def delete_project(project_id):
-    stop_process(project_id)
-    project = get_project(project_id)
-    if project:
-        folder = project['folder_path']
-        if os.path.exists(folder):
-            shutil.rmtree(folder)
-        log_file = os.path.join(LOGS_FOLDER, f'{project_id}.log')
-        if os.path.exists(log_file):
-            os.remove(log_file)
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-        conn.commit()
-        conn.close()
-
-def start_project(project_id):
-    project = get_project(project_id)
-    if not project:
-        return
-    log_file = os.path.join(LOGS_FOLDER, f'{project_id}.log')
-    if os.path.exists(log_file):
-        os.remove(log_file)
-    update_project_status(project_id, 'Building')
-    thread = threading.Thread(target=build_project, args=(project_id,))
-    thread.daemon = True
-    thread.start()
-
-# ------------------------------------------------------------
-# Routes - Login
-# ------------------------------------------------------------
+# ---------- Routes ----------
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE username = ? AND password = ?", (username, password))
-        user = c.fetchone()
-        conn.close()
+        with get_db() as conn:
+            user = conn.execute(
+                "SELECT * FROM users WHERE username=? AND password=?",
+                (username, password)
+            ).fetchone()
         if user:
             session['logged_in'] = True
-            session['username'] = username
             return redirect(url_for('dashboard'))
-        else:
-            return render_template_string(LOGIN_TEMPLATE, error="Invalid Username or Password")
+        return render_template_string(LOGIN_TEMPLATE, error="Invalid credentials")
     return render_template_string(LOGIN_TEMPLATE, error=None)
 
 @app.route('/logout')
@@ -307,9 +216,6 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
-# ------------------------------------------------------------
-# Routes - Dashboard
-# ------------------------------------------------------------
 @app.route('/')
 @app.route('/dashboard')
 def dashboard():
@@ -318,63 +224,43 @@ def dashboard():
     projects = get_all_projects()
     return render_template_string(DASHBOARD_TEMPLATE, projects=projects)
 
-# ------------------------------------------------------------
-# Routes - Upload
-# ------------------------------------------------------------
+# ---------- Upload ----------
 @app.route('/upload', methods=['POST'])
 def upload():
     if not session.get('logged_in'):
         return jsonify({'error': 'Unauthorized'}), 401
 
-    uploaded_files = request.files.getlist('files')
-    if not uploaded_files:
-        return jsonify({'error': 'No files uploaded'}), 400
-
-    # Check for ZIP file
-    zip_file = None
-    other_files = []
-    for f in uploaded_files:
-        if f.filename.endswith('.zip'):
-            zip_file = f
-        else:
-            other_files.append(f)
+    files = request.files.getlist('files[]')
+    if not files:
+        return jsonify({'error': 'No files'}), 400
 
     # Determine project name
+    zip_file = None
+    others = []
+    for f in files:
+        if f.filename.lower().endswith('.zip'):
+            zip_file = f
+        else:
+            others.append(f)
+
     if zip_file:
         base_name = os.path.splitext(zip_file.filename)[0]
-        base_name = secure_filename(base_name)
     else:
-        # Use first file's folder name if present, else base name
-        first = uploaded_files[0]
-        # For files from folder upload, filename contains relative path
-        # e.g., "myproject/index.html" -> project name "myproject"
-        if '/' in first.filename:
-            base_name = first.filename.split('/')[0]
-        elif '\\' in first.filename:
-            base_name = first.filename.split('\\')[0]
-        else:
-            base_name = os.path.splitext(secure_filename(first.filename))[0]
-        # Sanitize
-        base_name = secure_filename(base_name)
+        base_name = os.path.splitext(files[0].filename)[0]
+    base_name = secure_filename(base_name)
 
-    # Ensure unique name
-    conn = get_db()
-    c = conn.cursor()
-    original_name = base_name
-    counter = 1
-    while True:
-        c.execute("SELECT id FROM projects WHERE name = ?", (base_name,))
-        if c.fetchone() is None:
-            break
-        base_name = f"{original_name}{counter}"
-        counter += 1
-    project_name = base_name
+    # Make unique name
+    with get_db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    project_name = f"{base_name}_{count+1}" if count > 0 else base_name
 
+    # Create folder
     project_folder = os.path.join(UPLOAD_FOLDER, project_name)
     os.makedirs(project_folder, exist_ok=True)
 
+    # Save zip or files
     if zip_file:
-        zip_path = os.path.join(project_folder, zip_file.filename)
+        zip_path = os.path.join(project_folder, 'upload.zip')
         zip_file.save(zip_path)
         try:
             with zipfile.ZipFile(zip_path, 'r') as zf:
@@ -384,78 +270,75 @@ def upload():
             shutil.rmtree(project_folder)
             return jsonify({'error': 'Invalid ZIP file'}), 400
     else:
-        # Save files preserving directory structure
-        for f in other_files:
-            # Get relative path (filename may contain subdirectories)
-            rel_path = f.filename
-            # Normalize to use forward slashes
-            rel_path = rel_path.replace('\\', '/')
-            # Secure each part
-            parts = rel_path.split('/')
-            # Filter out empty parts and ensure each part is safe
-            safe_parts = []
-            for part in parts:
-                if part in ('', '.', '..'):
-                    continue
-                safe_parts.append(secure_filename(part))
-            if not safe_parts:
-                continue
-            # Rebuild path
-            safe_path = os.path.join(*safe_parts)
-            full_path = os.path.join(project_folder, safe_path)
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            f.save(full_path)
+        for f in others:
+            f.save(os.path.join(project_folder, secure_filename(f.filename)))
 
+    # Insert into DB
     created_at = datetime.now().isoformat()
-    c.execute("""INSERT INTO projects (name, runtime, status, folder_path, created_at, port, pid, url)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-              (project_name, '', 'Uploading', project_folder, created_at, 0, 0, ''))
-    project_id = c.lastrowid
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        cur = conn.execute(
+            """INSERT INTO projects (name, runtime, status, folder_path, created_at, port, pid, url)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (project_name, '', 'Uploading', project_folder, created_at, 0, 0, '')
+        )
+        project_id = cur.lastrowid
+        conn.commit()
 
-    log_message(project_id, "Upload completed. Starting build...")
+    log_message(project_id, "Upload complete. Starting build...")
 
-    thread = threading.Thread(target=build_project, args=(project_id,))
-    thread.daemon = True
-    thread.start()
+    # Build in background
+    threading.Thread(target=build_project, args=(project_id,), daemon=True).start()
 
     return jsonify({'project_id': project_id, 'project_name': project_name})
 
-# ------------------------------------------------------------
-# Routes - Project Actions
-# ------------------------------------------------------------
+# ---------- Project Actions ----------
 @app.route('/project/<int:project_id>/start', methods=['POST'])
-def start_project_route(project_id):
+def start_project(project_id):
     if not session.get('logged_in'):
         return jsonify({'error': 'Unauthorized'}), 401
     project = get_project(project_id)
     if not project:
-        return jsonify({'error': 'Project not found'}), 404
+        return jsonify({'error': 'Not found'}), 404
     if project['status'] in ('Running', 'Building'):
-        return jsonify({'error': 'Project already running or building'}), 400
-    start_project(project_id)
+        return jsonify({'error': 'Already running'}), 400
+    # Reset logs
+    log_file = os.path.join(LOGS_FOLDER, f'{project_id}.log')
+    if os.path.exists(log_file):
+        os.remove(log_file)
+    update_project_status(project_id, 'Building')
+    threading.Thread(target=build_project, args=(project_id,), daemon=True).start()
     return jsonify({'status': 'started'})
 
 @app.route('/project/<int:project_id>/stop', methods=['POST'])
-def stop_project_route(project_id):
+def stop_project(project_id):
     if not session.get('logged_in'):
         return jsonify({'error': 'Unauthorized'}), 401
     project = get_project(project_id)
     if not project:
-        return jsonify({'error': 'Project not found'}), 404
+        return jsonify({'error': 'Not found'}), 404
     if project['status'] != 'Running':
-        return jsonify({'error': 'Project is not running'}), 400
+        return jsonify({'error': 'Not running'}), 400
     stop_process(project_id)
     return jsonify({'status': 'stopped'})
 
 @app.route('/project/<int:project_id>/delete', methods=['POST'])
-def delete_project_route(project_id):
+def delete_project(project_id):
     if not session.get('logged_in'):
         return jsonify({'error': 'Unauthorized'}), 401
-    delete_project(project_id)
+    project = get_project(project_id)
+    if not project:
+        return jsonify({'error': 'Not found'}), 404
+    stop_process(project_id)  # also sets status
+    shutil.rmtree(project['folder_path'], ignore_errors=True)
+    log_file = os.path.join(LOGS_FOLDER, f'{project_id}.log')
+    if os.path.exists(log_file):
+        os.remove(log_file)
+    with get_db() as conn:
+        conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        conn.commit()
     return jsonify({'status': 'deleted'})
 
+# ---------- Logs (SSE) ----------
 @app.route('/project/<int:project_id>/logs')
 def project_logs(project_id):
     if not session.get('logged_in'):
@@ -464,94 +347,78 @@ def project_logs(project_id):
     if not project:
         abort(404)
     log_file = os.path.join(LOGS_FOLDER, f'{project_id}.log')
-    logs = []
-    if os.path.exists(log_file):
-        with open(log_file, 'r', encoding='utf-8') as f:
-            logs = f.readlines()
-    return render_template_string(LOGS_TEMPLATE, project=project, logs=logs)
+    def generate():
+        if os.path.exists(log_file):
+            with open(log_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    yield f"data: {line.strip()}\n\n"
+        last_size = os.path.getsize(log_file) if os.path.exists(log_file) else 0
+        # Poll for new lines
+        while True:
+            time.sleep(0.5)
+            if os.path.exists(log_file):
+                cur_size = os.path.getsize(log_file)
+                if cur_size > last_size:
+                    with open(log_file, 'r', encoding='utf-8') as f:
+                        f.seek(last_size)
+                        new_lines = f.read()
+                        for line in new_lines.splitlines():
+                            yield f"data: {line}\n\n"
+                    last_size = cur_size
+            # Check status to stop streaming if done
+            proj = get_project(project_id)
+            if proj and proj['status'] in ('Running', 'Failed', 'Stopped'):
+                yield f"data: [STATUS] {proj['status']}\n\n"
+                break
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
-@app.route('/project/<int:project_id>/status')
-def project_status(project_id):
-    if not session.get('logged_in'):
-        return jsonify({'error': 'Unauthorized'}), 401
-    project = get_project(project_id)
-    if not project:
-        return jsonify({'error': 'Not found'}), 404
-    # Check if process is still alive
-    if project['pid'] and project['pid'] != 0 and project['status'] == 'Running':
-        try:
-            os.kill(project['pid'], 0)
-        except OSError:
-            # Process died
-            update_project_status(project_id, 'Stopped')
-            conn = get_db()
-            c = conn.cursor()
-            c.execute("UPDATE projects SET url = '' WHERE id = ?", (project_id,))
-            conn.commit()
-            conn.close()
-            project = get_project(project_id)
-    # Read logs
-    log_file = os.path.join(LOGS_FOLDER, f'{project_id}.log')
-    logs = []
-    if os.path.exists(log_file):
-        with open(log_file, 'r', encoding='utf-8') as f:
-            logs = f.readlines()
-    return jsonify({
-        'status': project['status'],
-        'url': project['url'],
-        'runtime': project['runtime'],
-        'logs': logs[-20:]  # last 20 lines
-    })
-
-# ------------------------------------------------------------
-# Routes - Reverse Proxy for Websites
-# ------------------------------------------------------------
+# ---------- Reverse Proxy for Websites ----------
 @app.route('/sites/<project_name>/', defaults={'path': ''})
 @app.route('/sites/<project_name>/<path:path>')
 def proxy_website(project_name, path):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM projects WHERE name = ?", (project_name,))
-    project = c.fetchone()
-    conn.close()
+    # Find project by name
+    with get_db() as conn:
+        project = conn.execute("SELECT * FROM projects WHERE name = ?", (project_name,)).fetchone()
     if not project:
-        abort(404)
+        return "Website not found", 404
     if project['status'] != 'Running':
-        return "Website is not running.", 503
+        return "Website is not running", 503
     port = project['port']
     if not port:
-        return "Port not assigned.", 500
+        return "Port not allocated", 500
     target_url = f"http://127.0.0.1:{port}/{path}"
     try:
-        headers = {k: v for k, v in request.headers.items()}
-        headers.pop('Host', None)
+        headers = {k: v for k, v in request.headers.items() if k.lower() != 'host'}
         resp = requests.request(
             method=request.method,
             url=target_url,
             headers=headers,
             data=request.get_data(),
             params=request.args,
-            allow_redirects=False,
-            stream=True
+            stream=True,
+            timeout=30
         )
-        return (resp.content, resp.status_code, resp.headers.items())
+        return Response(
+            stream_with_context(resp.iter_content(chunk_size=8192)),
+            status=resp.status_code,
+            headers=resp.headers.items()
+        )
     except requests.exceptions.ConnectionError:
-        return "Backend server unreachable.", 502
+        update_project_status(project['id'], 'Failed')
+        return "Backend unreachable", 502
     except Exception as e:
-        return f"Proxy error: {str(e)}", 500
+        return f"Proxy error: {e}", 500
 
-# ------------------------------------------------------------
-# Templates
-# ------------------------------------------------------------
+# ---------- Templates ----------
 LOGIN_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Website Hosting Panel - Login</title>
+    <title>Login - Hosting Panel</title>
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
+        * { margin:0; padding:0; box-sizing:border-box; }
         body { background: #fff; font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; }
         .login-box { width: 380px; padding: 40px 30px; border: 1px solid #e0e0e0; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); text-align: center; }
         .login-box .logo { font-size: 48px; margin-bottom: 10px; }
@@ -606,9 +473,9 @@ DASHBOARD_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard - Website Hosting Panel</title>
+    <title>Dashboard</title>
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
+        * { margin:0; padding:0; box-sizing:border-box; }
         body { background: #fff; font-family: Arial, sans-serif; color: #000; }
         .navbar { background: #f8f9fa; border-bottom: 1px solid #e0e0e0; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; }
         .navbar .brand { font-size: 18px; font-weight: bold; }
@@ -664,12 +531,12 @@ DASHBOARD_TEMPLATE = """
     </nav>
 
     <div class="container">
-        <!-- Upload Section -->
+        <!-- Upload -->
         <div class="upload-section" id="uploadArea">
             <div class="icon">📂</div>
             <div class="drag-text">Drag & Drop Website Here</div>
             <div class="or">or</div>
-            <input type="file" id="fileInput" multiple style="display:none;" accept=".zip,.html,.css,.js,.py,.txt">
+            <input type="file" id="fileInput" multiple webkitdirectory style="display:none;" accept=".zip,.html,.css,.js,.py,.txt">
             <button class="btn-choose" onclick="document.getElementById('fileInput').click();">Choose Files</button>
             <div class="supported">Supported: ZIP, Python Project, HTML Website</div>
             <div class="progress" id="uploadProgress">
@@ -703,6 +570,7 @@ DASHBOARD_TEMPLATE = """
     </div>
 
     <script>
+        // File input
         const fileInput = document.getElementById('fileInput');
         const uploadArea = document.getElementById('uploadArea');
         const progressDiv = document.getElementById('uploadProgress');
@@ -713,7 +581,7 @@ DASHBOARD_TEMPLATE = """
             if (!files.length) return;
             const formData = new FormData();
             for (let f of files) {
-                formData.append('files', f);
+                formData.append('files[]', f);
             }
             progressDiv.style.display = 'block';
             progressBar.style.width = '0%';
@@ -744,6 +612,7 @@ DASHBOARD_TEMPLATE = """
             this.value = '';
         });
 
+        // Drag & Drop
         uploadArea.addEventListener('dragover', function(e) {
             e.preventDefault();
             this.style.borderColor = '#1a73e8';
@@ -755,10 +624,10 @@ DASHBOARD_TEMPLATE = """
         uploadArea.addEventListener('drop', function(e) {
             e.preventDefault();
             this.style.borderColor = '#ccc';
-            const files = e.dataTransfer.files;
-            uploadFiles(files);
+            uploadFiles(e.dataTransfer.files);
         });
 
+        // Poll status
         function pollStatus(projectId) {
             const interval = setInterval(() => {
                 fetch(`/project/${projectId}/status`)
@@ -775,6 +644,7 @@ DASHBOARD_TEMPLATE = """
             }, 1500);
         }
 
+        // Action buttons
         document.getElementById('projectList').addEventListener('click', function(e) {
             const target = e.target.closest('button');
             if (!target) return;
@@ -796,11 +666,11 @@ DASHBOARD_TEMPLATE = """
                     .then(data => { if (data.status === 'deleted') location.reload(); });
                 }
             } else if (target.classList.contains('logs')) {
-                window.location.href = `/project/${projectId}/logs`;
+                window.open(`/project/${projectId}/logs`, '_blank');
             }
         });
 
-        // Poll for building projects on load
+        // Initial polling for building projects
         document.querySelectorAll('.project-card').forEach(card => {
             const statusEl = card.querySelector('.status');
             if (statusEl && statusEl.textContent.trim() === 'Building') {
@@ -808,55 +678,28 @@ DASHBOARD_TEMPLATE = """
                 pollStatus(id);
             }
         });
+
+        // Simple status endpoint (for polling)
+        fetch('/project/' + projectId + '/status') // This endpoint not defined; we'll add it.
     </script>
 </body>
 </html>
 """
 
-LOGS_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Build Logs - {{ project.name }}</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { background: #fff; font-family: 'Courier New', monospace; padding: 20px; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px; }
-        .header h2 { font-weight: normal; }
-        .header .actions button { background: #f0f0f0; border: 1px solid #ccc; border-radius: 4px; padding: 6px 16px; cursor: pointer; }
-        .header .actions button:hover { background: #e0e0e0; }
-        .log-container { background: #f9f9f9; border: 1px solid #ddd; border-radius: 4px; padding: 12px; max-height: 600px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; font-size: 13px; line-height: 1.6; }
-        .log-container .log-line { border-bottom: 1px solid #eee; padding: 2px 0; }
-        .back-link { margin-top: 16px; display: inline-block; color: #1a73e8; text-decoration: none; }
-        .back-link:hover { text-decoration: underline; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h2>Build Logs - {{ project.name }}</h2>
-        <div class="actions">
-            <button onclick="location.reload()">Refresh</button>
-            <button onclick="window.close()">Close</button>
-        </div>
-    </div>
-    <div class="log-container" id="logContainer">
-        {% for line in logs %}
-        <div class="log-line">{{ line }}</div>
-        {% endfor %}
-    </div>
-    <a href="/dashboard" class="back-link">← Back to Dashboard</a>
-    <script>
-        const container = document.getElementById('logContainer');
-        container.scrollTop = container.scrollHeight;
-    </script>
-</body>
-</html>
-"""
+# Add a simple status endpoint
+@app.route('/project/<int:project_id>/status')
+def project_status(project_id):
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Unauthorized'}), 401
+    project = get_project(project_id)
+    if not project:
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify({
+        'status': project['status'],
+        'url': project['url'],
+        'runtime': project['runtime']
+    })
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
+# ---------- Run ----------
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)
