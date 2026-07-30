@@ -33,7 +33,7 @@ GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "abcd efgh ijkl mnop")
 GMAIL_RECIPIENT = os.environ.get("GMAIL_RECIPIENT", "recipient_email@gmail.com")
 
 # ==================== TOKEN & ADMIN (अपनी ID डालें) ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8880574991:AAE4ibumB6HezT8oW-wcKnPFa4FneXp0QHc")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8880574991:AAGm3xm8L74Yzep60z9T5tOn6pO7LCvZ4As")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 5674825926))
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=10)
