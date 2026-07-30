@@ -25,7 +25,7 @@ from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemo
 
 # ==================== FLASK WEB SERVER ====================
 from flask import Flask, jsonify
-app = Flask(__name__)
+flask_app = Flask(__name__)   # नाम बदल दिया ताकि 'app' variable conflict न हो
 
 # ==================== GMAIL SETTINGS (अपनी real credentials डालें) ====================
 GMAIL_USER = os.environ.get("GMAIL_USER", "your_email@gmail.com")
@@ -300,7 +300,7 @@ def emergency_backup_and_notify():
         print(f"Emergency backup failed: {e}")
         shutil.copy2(DATABASE_FILE, f"emergency_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
 
-# ==================== BOT FUNCTIONS (unchanged) ====================
+# ==================== BOT FUNCTIONS ====================
 def gen_key():
     return ''.join(random.choices(string.digits, k=10))
 
@@ -526,7 +526,7 @@ def create_main_kb():
                 mk.add(InlineKeyboardButton("CHECK JOINED", callback_data="main_action", icon_custom_emoji_id=verify_emoji_id))
             return mk
 
-# ==================== BOT HANDLERS ====================
+# ==================== BOT HANDLERS (unchanged) ====================
 @bot.message_handler(commands=["start"])
 def start_cmd(m):
     try:
@@ -1273,7 +1273,32 @@ def admins_menu_cb(c):
     bot.edit_message_text("👑 ADMIN MANAGEMENT", c.message.chat.id, c.message.message_id, reply_markup=get_admins_menu())
 
 # =====================================================================
-# ==================== EMERGENCY BACKUP ON SIGNAL =====================
+# ==================== POLLING FUNCTION & BACKGROUND THREADS ==========
+# =====================================================================
+
+def run_bot_polling():
+    print("🔄 Bot polling thread started.", flush=True)
+    while True:
+        try:
+            print("⏳ Starting infinity polling...", flush=True)
+            bot.infinity_polling(timeout=60, long_polling_timeout=30)
+        except Exception as e:
+            print(f"❌ Polling error: {e}", flush=True)
+            emergency_backup_and_notify()
+            print("⏰ Retrying in 10 seconds...", flush=True)
+            time.sleep(10)
+
+def periodic_backup_task():
+    while True:
+        time.sleep(10 * 60)  # 10 minute
+        try:
+            backup_database()
+            print(f"Periodic backup done at {datetime.now()}")
+        except Exception as e:
+            print(f"Periodic backup error: {e}")
+
+# =====================================================================
+# ==================== SIGNAL HANDLERS ================================
 # =====================================================================
 
 def signal_handler(sig, frame):
@@ -1285,52 +1310,45 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 # =====================================================================
-# ==================== PERIODIC BACKUP THREAD ========================
+# ==================== START BACKGROUND THREADS (MODULE LEVEL) =======
 # =====================================================================
 
-def periodic_backup_task():
-    while True:
-        time.sleep(10 * 60)  # 10 minute
-        try:
-            backup_database()
-            print(f"Periodic backup done at {datetime.now()}")
-        except Exception as e:
-            print(f"Periodic backup error: {e}")
+# यह thread module load होते ही start हो जाएगा – चाहे gunicorn चलाए या python app.py
+print("🚀 Starting polling thread at module import...", flush=True)
+polling_thread = threading.Thread(target=run_bot_polling, daemon=True)
+polling_thread.start()
 
-threading.Thread(target=periodic_backup_task, daemon=True).start()
-
-# =====================================================================
-# ==================== BOT POLLING IN BACKGROUND THREAD ==============
-# =====================================================================
-
-def run_bot_polling():
-    while True:
-        try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=30)
-        except Exception as e:
-            print(f"Polling error: {e}")
-            emergency_backup_and_notify()
-            time.sleep(10)
+# Periodic backup thread
+backup_thread = threading.Thread(target=periodic_backup_task, daemon=True)
+backup_thread.start()
 
 # =====================================================================
 # ==================== FLASK ROUTES (Health Check) ===================
 # =====================================================================
 
-@app.route('/')
+@flask_app.route('/')
 def index():
     return "Bot is running!"
 
-@app.route('/ping')
+@flask_app.route('/ping')
 def ping():
     return "pong"
 
+@flask_app.route('/test')
+def test_bot():
+    try:
+        bot.send_message(ADMIN_ID, "✅ Test message from bot (via /test endpoint)")
+        return "Test message sent to admin!"
+    except Exception as e:
+        return f"Error: {e}"
+
 # =====================================================================
-# ==================== MAIN ==========================================
+# ==================== MAIN (for local run) ===========================
 # =====================================================================
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🤖 PURE TELEGRAM BOT STARTED (WITH WEB SERVER FOR RENDER)")
+    print("🤖 PURE TELEGRAM BOT STARTED (LOCAL / TERMUX)")
     print(f"Users: {len(get_users())} | Channels: {len(get_channels())}")
     print("=" * 60)
     print("🔥 Emoji IDs: (number) -> premium emoji")
@@ -1342,14 +1360,10 @@ if __name__ == "__main__":
     print("=" * 60)
 
     try:
-        bot.send_message(ADMIN_ID, f"✅ BOT STARTED (WITH WEB SERVER)\nUsers: {len(get_users())}\n\n🔥 (number) -> premium emoji\n📢 Broadcast: /broadcast reply\n📊 Status: /status\n🚨 Emergency backup enabled.")
+        bot.send_message(ADMIN_ID, f"✅ BOT STARTED (LOCAL)\nUsers: {len(get_users())}")
     except:
         pass
 
-    # Start bot polling in a separate daemon thread
-    polling_thread = threading.Thread(target=run_bot_polling, daemon=True)
-    polling_thread.start()
-
-    # Start Flask web server (this will block the main thread)
+    # Local development – run Flask built-in server
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    flask_app.run(host='0.0.0.0', port=port)
