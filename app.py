@@ -52,7 +52,7 @@ TELEGRAM_BOT_MODE = True
 # =========================================================
 #  📌 CONFIG
 # =========================================================
-BOT_TOKEN = "8958507490:AAEnSQCrfiUsilIhRCKTwawq9SHsU5O4Las"
+BOT_TOKEN = "8958507490:AAG-VeSJq-Rbb1NAxQ1VA4x3HX-X066jQwY"
 OWNER_ID = 5674825926
 SUPPORT_USERNAME = "@Card_hacker_12"
 DATA_DIR = "data"
