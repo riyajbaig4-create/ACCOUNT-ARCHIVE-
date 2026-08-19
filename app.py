@@ -34,7 +34,7 @@ app.secret_key = 'yuvicodex_super_secret_key_change_me_in_production'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 
 # ---------- CONFIG ----------
-PASSWORD = "your_secure_password"                     # for old /execute endpoint
+PASSWORD = "your_secure_password"
 MASTER_PASSWORD = os.environ.get('MASTER_PASSWORD', 'master123')
 SECRET_KEY = os.environ.get('SECRET_KEY', 'secret123')
 
@@ -491,7 +491,7 @@ def schedule_log_clear():
 
 schedule_log_clear()
 
-# ---------- RUNTIME DETECTION ----------
+# ---------- RUNTIME DETECTION (IMPROVED) ----------
 def find_startup_file(folder):
     for filename in STARTUP_PRIORITY:
         if os.path.exists(os.path.join(folder, filename)):
@@ -499,7 +499,7 @@ def find_startup_file(folder):
     return None
 
 def detect_runtime_and_get_cmd(folder, port):
-    # Node.js with package.json
+    # ----- Node.js (with package.json) -----
     if os.path.exists(os.path.join(folder, 'package.json')):
         try:
             with open(os.path.join(folder, 'package.json'), 'r') as f:
@@ -507,27 +507,37 @@ def detect_runtime_and_get_cmd(folder, port):
                 scripts = data.get('scripts', {})
                 if 'start' in scripts:
                     return ['npm', 'start'], 'nodejs', {'NODE_ENV': 'production', 'PORT': str(port)}
+                else:
+                    # No start script – check "main" field
+                    main_file = data.get('main')
+                    if main_file and os.path.exists(os.path.join(folder, main_file)):
+                        return ['node', main_file], 'nodejs', {'PORT': str(port)}
+                    # else fall through
         except:
             pass
-    # Common JS files
-    js_files = ['server.js', 'index.js', 'app.js', 'main.js']
-    for fname in js_files:
+
+    # ----- Common JS files -----
+    for fname in ['server.js', 'index.js', 'app.js', 'main.js']:
         if os.path.exists(os.path.join(folder, fname)):
             return ['node', fname], 'nodejs', {'PORT': str(port)}
-    # Fallback any .js
+
+    # ----- Fallback: any .js file -----
     try:
         for f in os.listdir(folder):
             if f.endswith('.js') and os.path.isfile(os.path.join(folder, f)):
                 return ['node', f], 'nodejs', {'PORT': str(port)}
     except:
         pass
-    # PHP
+
+    # ----- PHP -----
     if os.path.exists(os.path.join(folder, 'index.php')):
         return ['php', '-S', f'0.0.0.0:{port}'], 'php', {}
-    # Go
+
+    # ----- Go -----
     if os.path.exists(os.path.join(folder, 'go.mod')):
         return ['go', 'run', 'main.go'], 'go', {}
-    # Java
+
+    # ----- Java -----
     if os.path.exists(os.path.join(folder, 'pom.xml')):
         return ['mvn', 'spring-boot:run'], 'java', {}
     if os.path.exists(os.path.join(folder, 'build.gradle')):
@@ -535,7 +545,8 @@ def detect_runtime_and_get_cmd(folder, port):
     jars = [f for f in os.listdir(folder) if f.endswith('.jar')]
     if jars:
         return ['java', '-jar', jars[0]], 'java', {}
-    # Python Flask/Django
+
+    # ----- Python Flask/Django -----
     flask_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
     for f in flask_files:
         path = os.path.join(folder, f)
@@ -556,13 +567,15 @@ def detect_runtime_and_get_cmd(folder, port):
         return [sys.executable, startup], 'python', {}
     if os.path.exists(os.path.join(folder, 'index.html')):
         return [sys.executable, '-m', 'http.server', str(port)], 'static', {}
-    # Fallback any .py
+
+    # ----- Fallback: any .py file -----
     try:
         for f in os.listdir(folder):
             if f.endswith('.py') and os.path.isfile(os.path.join(folder, f)):
                 return [sys.executable, f], 'python', {}
     except:
         pass
+
     return None, None, {}
 
 # ---------- INSTALL DEPENDENCIES ----------
@@ -615,7 +628,7 @@ def install_dependencies(folder, runtime, log_callback=None):
         return True, "No deps"
     return True, "Unknown runtime"
 
-# ---------- HEALTH CHECK ----------
+# ---------- HEALTH CHECK (IMPROVED) ----------
 def detect_port_from_log(log_file):
     if not os.path.exists(log_file): return None
     try:
@@ -630,7 +643,7 @@ def detect_port_from_log(log_file):
     except: pass
     return None
 
-def health_check_on_ports(port_list, max_retries=15, delay=3):
+def health_check_on_ports(port_list, max_retries=20, delay=3):
     for port in port_list:
         for attempt in range(max_retries):
             try:
@@ -651,25 +664,25 @@ def start_website_process(website_id, log_callback=None):
         log_website(website_id, "Folder missing", 'error')
         update_website_status(website_id, 'failed')
         return False, "Folder not found"
-    
+
     allocated_port = get_next_available_port()
     cmd, runtime, env_extra = detect_runtime_and_get_cmd(folder, allocated_port)
     if not cmd:
         log_website(website_id, "No startup file detected", 'error')
         update_website_status(website_id, 'failed')
         return False, "No startup file detected"
-    
+
     with get_db() as conn:
         conn.execute('UPDATE websites SET runtime = ? WHERE id = ?', (runtime, website_id))
         conn.commit()
-    
+
     if log_callback: log_callback("BUILD", f"Installing dependencies for {runtime}...")
     success, msg = install_dependencies(folder, runtime, log_callback)
     if not success:
         log_website(website_id, f"Dependency install failed: {msg}", 'error')
         update_website_status(website_id, 'failed')
         return False, msg
-    
+
     env = os.environ.copy()
     env['PORT'] = str(allocated_port)
     env['PYTHONUNBUFFERED'] = '1'
@@ -679,10 +692,10 @@ def start_website_process(website_id, log_callback=None):
         elif os.path.exists(os.path.join(folder, 'main.py')): env['FLASK_APP'] = 'main.py'
     if runtime == 'php':
         cmd = ['php', '-S', f'0.0.0.0:{allocated_port}']
-    
+
     log_file = os.path.join(LOG_FOLDER, f"website_{website_id}.log")
     if log_callback: log_callback("STARTUP", f"Starting: {' '.join(cmd)} on port {allocated_port}")
-    
+
     try:
         f_log = open(log_file, 'a')
         if os.name == 'nt':
@@ -697,11 +710,11 @@ def start_website_process(website_id, log_callback=None):
                     if log_callback: log_callback("PROCESS", decoded.strip())
             f_log.close()
         thread = threading.Thread(target=read_output); thread.daemon = True; thread.start()
-        
+
         with get_db() as conn:
             conn.execute('UPDATE websites SET last_start_time = CURRENT_TIMESTAMP, status = ? WHERE id = ?', ('starting', website_id))
             conn.commit()
-        
+
         time.sleep(3)
         if proc.poll() is not None:
             with open(log_file, 'r') as f:
@@ -709,14 +722,14 @@ def start_website_process(website_id, log_callback=None):
             update_website_status(website_id, 'failed')
             log_website(website_id, f"Process crashed: {error_lines}", 'error')
             return False, f"Process crashed: {error_lines}"
-        
+
         detected_port = detect_port_from_log(log_file)
         ports_to_try = [detected_port] if detected_port else []
         ports_to_try.append(allocated_port)
         for p in [3000, 8080, 5000, 8000, 8081, 3001]:
             if p not in ports_to_try: ports_to_try.append(p)
-        
-        healthy, actual_port, health_msg = health_check_on_ports(ports_to_try, max_retries=15, delay=3)
+
+        healthy, actual_port, health_msg = health_check_on_ports(ports_to_try, max_retries=20, delay=3)
         if healthy:
             update_website_status(website_id, 'running', proc.pid, actual_port)
             log_website(website_id, f"Started on port {actual_port} (PID {proc.pid})")
@@ -743,7 +756,7 @@ def stop_website_process(website_id):
     if not website: return False, "Not found"
     pid = website['pid']
     if not pid: return False, "No running process"
-    
+
     last_start = website['last_start_time']
     if last_start:
         try:
@@ -753,7 +766,7 @@ def stop_website_process(website_id):
                 conn.execute('UPDATE websites SET total_runtime_seconds = total_runtime_seconds + ? WHERE id = ?', (elapsed, website_id))
                 conn.commit()
         except: pass
-    
+
     try:
         if os.name == 'nt': subprocess.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True)
         else:
@@ -826,8 +839,6 @@ def deploy_zip_website(website_id):
     except Exception as e:
         log_website(website_id, f"Deployment exception: {str(e)}", 'error')
         with get_db() as conn:
-            # deployment_id might not be defined if exception occurred before assignment
-            # Use a dummy value or handle gracefully
             try:
                 conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?', ('failed', deployment_id))
             except:
@@ -1572,10 +1583,10 @@ def upload_website():
                            (username, slug, f"website_{0}", 'uploaded', 'website'))
         website_id = cur.lastrowid
         conn.commit()
-    
+
     folder = os.path.join(UPLOAD_FOLDER, f"website_{website_id}")
     os.makedirs(folder, exist_ok=True)
-    
+
     zip_file = None
     for f in files:
         if f.filename.lower().endswith('.zip'):
@@ -1585,13 +1596,13 @@ def upload_website():
             f.save(os.path.join(folder, filename))
     if zip_file:
         zip_file.save(os.path.join(folder, 'upload.zip'))
-    
+
     def bg_deploy():
         deploy_zip_website(website_id)
     thread = threading.Thread(target=bg_deploy)
     thread.daemon = True
     thread.start()
-    
+
     return jsonify({'success': True, 'website_id': website_id, 'slug': slug})
 
 @app.route('/api/websites')
@@ -1961,7 +1972,7 @@ def api_stats():
     offset_hours = float(get_config('total_hours_offset', '0'))
     internal_hours = total_internal_seconds / 3600.0
     main_hours = main_uptime_seconds / 3600.0
-    
+
     total_hours = offset_hours + main_hours + internal_hours + render_running_hours
 
     upload_size_bytes = calculate_folder_size(UPLOAD_FOLDER)
@@ -2239,7 +2250,7 @@ def execute():
         return jsonify({"output": str(e)})
 
 # ---------- CLI TOOLS ROUTES ----------
-cli_processes = {}  # for CLI tool processes
+cli_processes = {}
 
 @app.route('/api/cli_tools', methods=['GET'])
 @login_required
@@ -2514,14 +2525,14 @@ MINI_WEB_TEMPLATE = """
     <style>
         * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI', system-ui, sans-serif; }
         body { background:#05070d; color:#fff; min-height:100vh; display:flex; justify-content:center; align-items:center; padding:20px; }
-        .mini-container { max-width:500px; width:100%; background:rgba(255,255,255,0.03); backdrop-filter:blur(20px); border-radius:30px; padding:30px 25px; border:1px solid rgba(255,255,255,0.08); box-shadow:0 0 80px rgba(0,229,255,0.05); position:relative; overflow:hidden; }
+        .mini-container { max-width:500px; width:100%; background:rgba(255,255,255,0.03); backdrop-filter:blur(24px); border-radius:30px; padding:30px 25px; border:1px solid rgba(255,255,255,0.08); box-shadow:0 0 80px rgba(0,229,255,0.05); position:relative; overflow:hidden; }
         .mini-container::before { content:""; position:absolute; inset:-3px; background:conic-gradient(#00e5ff, transparent, transparent, transparent, #00e5ff); animation:spin 4s linear infinite; z-index:-1; }
         .mini-container::after { content:""; position:absolute; inset:3px; background:rgba(10,14,26,0.95); border-radius:27px; z-index:-1; }
         @keyframes spin { 100% { transform:rotate(360deg); } }
         .mini-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; padding-bottom:15px; border-bottom:1px solid rgba(255,255,255,0.06); }
         .mini-title { font-size:1.2rem; font-weight:800; background:linear-gradient(135deg, #00e5ff, #7a00ff); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
         .mini-badge { padding:4px 16px; border-radius:50px; font-size:0.7rem; font-weight:700; text-transform:uppercase; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); }
-        .mini-badge.running { background:rgba(0,229,255,0.15); color:#00e5ff; border-color:rgba(0,229,255,0.2); }
+        .mini-badge.running { background:rgba(0,229,255,0.15); color:#00e5ff; border-color:rgba(0,229,255,0.2); box-shadow:0 0 12px rgba(0,229,255,0.15); }
         .mini-badge.stopped { background:rgba(255,71,87,0.15); color:#ff4757; border-color:rgba(255,71,87,0.2); }
         .mini-badge.failed { background:rgba(255,0,0,0.15); color:#ff0000; border-color:rgba(255,0,0,0.2); }
         .mini-info { background:rgba(255,255,255,0.03); border-radius:15px; padding:15px; margin-bottom:20px; }
@@ -2531,6 +2542,7 @@ MINI_WEB_TEMPLATE = """
         .mini-controls { display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }
         .mini-controls button { flex:1; padding:12px 20px; border:none; border-radius:12px; font-weight:700; font-size:0.9rem; cursor:pointer; transition:all .3s cubic-bezier(.4,0,.2,1); min-width:80px; background:rgba(255,255,255,0.05); color:#aaa; border:1px solid rgba(255,255,255,0.08); }
         .mini-controls button:hover:not(:disabled) { transform:scale(1.05); box-shadow:0 8px 30px rgba(0,0,0,0.3); }
+        .mini-controls button:active:not(:disabled) { transform:scale(0.95); }
         .mini-controls button:disabled { opacity:0.4; cursor:not-allowed; }
         .mini-btn-start { background:rgba(0,229,255,0.12); color:#00e5ff; border-color:rgba(0,229,255,0.2); }
         .mini-btn-start:hover:not(:disabled) { background:#00e5ff; color:#000; border-color:#00e5ff; }
@@ -3114,11 +3126,12 @@ HTML_TEMPLATE = """
             background: #00ff6a33;
             color: #00ff6a;
             border: 1px solid #00ff6a;
+            box-shadow: 0 0 10px rgba(0,255,100,0.2);
         }
         .bot-status.stopped {
-            background: #555;
-            color: #aaa;
-            border: 1px solid #666;
+            background: #ff333333;
+            color: #ff4d4d;
+            border: 1px solid #ff4d4d55;
         }
         .bot-uptime {
             font-size: 12px;
@@ -3145,7 +3158,11 @@ HTML_TEMPLATE = """
             font-weight: bold;
             cursor: pointer;
             font-size: 12px;
-            transition: background 0.2s, opacity 0.2s;
+            transition: background 0.2s, opacity 0.2s, transform 0.1s;
+        }
+        .bot-controls button:active:not(:disabled),
+        .cli-tool-controls button:active:not(:disabled) {
+            transform: scale(0.94);
         }
         .bot-controls button:disabled,
         .cli-tool-controls button:disabled {
@@ -3156,9 +3173,15 @@ HTML_TEMPLATE = """
             background: #00d4ff;
             color: #000;
         }
+        .btn-start:hover:not(:disabled) {
+            background: #00c0e6;
+        }
         .btn-stop {
             background: #ff4d4d;
             color: #fff;
+        }
+        .btn-stop:hover:not(:disabled) {
+            background: #e64444;
         }
         .btn-edit {
             background: #4d88ff;
@@ -3265,11 +3288,12 @@ HTML_TEMPLATE = """
             background: #00ff6a33;
             color: #00ff6a;
             border: 1px solid #00ff6a;
+            box-shadow: 0 0 10px rgba(0,255,100,0.2);
         }
         .website-status.stopped {
-            background: #555;
-            color: #aaa;
-            border: 1px solid #666;
+            background: #ff333333;
+            color: #ff4d4d;
+            border: 1px solid #ff4d4d55;
         }
         .website-status.failed {
             background: #ff333333;
@@ -3304,7 +3328,10 @@ HTML_TEMPLATE = """
             font-weight: bold;
             cursor: pointer;
             font-size: 12px;
-            transition: background 0.2s, opacity 0.2s;
+            transition: background 0.2s, opacity 0.2s, transform 0.1s;
+        }
+        .website-actions button:active:not(:disabled) {
+            transform: scale(0.94);
         }
         .website-actions button:disabled {
             opacity: 0.5;
@@ -3314,70 +3341,70 @@ HTML_TEMPLATE = """
             background: #00d4ff;
             color: #000;
         }
-        .btn-start-w:hover {
+        .btn-start-w:hover:not(:disabled) {
             background: #00c0e6;
         }
         .btn-stop-w {
             background: #ff4d4d;
             color: #fff;
         }
-        .btn-stop-w:hover {
+        .btn-stop-w:hover:not(:disabled) {
             background: #e64444;
         }
         .btn-restart-w {
             background: #ffaa00;
             color: #000;
         }
-        .btn-restart-w:hover {
+        .btn-restart-w:hover:not(:disabled) {
             background: #e69900;
         }
         .btn-delete-w {
             background: #400;
             color: #fff;
         }
-        .btn-delete-w:hover {
+        .btn-delete-w:hover:not(:disabled) {
             background: #600;
         }
         .btn-edit-w {
             background: #4d88ff;
             color: #fff;
         }
-        .btn-edit-w:hover {
+        .btn-edit-w:hover:not(:disabled) {
             background: #3d78ef;
         }
         .btn-download-w {
             background: #2ecc71;
             color: #000;
         }
-        .btn-download-w:hover {
+        .btn-download-w:hover:not(:disabled) {
             background: #27ae60;
         }
         .btn-files-w {
             background: #555;
             color: #fff;
         }
-        .btn-files-w:hover {
+        .btn-files-w:hover:not(:disabled) {
             background: #666;
         }
         .btn-buildlogs-w {
             background: #8e44ad;
             color: #fff;
         }
-        .btn-buildlogs-w:hover {
+        .btn-buildlogs-w:hover:not(:disabled) {
             background: #7d3c98;
         }
         .btn-visit-w {
             background: #1da1f2;
             color: #fff;
         }
-        .btn-visit-w:hover {
+        .btn-visit-w:hover:not(:disabled) {
             background: #1a8cd8;
         }
         .btn-miniweb-w {
             background: #8e44ad;
             color: #fff;
         }
-        .btn-miniweb-w:hover {
+        .btn-miniweb-w:hover:not(:disabled) {
             background: #7d3c98;
         }
         .name-edit {
