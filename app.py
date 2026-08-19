@@ -17,8 +17,8 @@ import select
 import pty
 import queue
 from datetime import datetime, timedelta
+from functools import wraps  # ✅ Added for decorators
 from flask import Flask, render_template_string, request, jsonify, session, send_file, redirect, Response, stream_with_context, abort
-from functools import wraps
 from io import BytesIO
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -32,6 +32,23 @@ except ImportError:
 app = Flask(__name__)
 app.secret_key = 'yuvicodex_super_secret_key_change_me_in_production'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
+
+# ---------- DECORATORS (defined early) ----------
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'username' not in session:
+            return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'username' not in session or session.get('role') != 'admin':
+            return jsonify({'error': 'Forbidden'}), 403
+        return f(*args, **kwargs)
+    return decorated
 
 # ---------- CONFIG ----------
 PASSWORD = "your_secure_password"
@@ -805,14 +822,11 @@ def website_env(website_id):
     else:
         data = request.json
         new_env = data.get('env', {})
-        # Validate it's a dict of strings
         if not isinstance(new_env, dict):
             return jsonify({'error': 'Invalid format'}), 400
-        # Serialize and save
         with get_db() as conn:
             conn.execute('UPDATE websites SET env_vars = ? WHERE id = ?', (json.dumps(new_env), website_id))
             conn.commit()
-        # Restart if running
         if w['status'] == 'running':
             stop_website_process(website_id)
             start_website_process(website_id)
@@ -1082,22 +1096,8 @@ def get_container_memory():
     percent = (used_mb / total_mb) * 100 if total_mb > 0 else 0
     return round(used_mb, 2), round(total_mb, 2), round(min(percent, 100), 2)
 
-# ---------- DECORATORS ----------
-def login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if 'username' not in session:
-            return jsonify({'error': 'Unauthorized'}), 401
-        return f(*args, **kwargs)
-    return decorated
-
-def admin_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if 'username' not in session or session.get('role') != 'admin':
-            return jsonify({'error': 'Forbidden'}), 403
-        return f(*args, **kwargs)
-    return decorated
+# ---------- DECORATORS (already defined earlier, but kept for clarity) ----------
+# login_required and admin_required are defined at the top.
 
 # ---------- BEFORE REQUEST ----------
 @app.before_request
@@ -1915,7 +1915,7 @@ def website_delete_file(website_id):
         os.remove(full)
     return jsonify({'success': True})
 
-@app.route('/website/<int:website_id>/file/rename', methods(['POST'])
+@app.route('/website/<int:website_id>/file/rename', methods=['POST'])
 @login_required
 def website_rename_file(website_id):
     w = get_website_by_id(website_id)
