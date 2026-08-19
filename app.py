@@ -1,29 +1,24 @@
 # -*- coding: utf-8 -*-
-import threading
-import subprocess
 import os
+import sys
+import sqlite3
 import zipfile
 import shutil
-import json
-import uuid
-import time
+import subprocess
 import signal
-import tempfile
+import time
 import re
 import requests
-import select
-import pty
-import queue
-import sqlite3
-import sys
+import threading
+import json
+import uuid
 from datetime import datetime, timedelta
-from flask import Flask, render_template_string, request, jsonify, session, send_file, send_from_directory, redirect, Response, stream_with_context, abort
+from flask import Flask, render_template_string, request, jsonify, session, send_file, redirect, Response, stream_with_context, abort
 from functools import wraps
 from io import BytesIO
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# Try to import psutil for system stats
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -31,28 +26,25 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 app = Flask(__name__)
-app.secret_key = 'yuvicodex_super_secret_key'
+app.secret_key = 'yuvicodex_super_secret_key_change_me_in_production'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 
 # ---------- CONFIG ----------
-PASSWORD = "your_secure_password"          # for terminal
-MASTER_PASSWORD = os.environ.get('MASTER_PASSWORD', 'master123')   # master login password
-SECRET_KEY = os.environ.get('SECRET_KEY', 'secret123')             # secret key for logo clicks
-UPLOAD_FOLDER = os.path.abspath('uploads')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-BASE_DIR = os.path.abspath('.')  # base for file manager
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 LOG_FOLDER = os.path.join(BASE_DIR, 'logs')
+DB_PATH = os.path.join(BASE_DIR, 'hosting.db')
+SETTINGS_FILE = os.path.join(BASE_DIR, 'settings.json')
+USERS_FILE = os.path.join(BASE_DIR, 'users.json')
+BOTS_FILE = os.path.join(UPLOAD_FOLDER, 'bots.json')
+STATIC_LOGO_FOLDER = os.path.join(BASE_DIR, 'static', 'logos')
+STARTUP_PRIORITY = ['app.py', 'main.py', 'server.py', 'run.py', 'manage.py', 'index.py', 'start.py', 'wsgi.py', 'asgi.py']
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
-
-# ---------- RENDER_API_KEY - DEFAULT VALUE ----------
-RENDER_API_KEY = os.environ.get('RENDER_API_KEY', 'rnd_27v7iMggh7mafESEqJq1Lf12wIkF')
-RENDER_API_BASE = "https://api.render.com/v1"
-
-# ---------- SETTINGS ----------
-SETTINGS_FILE = 'settings.json'
-STATIC_LOGO_FOLDER = os.path.join('static', 'logos')
 os.makedirs(STATIC_LOGO_FOLDER, exist_ok=True)
 
+# ---------- SETTINGS ----------
 def load_settings():
     default = {
         "website_name": "YUVICODEX",
@@ -67,9 +59,9 @@ def load_settings():
     if os.path.exists(SETTINGS_FILE):
         with open(SETTINGS_FILE, 'r') as f:
             data = json.load(f)
-            for key, val in default.items():
-                if key not in data:
-                    data[key] = val
+            for k, v in default.items():
+                if k not in data:
+                    data[k] = v
             if "social_links" not in data:
                 data["social_links"] = default["social_links"]
             else:
@@ -86,31 +78,7 @@ def save_settings(settings):
 
 settings_db = load_settings()
 
-# ---------- BOT MANAGEMENT (JSON based) ----------
-BOTS_FILE = os.path.join(UPLOAD_FOLDER, 'bots.json')
-bots_db = {}
-
-def load_bots():
-    global bots_db
-    if os.path.exists(BOTS_FILE):
-        with open(BOTS_FILE, 'r') as f:
-            bots_db = json.load(f)
-    else:
-        bots_db = {}
-
-def save_bots():
-    with open(BOTS_FILE, 'w') as f:
-        json.dump(bots_db, f, indent=2)
-
-load_bots()
-
-# ---------- PROCESS TRACKING (for bots) ----------
-processes = {}
-cli_processes = {}   # For CLI tools
-
-# ---------- SQLITE FOR WEBSITES ----------
-DB_PATH = os.path.join(BASE_DIR, 'hosting.db')
-
+# ---------- DATABASE ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -118,7 +86,18 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        # Websites table
+        conn.execute('''CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT DEFAULT 'owner',
+            status TEXT DEFAULT 'active',
+            plan TEXT DEFAULT 'free',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP,
+            last_login TIMESTAMP
+        )''')
         conn.execute('''CREATE TABLE IF NOT EXISTS websites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_username TEXT NOT NULL,
@@ -144,7 +123,6 @@ def init_db():
             type TEXT DEFAULT 'website',
             bot_interpreter TEXT
         )''')
-        
         conn.execute('''CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             website_id INTEGER,
@@ -153,7 +131,6 @@ def init_db():
             log_text TEXT NOT NULL,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
-        
         conn.execute('''CREATE TABLE IF NOT EXISTS deployments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             website_id INTEGER,
@@ -167,13 +144,10 @@ def init_db():
             commit_hash TEXT,
             log_file TEXT
         )''')
-        
         conn.execute('''CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
             value TEXT
         )''')
-        
-        # CLI Tools Table
         conn.execute('''CREATE TABLE IF NOT EXISTS cli_tools (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_username TEXT NOT NULL,
@@ -189,130 +163,169 @@ def init_db():
             last_stopped TIMESTAMP,
             storage_used INTEGER DEFAULT 0
         )''')
-        
         conn.execute('CREATE INDEX IF NOT EXISTS idx_websites_owner ON websites(owner_username)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_website ON logs(website_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_deployments_website ON deployments(website_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_cli_tools_owner ON cli_tools(owner_username)')
-        
         conn.execute('INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)',
                      ('total_hours_offset', '0'))
         conn.commit()
 init_db()
 
-# ---------- PROJECT DATA CLASS ----------
-class ProjectData:
-    def __init__(self, project_folder):
-        self.folder = project_folder
-        self.data_file = os.path.join(project_folder, 'project_data.json')
-        self.data = self._load()
+# ---------- USER MANAGEMENT ----------
+def load_users():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, 'r') as f:
+            return json.load(f)
+    default = [
+        {"username": "admin", "password": "admin123", "role": "admin", "limit": 999, "banned": False, "expires_at": None, "session_version": 0},
+        {"username": "user1", "password": "pass123", "role": "user", "limit": 5, "banned": False, "expires_at": None, "session_version": 0},
+        {"username": "user2", "password": "pass456", "role": "user", "limit": 5, "banned": False, "expires_at": None, "session_version": 0}
+    ]
+    save_users(default)
+    return default
 
-    def _load(self):
-        """Load data from project_data.json or create default"""
-        if os.path.exists(self.data_file):
-            try:
-                with open(self.data_file, 'r') as f:
-                    return json.load(f)
-            except:
-                pass
-        return {"logs": [], "stats": {}, "config": {}}
+def save_users(users):
+    with open(USERS_FILE, 'w') as f:
+        json.dump(users, f, indent=2)
 
-    def _save(self):
-        """Save data to project_data.json"""
-        try:
-            with open(self.data_file, 'w') as f:
-                json.dump(self.data, f, indent=2)
-        except:
-            pass
+users_db = load_users()
 
-    def add_log(self, message, log_type='info'):
-        """Add a log entry with timestamp"""
-        self.data["logs"].append({
-            "ts": datetime.now().isoformat(),
-            "type": log_type,
-            "msg": message
-        })
-        # Keep only last 500 logs
-        if len(self.data["logs"]) > 500:
-            self.data["logs"] = self.data["logs"][-500:]
-        self._save()
+def find_user(username):
+    username = username.strip()
+    for u in users_db:
+        if u['username'].strip() == username:
+            return u
+    return None
 
-    def update_stat(self, key, value):
-        """Update or add a statistic"""
-        self.data["stats"][key] = value
-        self._save()
+def is_owner(username):
+    user = find_user(username)
+    return user and user['role'] == 'admin'
 
-    def get_stat(self, key, default=None):
-        """Get a statistic value"""
-        return self.data["stats"].get(key, default)
+def parse_expiry(expiry_str):
+    if not expiry_str:
+        return None
+    expiry_str = expiry_str.strip().lower()
+    if expiry_str.isdigit():
+        days = int(expiry_str)
+        return (datetime.now() + timedelta(days=days)).isoformat()
+    match = re.match(r'^(\d+)([dhm])$', expiry_str)
+    if match:
+        value = int(match.group(1))
+        unit = match.group(2)
+        if unit == 'd':
+            delta = timedelta(days=value)
+        elif unit == 'h':
+            delta = timedelta(hours=value)
+        elif unit == 'm':
+            delta = timedelta(minutes=value)
+        else:
+            return None
+        return (datetime.now() + delta).isoformat()
+    return None
 
-    def set_config(self, key, value):
-        """Set configuration value"""
-        self.data["config"][key] = value
-        self._save()
-
-    def get_config(self, key, default=None):
-        """Get configuration value"""
-        return self.data["config"].get(key, default)
-
-# ---------- LOGS AUTO-CLEAR (1 HOUR) ----------
-def clear_all_logs():
-    """Clear ALL logs - bot, website, cli, everything"""
+def is_expired(user):
+    if not user.get('expires_at'):
+        return False
     try:
-        # 1. Delete all log files from LOG_FOLDER
-        if os.path.exists(LOG_FOLDER):
-            for f in os.listdir(LOG_FOLDER):
-                file_path = os.path.join(LOG_FOLDER, f)
-                if os.path.isfile(file_path):
-                    try:
-                        os.remove(file_path)
-                    except:
-                        pass
-
-        # 2. Clear database logs (keep only website_id and cli_tool_id not null)
-        with get_db() as conn:
-            # Optionally keep logs with references? But we'll delete all for simplicity.
-            conn.execute('DELETE FROM logs')
-            conn.commit()
-
-        # 3. Clear bot logs from project folders
-        with get_db() as conn:
-            bots = conn.execute('SELECT user, project FROM bots').fetchall()  # Actually bots is in JSON, not DB
-            # Since bots are in JSON, we can iterate over bots_db
-            for bot_id, bot in list(bots_db.items()):
-                project_folder = os.path.join(get_user_folder(bot['user']), bot['project'])
-                log_file = os.path.join(project_folder, bot_id + '.log')
-                if os.path.exists(log_file):
-                    try:
-                        os.remove(log_file)
-                    except:
-                        pass
-
-        # 4. Clear CLI logs from project folders
-        with get_db() as conn:
-            cli_tools = conn.execute('SELECT id, tool_folder FROM cli_tools').fetchall()
-            for tool in cli_tools:
-                log_file = os.path.join(tool['tool_folder'], 'cli.log')
-                if os.path.exists(log_file):
-                    try:
-                        os.remove(log_file)
-                    except:
-                        pass
-
-        print(f"✅ All logs cleared at {datetime.now()}")
-        return True
-    except Exception as e:
-        print(f"Error clearing logs: {e}")
+        exp = datetime.fromisoformat(user['expires_at'])
+        return datetime.now() > exp
+    except:
         return False
 
-def schedule_log_clear():
-    clear_all_logs()
-    threading.Timer(3600, schedule_log_clear).start()  # 1 hour = 3600 seconds
+def delete_user_account(username):
+    global users_db, bots_db
+    user_folder = os.path.join(UPLOAD_FOLDER, username)
+    if os.path.exists(user_folder):
+        shutil.rmtree(user_folder, ignore_errors=True)
+    to_delete = [bid for bid, bot in bots_db.items() if bot['user'] == username]
+    for bid in to_delete:
+        if bid in processes:
+            try:
+                processes[bid].terminate()
+            except:
+                pass
+            processes.pop(bid, None)
+        del bots_db[bid]
+    save_bots()
+    users_db = [u for u in users_db if u['username'] != username]
+    save_users(users_db)
+    if session.get('username') == username:
+        session.clear()
 
-# Start the scheduler when server starts
-schedule_log_clear()
+# ---------- BOT MANAGEMENT ----------
+BOTS_FILE = os.path.join(UPLOAD_FOLDER, 'bots.json')
+bots_db = {}
+processes = {}
 
-# ---------- HELPERS FOR WEBSITES ----------
+def load_bots():
+    global bots_db
+    if os.path.exists(BOTS_FILE):
+        with open(BOTS_FILE, 'r') as f:
+            bots_db = json.load(f)
+    else:
+        bots_db = {}
+
+def save_bots():
+    with open(BOTS_FILE, 'w') as f:
+        json.dump(bots_db, f, indent=2)
+
+load_bots()
+
+# ---------- HELPERS ----------
+def get_user_folder(username):
+    folder = os.path.join(UPLOAD_FOLDER, username)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+def get_bot_absolute_path(bot):
+    project_folder = os.path.join(get_user_folder(bot['user']), bot['project'])
+    return os.path.join(project_folder, bot['filename'])
+
+def get_bot_log_file(bot):
+    return get_bot_absolute_path(bot) + '.log'
+
+def generate_project_id():
+    return str(uuid.uuid4())[:8]
+
+def get_interpreter(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == '.py':
+        return 'python'
+    elif ext == '.js':
+        return 'node'
+    elif ext == '.go':
+        return 'go run'
+    elif ext == '.rb':
+        return 'ruby'
+    elif ext == '.php':
+        return 'php'
+    elif ext == '.sh':
+        return 'bash'
+    elif ext == '.pl':
+        return 'perl'
+    else:
+        return None
+
+def detect_bot_token(filepath):
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        token_match = re.search(r'[0-9]{9,10}:[A-Za-z0-9_-]{35,}', content)
+        if token_match:
+            token = token_match.group(0)
+            try:
+                resp = requests.get(f'https://api.telegram.org/bot{token}/getMe', timeout=3)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get('ok'):
+                        return token, data['result'].get('username')
+            except:
+                pass
+        return None, None
+    except:
+        return None, None
+
 def get_website_by_id(website_id):
     with get_db() as conn:
         return conn.execute('SELECT * FROM websites WHERE id = ?', (website_id,)).fetchone()
@@ -370,7 +383,6 @@ def calculate_folder_size(folder):
                 total += os.path.getsize(fp)
     return total
 
-# ---------- CONFIG HELPERS ----------
 def get_config(key, default='0'):
     with get_db() as conn:
         row = conn.execute('SELECT value FROM config WHERE key = ?', (key,)).fetchone()
@@ -381,67 +393,97 @@ def set_config(key, value):
         conn.execute('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', (key, value))
         conn.commit()
 
-# ---------- CONTAINER MEMORY (REAL) ----------
-def get_container_memory():
-    try:
-        if os.path.exists('/sys/fs/cgroup/memory.max'):
-            with open('/sys/fs/cgroup/memory.max', 'r') as f:
-                total_bytes = int(f.read().strip())
-            with open('/sys/fs/cgroup/memory.current', 'r') as f:
-                used_bytes = int(f.read().strip())
-        elif os.path.exists('/sys/fs/cgroup/memory/memory.limit_in_bytes'):
-            with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
-                total_bytes = int(f.read().strip())
-            with open('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'r') as f:
-                used_bytes = int(f.read().strip())
-        else:
-            mem = psutil.virtual_memory()
-            return round(mem.used / 1024**2, 2), round(mem.total / 1024**2, 2), mem.percent
-    except Exception:
-        mem = psutil.virtual_memory()
-        return round(mem.used / 1024**2, 2), round(mem.total / 1024**2, 2), mem.percent
+# ---------- PROJECT DATA ----------
+class ProjectData:
+    def __init__(self, project_folder):
+        self.folder = project_folder
+        self.data_file = os.path.join(project_folder, 'project_data.json')
+        self.data = self._load()
 
-    total_mb = total_bytes / (1024**2)
-    used_mb = used_bytes / (1024**2)
-    if total_mb > 10000:
-        total_mb = 512.0
-        if used_mb > total_mb:
-            used_mb = total_mb
-    percent = (used_mb / total_mb) * 100 if total_mb > 0 else 0
-    return round(used_mb, 2), round(total_mb, 2), round(min(percent, 100), 2)
+    def _load(self):
+        if os.path.exists(self.data_file):
+            try:
+                with open(self.data_file, 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        return {"logs": [], "stats": {}, "config": {}}
 
-# ---------- RENDER API HELPERS ----------
-def render_api_call(endpoint, params=None):
-    if not RENDER_API_KEY:
-        return None, "RENDER_API_KEY not set"
-    headers = {"Authorization": f"Bearer {RENDER_API_KEY}", "Accept": "application/json"}
-    url = f"{RENDER_API_BASE}/{endpoint.lstrip('/')}"
+    def _save(self):
+        try:
+            with open(self.data_file, 'w') as f:
+                json.dump(self.data, f, indent=2)
+        except:
+            pass
+
+    def add_log(self, message, log_type='info'):
+        self.data["logs"].append({
+            "ts": datetime.now().isoformat(),
+            "type": log_type,
+            "msg": message
+        })
+        if len(self.data["logs"]) > 500:
+            self.data["logs"] = self.data["logs"][-500:]
+        self._save()
+
+    def update_stat(self, key, value):
+        self.data["stats"][key] = value
+        self._save()
+
+    def get_stat(self, key, default=None):
+        return self.data["stats"].get(key, default)
+
+    def set_config(self, key, value):
+        self.data["config"][key] = value
+        self._save()
+
+    def get_config(self, key, default=None):
+        return self.data["config"].get(key, default)
+
+# ---------- LOGS AUTO-CLEAR ----------
+def clear_all_logs():
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        if resp.status_code == 200:
-            return resp.json(), None
-        else:
-            return None, f"API error {resp.status_code}: {resp.text[:200]}"
+        if os.path.exists(LOG_FOLDER):
+            for f in os.listdir(LOG_FOLDER):
+                file_path = os.path.join(LOG_FOLDER, f)
+                if os.path.isfile(file_path):
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
+        with get_db() as conn:
+            conn.execute('DELETE FROM logs')
+            conn.commit()
+        for bot_id, bot in list(bots_db.items()):
+            project_folder = os.path.join(get_user_folder(bot['user']), bot['project'])
+            log_file = os.path.join(project_folder, bot_id + '.log')
+            if os.path.exists(log_file):
+                try:
+                    os.remove(log_file)
+                except:
+                    pass
+        with get_db() as conn:
+            cli_tools = conn.execute('SELECT id, tool_folder FROM cli_tools').fetchall()
+            for tool in cli_tools:
+                log_file = os.path.join(tool['tool_folder'], 'cli.log')
+                if os.path.exists(log_file):
+                    try:
+                        os.remove(log_file)
+                    except:
+                        pass
+        print(f"✅ All logs cleared at {datetime.now()}")
+        return True
     except Exception as e:
-        return None, str(e)
+        print(f"Error clearing logs: {e}")
+        return False
 
-def get_all_services():
-    services = []
-    page = 1
-    limit = 50
-    while True:
-        data, err = render_api_call("services", {"limit": limit, "page": page})
-        if err or not data:
-            break
-        services.extend(data)
-        if len(data) < limit:
-            break
-        page += 1
-    return services
+def schedule_log_clear():
+    clear_all_logs()
+    threading.Timer(3600, schedule_log_clear).start()
 
-# ---------- RUNTIME DETECTION (WEBSITES) ----------
-STARTUP_PRIORITY = ['app.py', 'main.py', 'server.py', 'run.py', 'manage.py', 'index.py', 'start.py', 'wsgi.py', 'asgi.py']
+schedule_log_clear()
 
+# ---------- RUNTIME DETECTION (with fallback to any .py/.js) ----------
 def find_startup_file(folder):
     for filename in STARTUP_PRIORITY:
         if os.path.exists(os.path.join(folder, filename)):
@@ -449,7 +491,7 @@ def find_startup_file(folder):
     return None
 
 def detect_runtime_and_get_cmd(folder, port):
-    # Node.js
+    # Node.js with package.json
     if os.path.exists(os.path.join(folder, 'package.json')):
         try:
             with open(os.path.join(folder, 'package.json'), 'r') as f:
@@ -459,25 +501,24 @@ def detect_runtime_and_get_cmd(folder, port):
                     return ['npm', 'start'], 'nodejs', {'NODE_ENV': 'production', 'PORT': str(port)}
         except:
             pass
+    # Common JS files
     js_files = ['server.js', 'index.js', 'app.js', 'main.js']
     for fname in js_files:
         if os.path.exists(os.path.join(folder, fname)):
             return ['node', fname], 'nodejs', {'PORT': str(port)}
+    # Fallback any .js
     try:
         for f in os.listdir(folder):
             if f.endswith('.js') and os.path.isfile(os.path.join(folder, f)):
                 return ['node', f], 'nodejs', {'PORT': str(port)}
     except:
         pass
-    
     # PHP
     if os.path.exists(os.path.join(folder, 'index.php')):
         return ['php', '-S', f'0.0.0.0:{port}'], 'php', {}
-    
     # Go
     if os.path.exists(os.path.join(folder, 'go.mod')):
         return ['go', 'run', 'main.go'], 'go', {}
-    
     # Java
     if os.path.exists(os.path.join(folder, 'pom.xml')):
         return ['mvn', 'spring-boot:run'], 'java', {}
@@ -486,7 +527,6 @@ def detect_runtime_and_get_cmd(folder, port):
     jars = [f for f in os.listdir(folder) if f.endswith('.jar')]
     if jars:
         return ['java', '-jar', jars[0]], 'java', {}
-    
     # Python Flask/Django
     flask_files = ['app.py', 'main.py', 'server.py', 'run.py', 'start.py']
     for f in flask_files:
@@ -506,10 +546,15 @@ def detect_runtime_and_get_cmd(folder, port):
     startup = find_startup_file(folder)
     if startup:
         return [sys.executable, startup], 'python', {}
-    
     if os.path.exists(os.path.join(folder, 'index.html')):
         return [sys.executable, '-m', 'http.server', str(port)], 'static', {}
-    
+    # Fallback any .py
+    try:
+        for f in os.listdir(folder):
+            if f.endswith('.py') and os.path.isfile(os.path.join(folder, f)):
+                return [sys.executable, f], 'python', {}
+    except:
+        pass
     return None, None, {}
 
 # ---------- INSTALL DEPENDENCIES ----------
@@ -562,7 +607,7 @@ def install_dependencies(folder, runtime, log_callback=None):
         return True, "No deps"
     return True, "Unknown runtime"
 
-# ---------- AUTO PORT DETECTION ----------
+# ---------- HEALTH CHECK (improved) ----------
 def detect_port_from_log(log_file):
     if not os.path.exists(log_file): return None
     try:
@@ -577,18 +622,19 @@ def detect_port_from_log(log_file):
     except: pass
     return None
 
-def health_check_on_ports(port_list, max_retries=3, delay=2):
+def health_check_on_ports(port_list, max_retries=15, delay=3):
     for port in port_list:
         for attempt in range(max_retries):
             try:
                 response = requests.get(f"http://localhost:{port}", timeout=3)
                 if response.status_code < 500:
                     return True, port, f"OK (port {port})"
-            except: pass
+            except:
+                pass
             time.sleep(delay)
     return False, None, "Health check failed"
 
-# ---------- START WEBSITE PROCESS ----------
+# ---------- START / STOP WEBSITE ----------
 def start_website_process(website_id, log_callback=None):
     website = get_website_by_id(website_id)
     if not website: return False, "Website not found"
@@ -662,7 +708,7 @@ def start_website_process(website_id, log_callback=None):
         for p in [3000, 8080, 5000, 8000, 8081, 3001]:
             if p not in ports_to_try: ports_to_try.append(p)
         
-        healthy, actual_port, health_msg = health_check_on_ports(ports_to_try, max_retries=5, delay=2)
+        healthy, actual_port, health_msg = health_check_on_ports(ports_to_try, max_retries=15, delay=3)
         if healthy:
             update_website_status(website_id, 'running', proc.pid, actual_port)
             log_website(website_id, f"Started on port {actual_port} (PID {proc.pid})")
@@ -676,7 +722,8 @@ def start_website_process(website_id, log_callback=None):
                 if os.name == 'nt': subprocess.run(['taskkill', '/PID', str(proc.pid), '/F'], capture_output=True)
                 else: os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except: pass
-            update_website_status(website_id, 'crashed')
+            update_website_status(website_id, 'failed')
+            log_website(website_id, f"Health check failed: {health_msg}", 'error')
             return False, "Health check failed"
     except Exception as e:
         log_website(website_id, f"Start error: {str(e)}", 'error')
@@ -713,7 +760,7 @@ def stop_website_process(website_id):
     log_website(website_id, f"Stopped (PID {pid})")
     return True, "Stopped"
 
-# ---------- DEPLOYMENT ENGINE FOR WEBSITES ----------
+# ---------- DEPLOYMENT ----------
 def write_log_step(log_file, step, message):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] [{step}] {message}\n"
@@ -721,7 +768,7 @@ def write_log_step(log_file, step, message):
         f.write(line)
     return line
 
-def deploy_zip_website(website_id, extra_files=None):
+def deploy_zip_website(website_id):
     try:
         website = get_website_by_id(website_id)
         if not website: return
@@ -755,7 +802,6 @@ def deploy_zip_website(website_id, extra_files=None):
         with get_db() as conn:
             conn.execute('UPDATE websites SET storage_used = ?, website_size = ? WHERE id = ?', (size, size, website_id))
             conn.commit()
-        
         log_cb("SYSTEM", "Starting website...")
         ok, msg = start_website_process(website_id, log_cb)
         if ok:
@@ -775,90 +821,204 @@ def deploy_zip_website(website_id, extra_files=None):
             conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?', ('failed', deployment_id))
             conn.commit()
 
-# ---------- USER MANAGEMENT ----------
-USERS_FILE = 'users.json'
-
-def load_users():
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'r') as f:
-            return json.load(f)
-    default = [
-        {"username": "admin", "password": "admin123", "role": "admin", "limit": 999, "banned": False, "expires_at": None, "session_version": 0},
-        {"username": "user1", "password": "pass123", "role": "user", "limit": 5, "banned": False, "expires_at": None, "session_version": 0},
-        {"username": "user2", "password": "pass456", "role": "user", "limit": 5, "banned": False, "expires_at": None, "session_version": 0}
-    ]
-    save_users(default)
-    return default
-
-def save_users(users):
-    with open(USERS_FILE, 'w') as f:
-        json.dump(users, f, indent=2)
-
-users_db = load_users()
-
-def find_user(username):
-    username = username.strip()
-    for u in users_db:
-        if u['username'].strip() == username:
-            return u
-    return None
-
-def is_owner(username):
+# ---------- BOT ACTIONS ----------
+def start_bot_by_id(bot_id):
+    bot = bots_db.get(bot_id)
+    if not bot: return False, "Bot not found"
+    if bot['status'] == 'running': return False, "Already running"
+    username = bot['user']
     user = find_user(username)
-    return user and user['role'] == 'admin'
-
-def parse_expiry(expiry_str):
-    if not expiry_str:
-        return None
-    expiry_str = expiry_str.strip().lower()
-    if expiry_str.isdigit():
-        days = int(expiry_str)
-        return (datetime.now() + timedelta(days=days)).isoformat()
-    match = re.match(r'^(\d+)([dhm])$', expiry_str)
-    if match:
-        value = int(match.group(1))
-        unit = match.group(2)
-        if unit == 'd':
-            delta = timedelta(days=value)
-        elif unit == 'h':
-            delta = timedelta(hours=value)
-        elif unit == 'm':
-            delta = timedelta(minutes=value)
-        else:
-            return None
-        return (datetime.now() + delta).isoformat()
-    return None
-
-def is_expired(user):
-    if not user.get('expires_at'):
-        return False
+    if user:
+        running_bots = [b for b in bots_db.values() if b['user'] == username and b['status'] == 'running']
+        if len(running_bots) >= user.get('limit', 5):
+            return False, "User limit exceeded"
+    project_folder = os.path.join(get_user_folder(username), bot['project'])
+    filepath = os.path.join(project_folder, bot['filename'])
+    if not os.path.exists(filepath):
+        return False, "File not found"
+    project_data = ProjectData(project_folder)
+    project_data.add_log(f"Starting {bot['filename']}...", "info")
+    project_data.update_stat("last_start", datetime.now().isoformat())
+    project_data.update_stat("start_count", project_data.get_stat("start_count", 0) + 1)
+    req_file = os.path.join(project_folder, 'requirements.txt')
+    if os.path.exists(req_file):
+        subprocess.run(['pip', 'install', '-r', req_file], capture_output=True)
+    interpreter = bot.get('interpreter') or get_interpreter(bot['filename'])
+    if not interpreter:
+        return False, "Unsupported file type"
+    log_file = get_bot_log_file(bot)
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    with open(log_file, 'a') as f:
+        f.write(f"--- Starting {bot['filename']} at {time.ctime()} ---\n")
     try:
-        exp = datetime.fromisoformat(user['expires_at'])
-        return datetime.now() > exp
-    except:
-        return False
+        proc = subprocess.Popen(
+            [interpreter, bot['filename']],
+            stdout=open(log_file, 'a'),
+            stderr=subprocess.STDOUT,
+            cwd=project_folder,
+            preexec_fn=os.setsid if os.name != 'nt' else None
+        )
+        bot['status'] = 'running'
+        bot['pid'] = proc.pid
+        bot['start_time'] = time.time()
+        processes[bot_id] = proc
+        save_bots()
+        project_data.add_log(f"Started with PID {proc.pid}", "success")
+        return True, None
+    except Exception as e:
+        project_data.add_log(f"Start failed: {str(e)}", "error")
+        return False, str(e)
 
-def delete_user_account(username):
-    global users_db, bots_db
-    user_folder = get_user_folder(username)
-    if os.path.exists(user_folder):
-        shutil.rmtree(user_folder, ignore_errors=True)
-    to_delete = [bid for bid, bot in bots_db.items() if bot['user'] == username]
-    for bid in to_delete:
-        if bid in processes:
-            try:
-                processes[bid].terminate()
-            except:
-                pass
-            processes.pop(bid, None)
-        del bots_db[bid]
+def stop_bot_by_id(bot_id):
+    bot = bots_db.get(bot_id)
+    if not bot: return False, "Bot not found"
+    if bot['status'] != 'running': return False, "Not running"
+    proc = processes.get(bot_id)
+    if proc:
+        try:
+            if os.name != 'nt':
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            else:
+                proc.terminate()
+        except:
+            pass
+        proc.wait()
+        processes.pop(bot_id, None)
+    bot['status'] = 'stopped'
+    bot['pid'] = None
+    log_file = get_bot_log_file(bot)
+    with open(log_file, 'a') as f:
+        f.write(f"--- Stopped at {time.ctime()} ---\n")
     save_bots()
-    users_db = [u for u in users_db if u['username'] != username]
-    save_users(users_db)
-    if session.get('username') == username:
-        session.clear()
+    return True, None
 
-# ---------- BEFORE REQUEST HOOK ----------
+# ---------- KILL SYSTEM ----------
+KILL_API_KEY = "your_secret_kill_key_2024"
+KILL_STATUS = False
+KILL_LOG = []
+
+@app.route('/api/kill', methods=['POST'])
+def kill_system():
+    global KILL_STATUS, KILL_LOG
+    data = request.json or {}
+    key = data.get('key', '')
+    action = data.get('action', '')
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if key != KILL_API_KEY:
+        return jsonify({"error": "Invalid API key", "success": False}), 403
+    if action == 'kill':
+        if KILL_STATUS:
+            return jsonify({"success": True, "message": "System already killed", "status": "killed"})
+        KILL_STATUS = True
+        killed_bots = []
+        killed_websites = []
+        for bot_id, bot in list(bots_db.items()):
+            if bot['status'] == 'running':
+                try:
+                    stop_bot_by_id(bot_id)
+                    killed_bots.append(bot_id)
+                except:
+                    pass
+        with get_db() as conn:
+            running_websites = conn.execute('SELECT id FROM websites WHERE status="running"').fetchall()
+            for w in running_websites:
+                try:
+                    stop_website_process(w['id'])
+                    killed_websites.append(w['id'])
+                except:
+                    pass
+        KILL_LOG.append({"timestamp": timestamp, "action": "kill", "bots": len(killed_bots), "websites": len(killed_websites)})
+        return jsonify({"success": True, "message": "All services killed", "killed_bots": len(killed_bots), "killed_websites": len(killed_websites), "status": "killed", "timestamp": timestamp})
+    elif action == 'status':
+        running_bots = len([b for b in bots_db.values() if b['status'] == 'running'])
+        with get_db() as conn:
+            running_websites = conn.execute('SELECT COUNT(*) FROM websites WHERE status="running"').fetchone()[0]
+            total_websites = conn.execute('SELECT COUNT(*) FROM websites').fetchone()[0]
+        return jsonify({"success": True, "status": "killed" if KILL_STATUS else "running", "killed": KILL_STATUS, "running_bots": running_bots, "running_websites": running_websites, "total_bots": len(bots_db), "total_websites": total_websites, "logs": KILL_LOG[-10:]})
+    elif action == 'restore':
+        KILL_STATUS = False
+        KILL_LOG.append({"timestamp": timestamp, "action": "restore", "message": "System restored"})
+        return jsonify({"success": True, "message": "System restored", "status": "running", "timestamp": timestamp})
+    return jsonify({"error": "Invalid action. Use: kill, status, restore", "success": False}), 400
+
+# ---------- RENDER API ----------
+RENDER_API_KEY = os.environ.get('RENDER_API_KEY', 'rnd_27v7iMggh7mafESEqJq1Lf12wIkF')
+RENDER_API_BASE = "https://api.render.com/v1"
+
+def render_api_call(endpoint, params=None):
+    if not RENDER_API_KEY:
+        return None, "RENDER_API_KEY not set"
+    headers = {"Authorization": f"Bearer {RENDER_API_KEY}", "Accept": "application/json"}
+    url = f"{RENDER_API_BASE}/{endpoint.lstrip('/')}"
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        if resp.status_code == 200:
+            return resp.json(), None
+        else:
+            return None, f"API error {resp.status_code}: {resp.text[:200]}"
+    except Exception as e:
+        return None, str(e)
+
+def get_all_services():
+    services = []
+    page = 1
+    limit = 50
+    while True:
+        data, err = render_api_call("services", {"limit": limit, "page": page})
+        if err or not data:
+            break
+        services.extend(data)
+        if len(data) < limit:
+            break
+        page += 1
+    return services
+
+# ---------- CONTAINER MEMORY ----------
+def get_container_memory():
+    try:
+        if os.path.exists('/sys/fs/cgroup/memory.max'):
+            with open('/sys/fs/cgroup/memory.max', 'r') as f:
+                total_bytes = int(f.read().strip())
+            with open('/sys/fs/cgroup/memory.current', 'r') as f:
+                used_bytes = int(f.read().strip())
+        elif os.path.exists('/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+            with open('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'r') as f:
+                total_bytes = int(f.read().strip())
+            with open('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'r') as f:
+                used_bytes = int(f.read().strip())
+        else:
+            mem = psutil.virtual_memory()
+            return round(mem.used / 1024**2, 2), round(mem.total / 1024**2, 2), mem.percent
+    except Exception:
+        mem = psutil.virtual_memory()
+        return round(mem.used / 1024**2, 2), round(mem.total / 1024**2, 2), mem.percent
+    total_mb = total_bytes / (1024**2)
+    used_mb = used_bytes / (1024**2)
+    if total_mb > 10000:
+        total_mb = 512.0
+        if used_mb > total_mb:
+            used_mb = total_mb
+    percent = (used_mb / total_mb) * 100 if total_mb > 0 else 0
+    return round(used_mb, 2), round(total_mb, 2), round(min(percent, 100), 2)
+
+# ---------- DECORATORS ----------
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'username' not in session:
+            return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'username' not in session or session.get('role') != 'admin':
+            return jsonify({'error': 'Forbidden'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+# ---------- BEFORE REQUEST ----------
 @app.before_request
 def check_expiry_and_session():
     if 'username' not in session:
@@ -883,281 +1043,8 @@ def check_expiry_and_session():
             return jsonify({'error': 'Session invalidated'}), 401
         return redirect('/')
 
-# ---------- DECORATORS ----------
-def login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if 'username' not in session:
-            return jsonify({'error': 'Unauthorized'}), 401
-        return f(*args, **kwargs)
-    return decorated
-
-def admin_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if 'username' not in session or session.get('role') != 'admin':
-            return jsonify({'error': 'Forbidden'}), 403
-        return f(*args, **kwargs)
-    return decorated
-
-# ---------- BOT HELPERS ----------
-def get_user_folder(username):
-    folder = os.path.join(UPLOAD_FOLDER, username)
-    os.makedirs(folder, exist_ok=True)
-    return folder
-
-def get_bot_absolute_path(bot):
-    project_folder = os.path.join(get_user_folder(bot['user']), bot['project'])
-    return os.path.join(project_folder, bot['filename'])
-
-def get_bot_log_file(bot):
-    return get_bot_absolute_path(bot) + '.log'
-
-def generate_project_id():
-    return str(uuid.uuid4())[:8]
-
-def get_interpreter(filename):
-    ext = os.path.splitext(filename)[1].lower()
-    if ext == '.py':
-        return 'python'
-    elif ext == '.js':
-        return 'node'
-    elif ext == '.go':
-        return 'go run'
-    elif ext == '.rb':
-        return 'ruby'
-    elif ext == '.php':
-        return 'php'
-    elif ext == '.sh':
-        return 'bash'
-    elif ext == '.pl':
-        return 'perl'
-    else:
-        return None
-
-def detect_bot_token(filepath):
-    try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        token_match = re.search(r'[0-9]{9,10}:[A-Za-z0-9_-]{35,}', content)
-        if token_match:
-            token = token_match.group(0)
-            try:
-                resp = requests.get(f'https://api.telegram.org/bot{token}/getMe', timeout=3)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get('ok'):
-                        return token, data['result'].get('username')
-            except:
-                pass
-        return None, None
-    except:
-        return None, None
-
-# ---------- BOT ACTIONS ----------
-def start_bot_by_id(bot_id):
-    bot = bots_db.get(bot_id)
-    if not bot:
-        return False, "Bot not found"
-    if bot['status'] == 'running':
-        return False, "Already running"
-    
-    username = bot['user']
-    user = find_user(username)
-    if user:
-        running_bots = [b for b in bots_db.values() if b['user'] == username and b['status'] == 'running']
-        if len(running_bots) >= user.get('limit', 5):
-            return False, "User limit exceeded"
-    
-    project_folder = os.path.join(get_user_folder(username), bot['project'])
-    filepath = os.path.join(project_folder, bot['filename'])
-    if not os.path.exists(filepath):
-        return False, "File not found"
-
-    # Project data
-    project_data = ProjectData(project_folder)
-    project_data.add_log(f"Starting {bot['filename']}...", "info")
-    project_data.update_stat("last_start", datetime.now().isoformat())
-    project_data.update_stat("start_count", project_data.get_stat("start_count", 0) + 1)
-    
-    req_file = os.path.join(project_folder, 'requirements.txt')
-    if os.path.exists(req_file):
-        subprocess.run(['pip', 'install', '-r', req_file], capture_output=True)
-    
-    interpreter = bot.get('interpreter') or get_interpreter(bot['filename'])
-    if not interpreter:
-        return False, "Unsupported file type"
-    
-    log_file = get_bot_log_file(bot)
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    with open(log_file, 'a') as f:
-        f.write(f"--- Starting {bot['filename']} at {time.ctime()} ---\n")
-    
-    try:
-        proc = subprocess.Popen(
-            [interpreter, bot['filename']],
-            stdout=open(log_file, 'a'),
-            stderr=subprocess.STDOUT,
-            cwd=project_folder,
-            preexec_fn=os.setsid if os.name != 'nt' else None
-        )
-        bot['status'] = 'running'
-        bot['pid'] = proc.pid
-        bot['start_time'] = time.time()
-        processes[bot_id] = proc
-        save_bots()
-        project_data.add_log(f"Started with PID {proc.pid}", "success")
-        return True, None
-    except Exception as e:
-        project_data.add_log(f"Start failed: {str(e)}", "error")
-        return False, str(e)
-
-def stop_bot_by_id(bot_id):
-    bot = bots_db.get(bot_id)
-    if not bot:
-        return False, "Bot not found"
-    if bot['status'] != 'running':
-        return False, "Not running"
-    
-    proc = processes.get(bot_id)
-    if proc:
-        try:
-            if os.name != 'nt':
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            else:
-                proc.terminate()
-        except:
-            pass
-        proc.wait()
-        processes.pop(bot_id, None)
-    
-    bot['status'] = 'stopped'
-    bot['pid'] = None
-    log_file = get_bot_log_file(bot)
-    with open(log_file, 'a') as f:
-        f.write(f"--- Stopped at {time.ctime()} ---\n")
-    save_bots()
-    return True, None
-
-# ============================================================
-# 🛑 KILL SYSTEM - API KEY BASED (NO ENCRYPTION)
-# ============================================================
-
-# Kill System API Key - Isko change karna apni marzi se
-KILL_API_KEY = "your_secret_kill_key_2024"
-KILL_STATUS = False
-KILL_LOG = []
-
-@app.route('/api/kill', methods=['POST'])
-def kill_system():
-    global KILL_STATUS, KILL_LOG
-    data = request.json or {}
-    key = data.get('key', '')
-    action = data.get('action', '')
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # API Key Check
-    if key != KILL_API_KEY:
-        return jsonify({"error": "Invalid API key", "success": False}), 403
-    
-    # ACTION: KILL - Stop everything
-    if action == 'kill':
-        if KILL_STATUS:
-            return jsonify({
-                "success": True,
-                "message": "System already killed",
-                "status": "killed"
-            })
-        
-        KILL_STATUS = True
-        killed_bots = []
-        killed_websites = []
-        
-        # Stop all running bots
-        for bot_id, bot in list(bots_db.items()):
-            if bot['status'] == 'running':
-                try:
-                    stop_bot_by_id(bot_id)
-                    killed_bots.append(bot_id)
-                except Exception as e:
-                    pass
-        
-        # Stop all running websites
-        with get_db() as conn:
-            running_websites = conn.execute('SELECT id FROM websites WHERE status="running"').fetchall()
-            for w in running_websites:
-                try:
-                    stop_website_process(w['id'])
-                    killed_websites.append(w['id'])
-                except Exception as e:
-                    pass
-        
-        KILL_LOG.append({
-            "timestamp": timestamp,
-            "action": "kill",
-            "bots": len(killed_bots),
-            "websites": len(killed_websites)
-        })
-        
-        return jsonify({
-            "success": True,
-            "message": "All services killed successfully",
-            "killed_bots": len(killed_bots),
-            "killed_websites": len(killed_websites),
-            "status": "killed",
-            "timestamp": timestamp
-        })
-    
-    # ACTION: STATUS - Check current state
-    elif action == 'status':
-        # Count running bots
-        running_bots = len([b for b in bots_db.values() if b['status'] == 'running'])
-        
-        # Count running websites
-        with get_db() as conn:
-            running_websites = conn.execute('SELECT COUNT(*) FROM websites WHERE status="running"').fetchone()[0]
-        
-        # Count total websites
-        with get_db() as conn:
-            total_websites = conn.execute('SELECT COUNT(*) FROM websites').fetchone()[0]
-        
-        return jsonify({
-            "success": True,
-            "status": "killed" if KILL_STATUS else "running",
-            "killed": KILL_STATUS,
-            "running_bots": running_bots,
-            "running_websites": running_websites,
-            "total_bots": len(bots_db),
-            "total_websites": total_websites,
-            "logs": KILL_LOG[-10:]  # Last 10 logs
-        })
-    
-    # ACTION: RESTORE - Reset everything
-    elif action == 'restore':
-        KILL_STATUS = False
-        KILL_LOG.append({
-            "timestamp": timestamp,
-            "action": "restore",
-            "message": "System restored"
-        })
-        
-        return jsonify({
-            "success": True,
-            "message": "System restored successfully",
-            "status": "running",
-            "timestamp": timestamp
-        })
-    
-    # Invalid action
-    else:
-        return jsonify({
-            "error": "Invalid action. Use: kill, status, restore",
-            "success": False
-        }), 400
-
-# ============================================================
-
-# ---------- MAIN ROUTE ----------
+# ========== FLASK ROUTES ==========
+# ---------- MAIN ----------
 @app.route('/')
 def index():
     settings = load_settings()
@@ -1182,7 +1069,7 @@ def index():
                                    username=username,
                                    user_password=user_password)
 
-# ---------- SETTINGS API ----------
+# ---------- SETTINGS ----------
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
     return jsonify(load_settings())
@@ -1297,7 +1184,7 @@ def logout():
     session.pop('session_version', None)
     return jsonify({'success': True})
 
-# --- User Management API ---
+# ---------- USER MANAGEMENT API ----------
 @app.route('/api/users', methods=['GET'])
 @login_required
 def get_users():
@@ -1314,15 +1201,12 @@ def create_user():
     password = data.get('password', '')
     role = data.get('role', 'user')
     expiry_str = data.get('expiry', '').strip()
-    
     if not username or not password:
         return jsonify({'error': 'Username and password required'}), 400
     if find_user(username):
         return jsonify({'error': 'User exists'}), 400
-    
     limit = 999 if role == 'admin' else 5
     expires_at = parse_expiry(expiry_str) if expiry_str else None
-    
     new_user = {
         'username': username,
         'password': password,
@@ -1364,7 +1248,6 @@ def delete_user(username):
     delete_user_account(username)
     return jsonify({'success': True})
 
-# --- Profile Edit (owner only) ---
 @app.route('/api/profile', methods=['PUT'])
 @admin_required
 def update_profile():
@@ -1372,12 +1255,10 @@ def update_profile():
     data = request.json
     new_username = data.get('username', '').strip()
     new_password = data.get('password', '').strip()
-    
     old_username = session['username']
     user = find_user(old_username)
     if not user:
         return jsonify({'error': 'User not found'}), 404
-    
     if new_username and new_username != old_username:
         if find_user(new_username):
             return jsonify({'error': 'Username already taken'}), 400
@@ -1386,16 +1267,14 @@ def update_profile():
             if bot['user'] == old_username:
                 bot['user'] = new_username
         save_bots()
-    
     if new_password:
         user['password'] = new_password
-    
     user['session_version'] = user.get('session_version', 0) + 1
     save_users(users_db)
     session.clear()
     return jsonify({'success': True, 'logout': True})
 
-# ---------- Bot Management ----------
+# ---------- BOT ROUTES ----------
 @app.route('/api/bots', methods=['GET'])
 @login_required
 def list_bots():
@@ -1405,7 +1284,6 @@ def list_bots():
         items = bots_db.items()
     else:
         items = [(bid, bot) for bid, bot in bots_db.items() if bot['user'] == username]
-    
     for bid, bot in items:
         filepath = get_bot_absolute_path(bot)
         token, bot_username = detect_bot_token(filepath) if os.path.exists(filepath) else (None, None)
@@ -1474,7 +1352,6 @@ def delete_bot(bot_id):
     username = session['username']
     if not is_owner(username) and bot['user'] != username:
         return jsonify({'error': 'Forbidden'}), 403
-
     if bot['status'] == 'running':
         proc = processes.get(bot_id)
         if proc:
@@ -1487,13 +1364,10 @@ def delete_bot(bot_id):
                 pass
             proc.wait()
             processes.pop(bot_id, None)
-
     log_file = get_bot_log_file(bot)
     if os.path.exists(log_file):
         os.remove(log_file)
-
     project_id = bot['project']
-    # Remove project_data.json if exists
     project_folder = os.path.join(get_user_folder(username), project_id)
     project_data_file = os.path.join(project_folder, 'project_data.json')
     if os.path.exists(project_data_file):
@@ -1501,15 +1375,12 @@ def delete_bot(bot_id):
             os.remove(project_data_file)
         except:
             pass
-
     del bots_db[bot_id]
     save_bots()
-
     remaining_bots = [b for b in bots_db.values() if b['user'] == username and b['project'] == project_id]
     if not remaining_bots:
         if os.path.exists(project_folder):
             shutil.rmtree(project_folder, ignore_errors=True)
-
     return jsonify({'success': True})
 
 @app.route('/api/bots/<bot_id>/download', methods=['GET'])
@@ -1521,7 +1392,6 @@ def download_bot(bot_id):
     username = session['username']
     if not is_owner(username) and bot['user'] != username:
         return jsonify({'error': 'Forbidden'}), 403
-
     project_folder = os.path.join(get_user_folder(username), bot['project'])
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -1534,7 +1404,43 @@ def download_bot(bot_id):
     zip_buffer.seek(0)
     return send_file(zip_buffer, as_attachment=True, download_name=f"{bot['project']}_project.zip")
 
-# --- Upload for Bots ---
+@app.route('/api/bots/<bot_id>/content', methods=['GET'])
+@login_required
+def get_bot_content(bot_id):
+    bot = bots_db.get(bot_id)
+    if not bot:
+        return jsonify({'error': 'Bot not found'}), 404
+    username = session['username']
+    if not is_owner(username) and bot['user'] != username:
+        return jsonify({'error': 'Forbidden'}), 403
+    filepath = get_bot_absolute_path(bot)
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'File not found'}), 404
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+    return jsonify({'content': content})
+
+@app.route('/api/bots/<bot_id>/content', methods=['PUT'])
+@login_required
+def update_bot_content(bot_id):
+    bot = bots_db.get(bot_id)
+    if not bot:
+        return jsonify({'error': 'Bot not found'}), 404
+    username = session['username']
+    if not is_owner(username) and bot['user'] != username:
+        return jsonify({'error': 'Forbidden'}), 403
+    data = request.json
+    new_content = data.get('content', '')
+    filepath = get_bot_absolute_path(bot)
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'File not found'}), 404
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(new_content)
+    if bot['status'] == 'running':
+        stop_bot_by_id(bot_id)
+        start_bot_by_id(bot_id)
+    return jsonify({'success': True})
+
 @app.route('/upload', methods=['POST'])
 @login_required
 def upload():
@@ -1620,59 +1526,7 @@ def upload():
         'bots_created': len(created_bots)
     })
 
-# --- Static file serving for bot project files ---
-@app.route('/project/<username>/<project_id>/<path:filename>')
-@login_required
-def serve_project_file(username, project_id, filename):
-    if session['username'] != username and session.get('role') != 'admin':
-        return "Forbidden", 403
-    project_folder = os.path.join(get_user_folder(username), project_id)
-    filepath = os.path.join(project_folder, filename)
-    if not os.path.exists(filepath) or not os.path.isfile(filepath):
-        return "File not found", 404
-    if not os.path.abspath(filepath).startswith(os.path.abspath(project_folder)):
-        return "Forbidden", 403
-    return send_file(filepath)
-
-# --- Bot file content (edit) ---
-@app.route('/api/bots/<bot_id>/content', methods=['GET'])
-@login_required
-def get_bot_content(bot_id):
-    bot = bots_db.get(bot_id)
-    if not bot:
-        return jsonify({'error': 'Bot not found'}), 404
-    username = session['username']
-    if not is_owner(username) and bot['user'] != username:
-        return jsonify({'error': 'Forbidden'}), 403
-    filepath = get_bot_absolute_path(bot)
-    if not os.path.exists(filepath):
-        return jsonify({'error': 'File not found'}), 404
-    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-        content = f.read()
-    return jsonify({'content': content})
-
-@app.route('/api/bots/<bot_id>/content', methods=['PUT'])
-@login_required
-def update_bot_content(bot_id):
-    bot = bots_db.get(bot_id)
-    if not bot:
-        return jsonify({'error': 'Bot not found'}), 404
-    username = session['username']
-    if not is_owner(username) and bot['user'] != username:
-        return jsonify({'error': 'Forbidden'}), 403
-    data = request.json
-    new_content = data.get('content', '')
-    filepath = get_bot_absolute_path(bot)
-    if not os.path.exists(filepath):
-        return jsonify({'error': 'File not found'}), 404
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(new_content)
-    if bot['status'] == 'running':
-        stop_bot_by_id(bot_id)
-        start_bot_by_id(bot_id)
-    return jsonify({'success': True})
-
-# ---------- WEBSITE MANAGEMENT ROUTES ----------
+# ---------- WEBSITE ROUTES ----------
 @app.route('/upload_website', methods=['POST'])
 @login_required
 def upload_website():
@@ -2023,7 +1877,7 @@ def build_logs_page(website_id):
         dep = conn.execute('SELECT * FROM deployments WHERE website_id = ? ORDER BY id DESC LIMIT 1', (website_id,)).fetchone()
     return render_template_string(BUILD_LOGS_TEMPLATE, website=w, no_logs=not dep)
 
-# ---------- WEBSITE PROXY ----------
+# ---------- PROXY ----------
 @app.route('/<slug>/', defaults={'path': ''})
 @app.route('/<slug>/<path:path>')
 def proxy_website(slug, path):
@@ -2046,7 +1900,7 @@ def proxy_website(slug, path):
     except Exception as e:
         return f"Proxy error: {str(e)}", 500
 
-# ---------- SYSTEM STATS API ----------
+# ---------- STATS ----------
 @app.route('/api/stats')
 @admin_required
 def api_stats():
@@ -2143,7 +1997,7 @@ def set_offset():
     set_config('total_hours_offset', str(offset))
     return jsonify({'success': True, 'new_offset': offset})
 
-# ---------- FILE MANAGER (admin system) ----------
+# ---------- FILE MANAGER (ADMIN SYSTEM) ----------
 def safe_path(path):
     abs_path = os.path.abspath(os.path.join(BASE_DIR, path))
     if not abs_path.startswith(BASE_DIR):
@@ -2355,7 +2209,7 @@ def terminal_stop():
         terminal_sessions.pop(username, None)
     return jsonify({'success': True})
 
-# ---------- OLD TERMINAL (kept for compatibility) ----------
+# ---------- OLD TERMINAL (compatibility) ----------
 @app.route('/execute', methods=['POST'])
 def execute():
     data = request.json
@@ -2369,7 +2223,269 @@ def execute():
     except Exception as e:
         return jsonify({"output": str(e)})
 
-# ---------- MINI WEB VIEW ----------
+# ---------- CLI TOOLS ROUTES ----------
+@app.route('/api/cli_tools', methods=['GET'])
+@login_required
+def api_list_cli_tools():
+    username = session['username']
+    with get_db() as conn:
+        if session.get('role') == 'admin':
+            tools = conn.execute('SELECT * FROM cli_tools ORDER BY created_at DESC').fetchall()
+        else:
+            tools = conn.execute('SELECT * FROM cli_tools WHERE owner_username = ? ORDER BY created_at DESC',
+                                (username,)).fetchall()
+    return jsonify([dict(row) for row in tools])
+
+@app.route('/upload_cli', methods=['POST'])
+@login_required
+def upload_cli():
+    username = session['username']
+    if 'files[]' not in request.files:
+        return jsonify({'error': 'No files'}), 400
+    files = request.files.getlist('files[]')
+    if not files or all(f.filename == '' for f in files):
+        return jsonify({'error': 'No file selected'}), 400
+
+    user = find_user(username)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    limit = user.get('limit', 5)
+    with get_db() as conn:
+        bot_count = conn.execute('SELECT COUNT(*) FROM bots WHERE user = ?', (username,)).fetchone()[0]
+        website_count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_username = ?', (username,)).fetchone()[0]
+        cli_count = conn.execute('SELECT COUNT(*) FROM cli_tools WHERE owner_username = ?', (username,)).fetchone()[0]
+    total_current = bot_count + website_count + cli_count
+
+    temp_dir = tempfile.mkdtemp()
+    tool_id = str(uuid.uuid4())[:8]
+    tool_folder = os.path.join(UPLOAD_FOLDER, f"cli_tool_{tool_id}")
+    os.makedirs(tool_folder, exist_ok=True)
+
+    try:
+        zip_file = None
+        for file in files:
+            if file.filename == '':
+                continue
+            temp_path = os.path.join(temp_dir, file.filename)
+            file.save(temp_path)
+            if file.filename.lower().endswith('.zip'):
+                zip_file = temp_path
+            else:
+                shutil.move(temp_path, os.path.join(tool_folder, file.filename))
+
+        if zip_file:
+            with zipfile.ZipFile(zip_file, 'r') as zf:
+                zf.extractall(tool_folder)
+            os.remove(zip_file)
+
+        startup_file = None
+        interpreter = None
+        for root, dirs, files_in_folder in os.walk(tool_folder):
+            for fname in files_in_folder:
+                interp = get_interpreter(fname)
+                if interp:
+                    startup_file = fname
+                    interpreter = interp
+                    break
+            if startup_file:
+                break
+
+        if not startup_file:
+            shutil.rmtree(tool_folder, ignore_errors=True)
+            return jsonify({'error': 'No executable file found (.py, .js, etc.)'}), 400
+
+        slug = f"cli_{tool_id}"
+        with get_db() as conn:
+            cur = conn.execute('''INSERT INTO cli_tools
+                (owner_username, tool_name, tool_slug, tool_folder, startup_file, interpreter, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                (username, startup_file, slug, tool_folder, startup_file, interpreter, 'stopped'))
+            tool_db_id = cur.lastrowid
+            conn.commit()
+
+        return jsonify({'success': True, 'tool_id': tool_db_id, 'tool_slug': slug})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+@app.route('/api/cli_tool/<int:tool_id>/start', methods=['POST'])
+@login_required
+def cli_tool_start(tool_id):
+    with get_db() as conn:
+        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
+                           (tool_id, session['username'])).fetchone()
+    if not tool:
+        return jsonify({'error': 'Tool not found'}), 404
+    if tool['status'] == 'running':
+        return jsonify({'error': 'Already running'}), 400
+
+    tool_folder = tool['tool_folder']
+    startup_file = tool['startup_file']
+    interpreter = tool['interpreter']
+    if not interpreter:
+        interpreter = get_interpreter(startup_file)
+    if not interpreter:
+        return jsonify({'error': 'Unsupported interpreter'}), 400
+
+    log_file = os.path.join(tool_folder, 'cli.log')
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+    try:
+        proc = subprocess.Popen(
+            [interpreter, startup_file],
+            stdout=open(log_file, 'a'),
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE,
+            cwd=tool_folder,
+            preexec_fn=os.setsid if os.name != 'nt' else None
+        )
+
+        with get_db() as conn:
+            conn.execute('UPDATE cli_tools SET status = ?, pid = ?, last_started = CURRENT_TIMESTAMP WHERE id = ?',
+                         ('running', proc.pid, tool_id))
+            conn.commit()
+
+        cli_processes[tool_id] = proc
+        return jsonify({'success': True, 'pid': proc.pid})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/cli_tool/<int:tool_id>/stop', methods=['POST'])
+@login_required
+def cli_tool_stop(tool_id):
+    with get_db() as conn:
+        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
+                           (tool_id, session['username'])).fetchone()
+    if not tool:
+        return jsonify({'error': 'Tool not found'}), 404
+
+    pid = tool['pid']
+    if pid:
+        try:
+            if os.name != 'nt':
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            else:
+                subprocess.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True)
+        except:
+            pass
+
+        if tool_id in cli_processes:
+            del cli_processes[tool_id]
+
+    with get_db() as conn:
+        conn.execute('UPDATE cli_tools SET status = ?, pid = NULL, last_stopped = CURRENT_TIMESTAMP WHERE id = ?',
+                     ('stopped', tool_id))
+        conn.commit()
+
+    return jsonify({'success': True})
+
+@app.route('/api/cli_tool/<int:tool_id>/delete', methods=['POST'])
+@login_required
+def cli_tool_delete(tool_id):
+    with get_db() as conn:
+        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
+                           (tool_id, session['username'])).fetchone()
+    if not tool:
+        return jsonify({'error': 'Tool not found'}), 404
+
+    if tool['status'] == 'running':
+        cli_tool_stop(tool_id)
+
+    tool_folder = tool['tool_folder']
+    shutil.rmtree(tool_folder, ignore_errors=True)
+
+    with get_db() as conn:
+        conn.execute('DELETE FROM cli_tools WHERE id = ?', (tool_id,))
+        conn.commit()
+
+    return jsonify({'success': True})
+
+@app.route('/api/cli_tool/<int:tool_id>/download', methods=['GET'])
+@login_required
+def cli_tool_download(tool_id):
+    with get_db() as conn:
+        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
+                           (tool_id, session['username'])).fetchone()
+    if not tool:
+        return jsonify({'error': 'Tool not found'}), 404
+
+    tool_folder = tool['tool_folder']
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        if os.path.exists(tool_folder):
+            for root, _, files_in_folder in os.walk(tool_folder):
+                for fname in files_in_folder:
+                    full_path = os.path.join(root, fname)
+                    arcname = os.path.relpath(full_path, tool_folder)
+                    zipf.write(full_path, arcname)
+    zip_buffer.seek(0)
+    return send_file(zip_buffer, as_attachment=True, download_name=f"cli_tool_{tool_id}.zip")
+
+@app.route('/api/cli_tool/<int:tool_id>/send_input', methods=['POST'])
+@login_required
+def cli_tool_send_input(tool_id):
+    data = request.json
+    input_data = data.get('input', '')
+    proc = cli_processes.get(tool_id)
+    if not proc:
+        return jsonify({'error': 'Process not running'}), 400
+    try:
+        proc.stdin.write((input_data + '\n').encode())
+        proc.stdin.flush()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/cli_tool/<int:tool_id>/logs', methods=['GET'])
+@login_required
+def cli_tool_logs(tool_id):
+    with get_db() as conn:
+        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
+                           (tool_id, session['username'])).fetchone()
+    if not tool:
+        return jsonify({'error': 'Tool not found'}), 404
+
+    log_file = os.path.join(tool['tool_folder'], 'cli.log')
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            lines = f.readlines()
+        return jsonify({'logs': ''.join(lines[-200:])})
+    return jsonify({'logs': ''})
+
+@app.route('/api/cli_tool/<int:tool_id>/upload_file', methods=['POST'])
+@login_required
+def cli_tool_upload_file(tool_id):
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'Empty file'}), 400
+
+    with get_db() as conn:
+        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
+                           (tool_id, session['username'])).fetchone()
+    if not tool:
+        return jsonify({'error': 'Tool not found'}), 404
+
+    tool_folder = tool['tool_folder']
+    filename = secure_filename(file.filename)
+    file_path = os.path.join(tool_folder, filename)
+    file.save(file_path)
+
+    if tool_id in cli_processes:
+        proc = cli_processes[tool_id]
+        try:
+            proc.stdin.write((file_path + '\n').encode())
+            proc.stdin.flush()
+        except:
+            pass
+
+    return jsonify({'success': True, 'filename': filename, 'filepath': file_path})
+
+# ---------- MINI WEB ----------
 MINI_WEB_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -2379,39 +2495,40 @@ MINI_WEB_TEMPLATE = """
     <title>Mini Web - {{ name }}</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
     <style>
-        * { margin:0; padding:0; box-sizing:border-box; font-family:'Arial',sans-serif; }
+        * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI', system-ui, sans-serif; }
         body { background:#05070d; color:#fff; min-height:100vh; display:flex; justify-content:center; align-items:center; padding:20px; }
-        .mini-container { max-width:500px; width:100%; background:#0c1018; border-radius:25px; padding:30px 25px; border:1px solid rgba(255,255,255,0.08); box-shadow:0 0 40px rgba(0,229,255,0.05); position:relative; overflow:hidden; }
+        .mini-container { max-width:500px; width:100%; background:rgba(255,255,255,0.03); backdrop-filter:blur(20px); border-radius:30px; padding:30px 25px; border:1px solid rgba(255,255,255,0.08); box-shadow:0 0 80px rgba(0,229,255,0.05); position:relative; overflow:hidden; }
         .mini-container::before { content:""; position:absolute; inset:-3px; background:conic-gradient(#00e5ff, transparent, transparent, transparent, #00e5ff); animation:spin 4s linear infinite; z-index:-1; }
-        .mini-container::after { content:""; position:absolute; inset:3px; background:#0c1018; border-radius:22px; z-index:-1; }
+        .mini-container::after { content:""; position:absolute; inset:3px; background:rgba(10,14,26,0.95); border-radius:27px; z-index:-1; }
         @keyframes spin { 100% { transform:rotate(360deg); } }
         .mini-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; padding-bottom:15px; border-bottom:1px solid rgba(255,255,255,0.06); }
         .mini-title { font-size:1.2rem; font-weight:800; background:linear-gradient(135deg, #00e5ff, #7a00ff); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-        .mini-badge { padding:4px 14px; border-radius:50px; font-size:0.7rem; font-weight:700; text-transform:uppercase; }
-        .mini-badge.running { background:rgba(0,229,255,0.15); color:#00e5ff; border:1px solid rgba(0,229,255,0.2); }
-        .mini-badge.stopped { background:rgba(255,71,87,0.15); color:#ff4757; border:1px solid rgba(255,71,87,0.2); }
-        .mini-info { background:rgba(255,255,255,0.03); border-radius:12px; padding:15px; margin-bottom:20px; }
+        .mini-badge { padding:4px 16px; border-radius:50px; font-size:0.7rem; font-weight:700; text-transform:uppercase; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); }
+        .mini-badge.running { background:rgba(0,229,255,0.15); color:#00e5ff; border-color:rgba(0,229,255,0.2); }
+        .mini-badge.stopped { background:rgba(255,71,87,0.15); color:#ff4757; border-color:rgba(255,71,87,0.2); }
+        .mini-badge.failed { background:rgba(255,0,0,0.15); color:#ff0000; border-color:rgba(255,0,0,0.2); }
+        .mini-info { background:rgba(255,255,255,0.03); border-radius:15px; padding:15px; margin-bottom:20px; }
         .mini-info .row { display:flex; justify-content:space-between; padding:6px 0; color:#aaa; font-size:0.9rem; }
         .mini-info .row .label { color:#666; }
         .mini-info .row .value { color:#ddd; font-weight:600; }
         .mini-controls { display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }
-        .mini-controls button { flex:1; padding:12px 20px; border:none; border-radius:12px; font-weight:700; font-size:0.9rem; cursor:pointer; transition:.2s; min-width:80px; }
-        .mini-controls button:hover:not(:disabled) { transform:scale(1.05); }
-        .mini-controls button:disabled { opacity:0.5; cursor:not-allowed; }
-        .mini-btn-start { background:rgba(0,229,255,0.2); color:#00e5ff; }
-        .mini-btn-start:hover:not(:disabled) { background:#00e5ff; color:#000; }
-        .mini-btn-stop { background:rgba(255,71,87,0.2); color:#ff4757; }
-        .mini-btn-stop:hover:not(:disabled) { background:#ff4757; color:#fff; }
-        .mini-btn-restart { background:rgba(255,170,0,0.2); color:#ffaa00; }
-        .mini-btn-restart:hover:not(:disabled) { background:#ffaa00; color:#000; }
-        .mini-logs { background:#010409; border-radius:12px; padding:12px 15px; min-height:100px; max-height:200px; overflow-y:auto; font-family:'Courier New', monospace; font-size:11px; color:#50fa7b; border:1px solid rgba(255,255,255,0.05); line-height:1.6; white-space:pre-wrap; }
+        .mini-controls button { flex:1; padding:12px 20px; border:none; border-radius:12px; font-weight:700; font-size:0.9rem; cursor:pointer; transition:all .3s cubic-bezier(.4,0,.2,1); min-width:80px; background:rgba(255,255,255,0.05); color:#aaa; border:1px solid rgba(255,255,255,0.08); }
+        .mini-controls button:hover:not(:disabled) { transform:scale(1.05); box-shadow:0 8px 30px rgba(0,0,0,0.3); }
+        .mini-controls button:disabled { opacity:0.4; cursor:not-allowed; }
+        .mini-btn-start { background:rgba(0,229,255,0.12); color:#00e5ff; border-color:rgba(0,229,255,0.2); }
+        .mini-btn-start:hover:not(:disabled) { background:#00e5ff; color:#000; border-color:#00e5ff; }
+        .mini-btn-stop { background:rgba(255,71,87,0.12); color:#ff4757; border-color:rgba(255,71,87,0.2); }
+        .mini-btn-stop:hover:not(:disabled) { background:#ff4757; color:#fff; border-color:#ff4757; }
+        .mini-btn-restart { background:rgba(255,170,0,0.12); color:#ffaa00; border-color:rgba(255,170,0,0.2); }
+        .mini-btn-restart:hover:not(:disabled) { background:#ffaa00; color:#000; border-color:#ffaa00; }
+        .mini-logs { background:rgba(0,0,0,0.5); border-radius:12px; padding:12px 15px; min-height:100px; max-height:200px; overflow-y:auto; font-family:'Courier New', monospace; font-size:12px; color:#50fa7b; border:1px solid rgba(255,255,255,0.05); line-height:1.6; white-space:pre-wrap; }
         .mini-logs::-webkit-scrollbar { width:4px; }
-        .mini-logs::-webkit-scrollbar-track { background:#0c1018; }
+        .mini-logs::-webkit-scrollbar-track { background:transparent; }
         .mini-logs::-webkit-scrollbar-thumb { background:#00e5ff; border-radius:4px; }
         .mini-logs .empty { color:#555; font-style:italic; }
         .mini-visit { margin-top:15px; text-align:center; }
-        .mini-visit a { color:#00e5ff; text-decoration:none; font-weight:600; padding:10px 25px; border:1px solid rgba(0,229,255,0.2); border-radius:50px; transition:.3s; display:inline-block; }
-        .mini-visit a:hover { background:#00e5ff; color:#000; }
+        .mini-visit a { color:#00e5ff; text-decoration:none; font-weight:600; padding:10px 25px; border:1px solid rgba(0,229,255,0.2); border-radius:50px; transition:.3s; display:inline-block; background:rgba(0,229,255,0.05); }
+        .mini-visit a:hover { background:#00e5ff; color:#000; border-color:#00e5ff; transform:scale(1.02); }
         .mini-footer { margin-top:20px; text-align:center; font-size:0.7rem; color:#444; border-top:1px solid rgba(255,255,255,0.04); padding-top:15px; }
         @media(max-width:480px){ .mini-controls { flex-direction:column; } .mini-controls button { flex:none; width:100%; } }
     </style>
@@ -2490,7 +2607,6 @@ def mini_web_view(type, id):
         bot = bots_db.get(id)
         if not bot:
             return render_template_string(MINI_WEB_ERROR, message="Bot not found"), 404
-        # Get bot_username if token exists
         filepath = get_bot_absolute_path(bot)
         token, bot_username = detect_bot_token(filepath) if os.path.exists(filepath) else (None, None)
         bot['bot_username'] = bot_username
@@ -2625,276 +2741,6 @@ def deploy_bot_logs_sse(bot_id):
                 yield f"data: [SYSTEM] Bot stopped.\n\n"
                 break
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
-
-# ---------- CLI TOOLS MANAGEMENT ----------
-@app.route('/api/cli_tools', methods=['GET'])
-@login_required
-def api_list_cli_tools():
-    username = session['username']
-    with get_db() as conn:
-        if session.get('role') == 'admin':
-            tools = conn.execute('SELECT * FROM cli_tools ORDER BY created_at DESC').fetchall()
-        else:
-            tools = conn.execute('SELECT * FROM cli_tools WHERE owner_username = ? ORDER BY created_at DESC',
-                                (username,)).fetchall()
-    return jsonify([dict(row) for row in tools])
-
-@app.route('/upload_cli', methods=['POST'])
-@login_required
-def upload_cli():
-    username = session['username']
-    if 'files[]' not in request.files:
-        return jsonify({'error': 'No files'}), 400
-
-    files = request.files.getlist('files[]')
-    if not files or all(f.filename == '' for f in files):
-        return jsonify({'error': 'No file selected'}), 400
-
-    user = find_user(username)
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-
-    limit = user.get('limit', 5)
-    with get_db() as conn:
-        bot_count = conn.execute('SELECT COUNT(*) FROM bots WHERE user = ?', (username,)).fetchone()[0]
-        website_count = conn.execute('SELECT COUNT(*) FROM websites WHERE owner_username = ?', (username,)).fetchone()[0]
-        cli_count = conn.execute('SELECT COUNT(*) FROM cli_tools WHERE owner_username = ?', (username,)).fetchone()[0]
-    total_current = bot_count + website_count + cli_count
-
-    temp_dir = tempfile.mkdtemp()
-    tool_id = str(uuid.uuid4())[:8]
-    tool_folder = os.path.join(UPLOAD_FOLDER, f"cli_tool_{tool_id}")
-    os.makedirs(tool_folder, exist_ok=True)
-
-    try:
-        zip_file = None
-        for file in files:
-            if file.filename == '':
-                continue
-            temp_path = os.path.join(temp_dir, file.filename)
-            file.save(temp_path)
-            if file.filename.lower().endswith('.zip'):
-                zip_file = temp_path
-            else:
-                shutil.move(temp_path, os.path.join(tool_folder, file.filename))
-
-        if zip_file:
-            with zipfile.ZipFile(zip_file, 'r') as zf:
-                zf.extractall(tool_folder)
-            os.remove(zip_file)
-
-        startup_file = None
-        interpreter = None
-        for root, dirs, files_in_folder in os.walk(tool_folder):
-            for fname in files_in_folder:
-                interp = get_interpreter(fname)
-                if interp:
-                    startup_file = fname
-                    interpreter = interp
-                    break
-            if startup_file:
-                break
-
-        if not startup_file:
-            shutil.rmtree(tool_folder, ignore_errors=True)
-            return jsonify({'error': 'No executable file found'}), 400
-
-        slug = f"cli_{tool_id}"
-        with get_db() as conn:
-            cur = conn.execute('''INSERT INTO cli_tools
-                (owner_username, tool_name, tool_slug, tool_folder, startup_file, interpreter, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                (username, startup_file, slug, tool_folder, startup_file, interpreter, 'stopped'))
-            tool_db_id = cur.lastrowid
-            conn.commit()
-
-        return jsonify({'success': True, 'tool_id': tool_db_id, 'tool_slug': slug})
-
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-@app.route('/api/cli_tool/<int:tool_id>/start', methods=['POST'])
-@login_required
-def cli_tool_start(tool_id):
-    with get_db() as conn:
-        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
-                           (tool_id, session['username'])).fetchone()
-    if not tool:
-        return jsonify({'error': 'Tool not found'}), 404
-
-    if tool['status'] == 'running':
-        return jsonify({'error': 'Already running'}), 400
-
-    tool_folder = tool['tool_folder']
-    startup_file = tool['startup_file']
-    interpreter = tool['interpreter']
-
-    if not interpreter:
-        interpreter = get_interpreter(startup_file)
-
-    log_file = os.path.join(tool_folder, 'cli.log')
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-
-    try:
-        # Start with stdin=PIPE for interactive input
-        proc = subprocess.Popen(
-            [interpreter, startup_file],
-            stdout=open(log_file, 'a'),
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE,
-            cwd=tool_folder,
-            preexec_fn=os.setsid if os.name != 'nt' else None
-        )
-
-        with get_db() as conn:
-            conn.execute('UPDATE cli_tools SET status = ?, pid = ?, last_started = CURRENT_TIMESTAMP WHERE id = ?',
-                         ('running', proc.pid, tool_id))
-            conn.commit()
-
-        cli_processes[tool_id] = proc
-        return jsonify({'success': True, 'pid': proc.pid})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/cli_tool/<int:tool_id>/stop', methods=['POST'])
-@login_required
-def cli_tool_stop(tool_id):
-    with get_db() as conn:
-        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
-                           (tool_id, session['username'])).fetchone()
-    if not tool:
-        return jsonify({'error': 'Tool not found'}), 404
-
-    pid = tool['pid']
-    if pid:
-        try:
-            if os.name != 'nt':
-                os.killpg(os.getpgid(pid), signal.SIGTERM)
-            else:
-                subprocess.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True)
-        except:
-            pass
-
-        if tool_id in cli_processes:
-            del cli_processes[tool_id]
-
-    with get_db() as conn:
-        conn.execute('UPDATE cli_tools SET status = ?, pid = NULL, last_stopped = CURRENT_TIMESTAMP WHERE id = ?',
-                     ('stopped', tool_id))
-        conn.commit()
-
-    return jsonify({'success': True})
-
-@app.route('/api/cli_tool/<int:tool_id>/delete', methods=['POST'])
-@login_required
-def cli_tool_delete(tool_id):
-    with get_db() as conn:
-        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
-                           (tool_id, session['username'])).fetchone()
-    if not tool:
-        return jsonify({'error': 'Tool not found'}), 404
-
-    if tool['status'] == 'running':
-        cli_tool_stop(tool_id)
-
-    tool_folder = tool['tool_folder']
-    shutil.rmtree(tool_folder, ignore_errors=True)
-
-    with get_db() as conn:
-        conn.execute('DELETE FROM cli_tools WHERE id = ?', (tool_id,))
-        conn.commit()
-
-    return jsonify({'success': True})
-
-@app.route('/api/cli_tool/<int:tool_id>/download', methods=['GET'])
-@login_required
-def cli_tool_download(tool_id):
-    with get_db() as conn:
-        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
-                           (tool_id, session['username'])).fetchone()
-    if not tool:
-        return jsonify({'error': 'Tool not found'}), 404
-
-    tool_folder = tool['tool_folder']
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        if os.path.exists(tool_folder):
-            for root, _, files_in_folder in os.walk(tool_folder):
-                for fname in files_in_folder:
-                    full_path = os.path.join(root, fname)
-                    arcname = os.path.relpath(full_path, tool_folder)
-                    zipf.write(full_path, arcname)
-    zip_buffer.seek(0)
-    return send_file(zip_buffer, as_attachment=True, download_name=f"cli_tool_{tool_id}.zip")
-
-@app.route('/api/cli_tool/<int:tool_id>/send_input', methods=['POST'])
-@login_required
-def cli_tool_send_input(tool_id):
-    data = request.json
-    input_data = data.get('input', '')
-
-    proc = cli_processes.get(tool_id)
-    if not proc:
-        return jsonify({'error': 'Process not running'}), 400
-
-    try:
-        proc.stdin.write((input_data + '\n').encode())
-        proc.stdin.flush()
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/cli_tool/<int:tool_id>/logs', methods=['GET'])
-@login_required
-def cli_tool_logs(tool_id):
-    with get_db() as conn:
-        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
-                           (tool_id, session['username'])).fetchone()
-    if not tool:
-        return jsonify({'error': 'Tool not found'}), 404
-
-    log_file = os.path.join(tool['tool_folder'], 'cli.log')
-    if os.path.exists(log_file):
-        with open(log_file, 'r') as f:
-            lines = f.readlines()
-        return jsonify({'logs': ''.join(lines[-200:])})
-    return jsonify({'logs': ''})
-
-@app.route('/api/cli_tool/<int:tool_id>/upload_file', methods=['POST'])
-@login_required
-def cli_tool_upload_file(tool_id):
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file'}), 400
-
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'Empty file'}), 400
-
-    with get_db() as conn:
-        tool = conn.execute('SELECT * FROM cli_tools WHERE id = ? AND owner_username = ?',
-                           (tool_id, session['username'])).fetchone()
-    if not tool:
-        return jsonify({'error': 'Tool not found'}), 404
-
-    tool_folder = tool['tool_folder']
-    filename = secure_filename(file.filename)
-    file_path = os.path.join(tool_folder, filename)
-    file.save(file_path)
-
-    # Send file path to CLI process if running
-    if tool_id in cli_processes:
-        proc = cli_processes[tool_id]
-        try:
-            proc.stdin.write((file_path + '\n').encode())
-            proc.stdin.flush()
-        except:
-            pass
-
-    return jsonify({
-        'success': True,
-        'filename': filename,
-        'filepath': file_path
-    })
 
 # ---------- TEMPLATES ----------
 ERROR_TEMPLATE = """<!DOCTYPE html>
