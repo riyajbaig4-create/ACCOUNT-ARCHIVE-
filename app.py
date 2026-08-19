@@ -129,7 +129,8 @@ def init_db():
             total_runtime_seconds INTEGER DEFAULT 0,
             last_start_time TIMESTAMP,
             type TEXT DEFAULT 'website',
-            bot_interpreter TEXT
+            bot_interpreter TEXT,
+            env_vars TEXT DEFAULT '{}'
         )''')
         conn.execute('''CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -508,11 +509,9 @@ def detect_runtime_and_get_cmd(folder, port):
                 if 'start' in scripts:
                     return ['npm', 'start'], 'nodejs', {'NODE_ENV': 'production', 'PORT': str(port)}
                 else:
-                    # No start script – check "main" field
                     main_file = data.get('main')
                     if main_file and os.path.exists(os.path.join(folder, main_file)):
                         return ['node', main_file], 'nodejs', {'PORT': str(port)}
-                    # else fall through
         except:
             pass
 
@@ -683,10 +682,19 @@ def start_website_process(website_id, log_callback=None):
         update_website_status(website_id, 'failed')
         return False, msg
 
+    # ---- Load env vars from database ----
+    env_vars = {}
+    try:
+        env_vars = json.loads(website['env_vars'] or '{}')
+    except:
+        pass
+
     env = os.environ.copy()
     env['PORT'] = str(allocated_port)
     env['PYTHONUNBUFFERED'] = '1'
     env.update(env_extra)
+    env.update(env_vars)  # user-defined env vars override
+
     if runtime == 'flask':
         if os.path.exists(os.path.join(folder, 'app.py')): env['FLASK_APP'] = 'app.py'
         elif os.path.exists(os.path.join(folder, 'main.py')): env['FLASK_APP'] = 'main.py'
@@ -781,6 +789,35 @@ def stop_website_process(website_id):
     log_website(website_id, f"Stopped (PID {pid})")
     return True, "Stopped"
 
+# ---------- ENV VARS API ----------
+@app.route('/api/website/<int:website_id>/env', methods=['GET', 'PUT'])
+@login_required
+def website_env(website_id):
+    w = get_website_by_id(website_id)
+    if not w or w['owner_username'] != session['username']:
+        return jsonify({'error': 'Forbidden'}), 403
+    if request.method == 'GET':
+        try:
+            env = json.loads(w['env_vars'] or '{}')
+        except:
+            env = {}
+        return jsonify({'env': env})
+    else:
+        data = request.json
+        new_env = data.get('env', {})
+        # Validate it's a dict of strings
+        if not isinstance(new_env, dict):
+            return jsonify({'error': 'Invalid format'}), 400
+        # Serialize and save
+        with get_db() as conn:
+            conn.execute('UPDATE websites SET env_vars = ? WHERE id = ?', (json.dumps(new_env), website_id))
+            conn.commit()
+        # Restart if running
+        if w['status'] == 'running':
+            stop_website_process(website_id)
+            start_website_process(website_id)
+        return jsonify({'success': True})
+
 # ---------- DEPLOYMENT ----------
 def write_log_step(log_file, step, message):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -823,6 +860,26 @@ def deploy_zip_website(website_id):
         with get_db() as conn:
             conn.execute('UPDATE websites SET storage_used = ?, website_size = ? WHERE id = ?', (size, size, website_id))
             conn.commit()
+
+        # ---- Check for .env file in the extracted folder ----
+        env_file = os.path.join(folder, '.env')
+        if os.path.exists(env_file):
+            log_cb("SYSTEM", "Found .env file, parsing...")
+            try:
+                with open(env_file, 'r') as f:
+                    env_vars = {}
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            key, val = line.split('=', 1)
+                            env_vars[key.strip()] = val.strip()
+                with get_db() as conn:
+                    conn.execute('UPDATE websites SET env_vars = ? WHERE id = ?', (json.dumps(env_vars), website_id))
+                    conn.commit()
+                log_cb("SUCCESS", f"Loaded {len(env_vars)} environment variables from .env")
+            except Exception as e:
+                log_cb("ERROR", f"Failed to parse .env: {str(e)}")
+
         log_cb("SYSTEM", "Starting website...")
         ok, msg = start_website_process(website_id, log_cb)
         if ok:
@@ -1858,7 +1915,7 @@ def website_delete_file(website_id):
         os.remove(full)
     return jsonify({'success': True})
 
-@app.route('/website/<int:website_id>/file/rename', methods=['POST'])
+@app.route('/website/<int:website_id>/file/rename', methods(['POST'])
 @login_required
 def website_rename_file(website_id):
     w = get_website_by_id(website_id)
@@ -2542,7 +2599,7 @@ MINI_WEB_TEMPLATE = """
         .mini-controls { display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap; }
         .mini-controls button { flex:1; padding:12px 20px; border:none; border-radius:12px; font-weight:700; font-size:0.9rem; cursor:pointer; transition:all .3s cubic-bezier(.4,0,.2,1); min-width:80px; background:rgba(255,255,255,0.05); color:#aaa; border:1px solid rgba(255,255,255,0.08); }
         .mini-controls button:hover:not(:disabled) { transform:scale(1.05); box-shadow:0 8px 30px rgba(0,0,0,0.3); }
-        .mini-controls button:active:not(:disabled) { transform:scale(0.95); }
+        .mini-controls button:active:not(:disabled) { transform:scale(0.94); box-shadow:0 4px 20px rgba(0,0,0,0.5); }
         .mini-controls button:disabled { opacity:0.4; cursor:not-allowed; }
         .mini-btn-start { background:rgba(0,229,255,0.12); color:#00e5ff; border-color:rgba(0,229,255,0.2); }
         .mini-btn-start:hover:not(:disabled) { background:#00e5ff; color:#000; border-color:#00e5ff; }
@@ -3163,6 +3220,7 @@ HTML_TEMPLATE = """
         .bot-controls button:active:not(:disabled),
         .cli-tool-controls button:active:not(:disabled) {
             transform: scale(0.94);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
         }
         .bot-controls button:disabled,
         .cli-tool-controls button:disabled {
@@ -3332,6 +3390,7 @@ HTML_TEMPLATE = """
         }
         .website-actions button:active:not(:disabled) {
             transform: scale(0.94);
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
         }
         .website-actions button:disabled {
             opacity: 0.5;
@@ -6592,5 +6651,6 @@ if __name__ == '__main__':
     print("   Use POST /api/kill with {key, action: kill|status|restore}")
     print("🧹 Logs auto-cleared every 1 hour.")
     print("📦 Project data stored in project_data.json inside each project folder.")
+    print("🔐 Per‑website env vars supported – upload .env file or use API.")
     print("="*60)
     app.run(host='0.0.0.0', port=port, debug=False)
