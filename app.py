@@ -12,6 +12,10 @@ import requests
 import threading
 import json
 import uuid
+import tempfile
+import select
+import pty
+import queue
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify, session, send_file, redirect, Response, stream_with_context, abort
 from functools import wraps
@@ -30,6 +34,10 @@ app.secret_key = 'yuvicodex_super_secret_key_change_me_in_production'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB
 
 # ---------- CONFIG ----------
+PASSWORD = "your_secure_password"                     # for old /execute endpoint
+MASTER_PASSWORD = os.environ.get('MASTER_PASSWORD', 'master123')
+SECRET_KEY = os.environ.get('SECRET_KEY', 'secret123')
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 LOG_FOLDER = os.path.join(BASE_DIR, 'logs')
@@ -483,7 +491,7 @@ def schedule_log_clear():
 
 schedule_log_clear()
 
-# ---------- RUNTIME DETECTION (with fallback to any .py/.js) ----------
+# ---------- RUNTIME DETECTION ----------
 def find_startup_file(folder):
     for filename in STARTUP_PRIORITY:
         if os.path.exists(os.path.join(folder, filename)):
@@ -607,7 +615,7 @@ def install_dependencies(folder, runtime, log_callback=None):
         return True, "No deps"
     return True, "Unknown runtime"
 
-# ---------- HEALTH CHECK (improved) ----------
+# ---------- HEALTH CHECK ----------
 def detect_port_from_log(log_file):
     if not os.path.exists(log_file): return None
     try:
@@ -818,7 +826,12 @@ def deploy_zip_website(website_id):
     except Exception as e:
         log_website(website_id, f"Deployment exception: {str(e)}", 'error')
         with get_db() as conn:
-            conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?', ('failed', deployment_id))
+            # deployment_id might not be defined if exception occurred before assignment
+            # Use a dummy value or handle gracefully
+            try:
+                conn.execute('UPDATE deployments SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?', ('failed', deployment_id))
+            except:
+                pass
             conn.commit()
 
 # ---------- BOT ACTIONS ----------
@@ -1067,7 +1080,9 @@ def index():
                                    logged_in=logged_in,
                                    is_admin=is_admin,
                                    username=username,
-                                   user_password=user_password)
+                                   user_password=user_password,
+                                   MASTER_PASSWORD=MASTER_PASSWORD,
+                                   SECRET_KEY=SECRET_KEY)
 
 # ---------- SETTINGS ----------
 @app.route('/api/settings', methods=['GET'])
@@ -2224,6 +2239,8 @@ def execute():
         return jsonify({"output": str(e)})
 
 # ---------- CLI TOOLS ROUTES ----------
+cli_processes = {}  # for CLI tool processes
+
 @app.route('/api/cli_tools', methods=['GET'])
 @login_required
 def api_list_cli_tools():
@@ -2293,7 +2310,7 @@ def upload_cli():
 
         if not startup_file:
             shutil.rmtree(tool_folder, ignore_errors=True)
-            return jsonify({'error': 'No executable file found (.py, .js, etc.)'}), 400
+            return jsonify({'error': 'No executable file found'}), 400
 
         slug = f"cli_{tool_id}"
         with get_db() as conn:
@@ -2786,7 +2803,8 @@ evt.onmessage = function(e) {
 """
 
 # ---------- MAIN HTML TEMPLATE (with CLI Tab, Mini Web, Build Logs buttons) ----------
-HTML_TEMPLATE = """<!DOCTYPE html>
+HTML_TEMPLATE = """
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
