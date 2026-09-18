@@ -1,29 +1,29 @@
-from flask import Flask, request, jsonify
+import telebot
+from telebot import types
+import json
+import os
+import jwt
+import requests
 import asyncio
+import threading
+from datetime import datetime
+from flask import Flask, request, jsonify
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 import binascii
 import aiohttp
-import requests
-import json
 import like_pb2
 import uid_generator_pb2
 import visit_count_pb2
 from google.protobuf.message import DecodeError
 from collections import OrderedDict
-import os
-import jwt
-from datetime import datetime
-
-app = Flask(__name__)
 
 # ==================== CONFIG ====================
+BOT_TOKEN = "8995844626:AAEJP6lRMkYgB_1th_G8YRUthHYzYTc9Y3Y"
+ADMIN_ID = 5674825926
 VALID_API_KEYS = {"Anurag"}
 daily_limit = 20
 used_count = 0
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8995844626:AAEJP6lRMkYgB_1th_G8YRUthHYzYTc9Y3Y")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "5674825926")
 
 TOKEN_FILES = {
     "BD": "token_bd.json",
@@ -31,6 +31,11 @@ TOKEN_FILES = {
     "BR": "token_br.json"
 }
 
+# ==================== FLASK APP ====================
+app = Flask(__name__)
+
+# ==================== TELEGRAM BOT ====================
+bot = telebot.TeleBot(BOT_TOKEN)
 user_sessions = {}
 
 
@@ -174,7 +179,7 @@ def encrypt_message(plaintext):
         encrypted_message = cipher.encrypt(padded_message)
         return binascii.hexlify(encrypted_message).decode('utf-8')
     except Exception as e:
-        app.logger.error(f"Error encrypting message: {e}")
+        print(f"Error encrypting: {e}")
         return None
 
 
@@ -185,7 +190,7 @@ def create_protobuf_message(user_id, region):
         message.region = region
         return message.SerializeToString()
     except Exception as e:
-        app.logger.error(f"Error creating protobuf message: {e}")
+        print(f"Error protobuf: {e}")
         return None
 
 
@@ -207,7 +212,7 @@ async def send_request(encrypted_uid, token, url):
             async with session.post(url, data=edata, headers=headers) as response:
                 return await response.text()
     except Exception as e:
-        app.logger.error(f"Exception in send_request: {e}")
+        print(f"Error send_request: {e}")
         return None
 
 
@@ -229,7 +234,7 @@ async def send_multiple_requests(uid, region, url):
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return results
     except Exception as e:
-        app.logger.error(f"Exception in send_multiple_requests: {e}")
+        print(f"Error send_multiple: {e}")
         return None
 
 
@@ -240,7 +245,7 @@ def create_protobuf(uid):
         message.garena = 1
         return message.SerializeToString()
     except Exception as e:
-        app.logger.error(f"Error creating uid protobuf: {e}")
+        print(f"Error uid protobuf: {e}")
         return None
 
 
@@ -277,14 +282,14 @@ def make_request(encrypt, region, token):
         decoded.ParseFromString(binary)
         return decoded
     except DecodeError as e:
-        app.logger.error(f"DecodeError: {e}")
+        print(f"DecodeError: {e}")
         return None
     except Exception as e:
-        app.logger.error(f"Error in make_request: {e}")
+        print(f"Error make_request: {e}")
         return None
 
 
-# ==================== LIKE API ====================
+# ==================== FLASK API ROUTES ====================
 
 @app.route('/like', methods=['GET'])
 def handle_requests():
@@ -304,64 +309,60 @@ def handle_requests():
         return {"error": "UID and region are required"}, 400
 
     try:
-        def process_request():
-            global used_count
-            tokens = load_tokens(region)
-            if not tokens:
-                raise Exception("Failed to load tokens.")
-            token = tokens[0]['token']
-            encrypted_uid = enc(uid)
-            if encrypted_uid is None:
-                raise Exception("Encryption of UID failed.")
-            before = make_request(encrypted_uid, region, token)
-            if before is None:
-                raise Exception("Failed to get initial info.")
-            before_like = before.AccountInfo.Likes
+        tokens = load_tokens(region)
+        if not tokens:
+            raise Exception("Failed to load tokens.")
+        token = tokens[0]['token']
+        encrypted_uid = enc(uid)
+        if encrypted_uid is None:
+            raise Exception("Encryption of UID failed.")
+        before = make_request(encrypted_uid, region, token)
+        if before is None:
+            raise Exception("Failed to get initial info.")
+        before_like = before.AccountInfo.Likes
 
-            if region == "IND":
-                url = "https://client.ind.freefiremobile.com/LikeProfile"
-            elif region in {"BR", "US", "SAC", "NA"}:
-                url = "https://client.us.freefiremobile.com/LikeProfile"
-            else:
-                url = "https://clientbp.ggpolarbear.com/LikeProfile"
+        if region == "IND":
+            url = "https://client.ind.freefiremobile.com/LikeProfile"
+        elif region in {"BR", "US", "SAC", "NA"}:
+            url = "https://client.us.freefiremobile.com/LikeProfile"
+        else:
+            url = "https://clientbp.ggpolarbear.com/LikeProfile"
 
-            asyncio.run(send_multiple_requests(uid, region, url))
+        asyncio.run(send_multiple_requests(uid, region, url))
 
-            after = make_request(encrypted_uid, region, token)
-            if after is None:
-                raise Exception("Failed to get final info.")
-            after_like = after.AccountInfo.Likes
-            like_given = after_like - before_like
-            status = 1 if like_given > 0 else 2
+        after = make_request(encrypted_uid, region, token)
+        if after is None:
+            raise Exception("Failed to get final info.")
+        after_like = after.AccountInfo.Likes
+        like_given = after_like - before_like
+        status = 1 if like_given > 0 else 2
 
-            if status == 1:
-                used_count += 1
+        if status == 1:
+            used_count += 1
 
-            remaining = max(daily_limit - used_count, 0)
+        remaining = max(daily_limit - used_count, 0)
 
-            result = OrderedDict([
-                ("LikesGivenByAPI", like_given),
-                ("LikesafterCommand", after_like),
-                ("LikesbeforeCommand", before_like),
-                ("PlayerNickname", after.AccountInfo.PlayerNickname),
-                ("Level", after.AccountInfo.Levels),
-                ("Region", after.AccountInfo.PlayerRegion),
-                ("UID", after.AccountInfo.UID),
-                ("status", status),
-                ("daily_limit", daily_limit),
-                ("used", used_count),
-                ("remaining", remaining)
-            ])
+        result = OrderedDict([
+            ("LikesGivenByAPI", like_given),
+            ("LikesafterCommand", after_like),
+            ("LikesbeforeCommand", before_like),
+            ("PlayerNickname", after.AccountInfo.PlayerNickname),
+            ("Level", after.AccountInfo.Levels),
+            ("Region", after.AccountInfo.PlayerRegion),
+            ("UID", after.AccountInfo.UID),
+            ("status", status),
+            ("daily_limit", daily_limit),
+            ("used", used_count),
+            ("remaining", remaining)
+        ])
 
-            return app.response_class(
-                response=json.dumps(result, separators=(',', ':')),
-                status=200, mimetype='application/json'
-            )
-
-        return process_request()
+        return app.response_class(
+            response=json.dumps(result, separators=(',', ':')),
+            status=200, mimetype='application/json'
+        )
 
     except Exception as e:
-        app.logger.error(f"Error: {e}")
+        print(f"Error: {e}")
         return {"error": str(e)}, 500
 
 
@@ -377,133 +378,112 @@ def remain_info():
     })
 
 
-# ==================== TELEGRAM BOT ====================
-
-def tg_api(method, data):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    try:
-        r = requests.post(url, json=data, timeout=10)
-        return r.json()
-    except Exception as e:
-        print(f"TG API error: {e}")
-        return None
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({"status": "ok", "bot": "running"})
 
 
-def send_message(chat_id, text, keyboard=None):
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if keyboard:
-        data["reply_markup"] = json.dumps(keyboard)
-    return tg_api("sendMessage", data)
+# ==================== TELEGRAM KEYBOARDS ====================
+
+def main_menu():
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("🌍 BD", callback_data="region_BD"),
+        types.InlineKeyboardButton("🇮🇳 IND", callback_data="region_IND"),
+        types.InlineKeyboardButton("🇧🇷 BR", callback_data="region_BR")
+    )
+    kb.row(
+        types.InlineKeyboardButton("📊 Status", callback_data="status"),
+        types.InlineKeyboardButton("🧹 Clean All", callback_data="clean_menu")
+    )
+    return kb
 
 
-def edit_message(chat_id, message_id, text, keyboard=None):
-    data = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
-    if keyboard:
-        data["reply_markup"] = json.dumps(keyboard)
-    return tg_api("editMessageText", data)
+def region_menu(region):
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton(f"➕ ADD ({region})", callback_data=f"add_{region}"),
+        types.InlineKeyboardButton(f"🔄 UPDATE ({region})", callback_data=f"update_{region}")
+    )
+    kb.row(
+        types.InlineKeyboardButton("📊 Status", callback_data=f"status_{region}"),
+        types.InlineKeyboardButton("🧹 Clean", callback_data=f"clean_{region}")
+    )
+    kb.row(types.InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu"))
+    return kb
 
 
-def answer_callback(callback_id, text=""):
-    return tg_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+def back_menu():
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu"))
+    return kb
 
 
-def get_file(file_id):
-    result = tg_api("getFile", {"file_id": file_id})
-    if not result or not result.get("ok"):
-        return None
-    file_path = result["result"]["file_path"]
-    url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code == 200:
-            return r.text
-    except Exception as e:
-        print(f"File download error: {e}")
-    return None
+def clean_menu():
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("🧹 BD", callback_data="clean_BD"),
+        types.InlineKeyboardButton("🧹 IND", callback_data="clean_IND"),
+        types.InlineKeyboardButton("🧹 BR", callback_data="clean_BR")
+    )
+    kb.row(types.InlineKeyboardButton("🔙 Main Menu", callback_data="main_menu"))
+    return kb
 
 
-def main_menu_keyboard():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🌍 BD", "callback_data": "region_BD"},
-                {"text": "🇮🇳 IND", "callback_data": "region_IND"},
-                {"text": "🇧🇷 BR", "callback_data": "region_BR"}
-            ],
-            [
-                {"text": "📊 Status", "callback_data": "status"},
-                {"text": "🧹 Clean All", "callback_data": "clean_menu"}
-            ]
-        ]
-    }
+# ==================== TELEGRAM COMMANDS ====================
 
-
-def region_menu_keyboard(region):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": f"➕ ADD ({region})", "callback_data": f"add_{region}"},
-                {"text": f"🔄 UPDATE ({region})", "callback_data": f"update_{region}"}
-            ],
-            [
-                {"text": "📊 Status", "callback_data": f"status_{region}"},
-                {"text": "🧹 Clean", "callback_data": f"clean_{region}"}
-            ],
-            [{"text": "🔙 Back", "callback_data": "main_menu"}]
-        ]
-    }
-
-
-def back_keyboard():
-    return {"inline_keyboard": [[{"text": "🔙 Main Menu", "callback_data": "main_menu"}]]}
-
-
-def clean_menu_keyboard():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🧹 BD", "callback_data": "clean_BD"},
-                {"text": "🧹 IND", "callback_data": "clean_IND"},
-                {"text": "🧹 BR", "callback_data": "clean_BR"}
-            ],
-            [{"text": "🔙 Back", "callback_data": "main_menu"}]
-        ]
-    }
-
-
-def handle_start(chat_id):
-    send_message(chat_id,
+@bot.message_handler(commands=['start'])
+def start(message):
+    chat_id = message.chat.id
+    if chat_id != ADMIN_ID:
+        bot.send_message(chat_id, "❌ Aap admin nahi hain")
+        return
+    bot.send_message(chat_id,
         "🤖 <b>FF Token Manager Bot</b>\n\nRegion select karein:",
-        main_menu_keyboard()
+        parse_mode='HTML',
+        reply_markup=main_menu()
     )
 
 
-def handle_callback(callback):
-    chat_id = callback["message"]["chat"]["id"]
-    message_id = callback["message"]["message_id"]
-    data = callback["data"]
-    callback_id = callback["id"]
+@bot.message_handler(commands=['status'])
+def status_cmd(message):
+    chat_id = message.chat.id
+    if chat_id != ADMIN_ID:
+        return
+    report = get_status()
+    txt = "📊 <b>Status</b>\n\n"
+    for r, s in report.items():
+        txt += f"<b>{r}</b>: {s['total']} total | ✅ {s['valid']} | ❌ {s['expired']}\n"
+    bot.send_message(chat_id, txt, parse_mode='HTML')
 
-    if str(chat_id) != str(ADMIN_CHAT_ID):
-        answer_callback(callback_id, "❌ Aap admin nahi hain")
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback(call):
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    data = call.data
+
+    if chat_id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Aap admin nahi hain")
         return
 
-    answer_callback(callback_id)
+    bot.answer_callback_query(call.id)
 
     if data.startswith("region_"):
         region = data.split("_")[1]
         user_sessions[chat_id] = {"region": region}
         tokens = load_tokens(region)
-        edit_message(chat_id, message_id,
+        bot.edit_message_text(
             f"🌍 <b>{region}</b>\n\n📊 Current tokens: <b>{len(tokens)}</b>\n\nKya karna hai?",
-            region_menu_keyboard(region)
+            chat_id, message_id, parse_mode='HTML',
+            reply_markup=region_menu(region)
         )
 
     elif data.startswith("add_"):
         region = data.split("_")[1]
         user_sessions[chat_id] = {"region": region, "action": "waiting_file_add"}
         tokens = load_tokens(region)
-        edit_message(chat_id, message_id,
+        bot.edit_message_text(
             f"➕ <b>ADD Mode ({region})</b>\n\n"
             f"📊 Current: <b>{len(tokens)}</b> tokens\n\n"
             f"Ab file bhejein. Naye tokens <b>purane ke saath judenge</b>.\n"
@@ -511,20 +491,22 @@ def handle_callback(callback):
             f"<b>File format:</b>\n"
             f"• JSON: <code>[{{\"token\":\"eyJ...\"}}]</code>\n"
             f"• TXT: Har line ek token",
-            back_keyboard()
+            chat_id, message_id, parse_mode='HTML',
+            reply_markup=back_menu()
         )
 
     elif data.startswith("update_"):
         region = data.split("_")[1]
         user_sessions[chat_id] = {"region": region, "action": "waiting_file_update"}
         tokens = load_tokens(region)
-        edit_message(chat_id, message_id,
+        bot.edit_message_text(
             f"🔄 <b>UPDATE Mode ({region})</b>\n\n"
             f"📊 Current: <b>{len(tokens)}</b> tokens\n\n"
             f"⚠️ <b>Warning:</b> Purane saare tokens <b>hat jayenge</b>!\n"
             f"Sirf naye tokens rahenge.\n\n"
             f"Ab file bhejein.",
-            back_keyboard()
+            chat_id, message_id, parse_mode='HTML',
+            reply_markup=back_menu()
         )
 
     elif data == "status":
@@ -533,7 +515,7 @@ def handle_callback(callback):
         for r, s in report.items():
             text += f"<b>🌍 {r}</b>\n"
             text += f"  Total: {s['total']} | ✅ {s['valid']} | ⚠️ {s['expiring_soon']} | ❌ {s['expired']}\n\n"
-        edit_message(chat_id, message_id, text, back_keyboard())
+        bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML', reply_markup=back_menu())
 
     elif data.startswith("status_"):
         region = data.split("_")[1]
@@ -548,31 +530,33 @@ def handle_callback(callback):
             f"⚠️ Expiring: <b>{expiring}</b>\n"
             f"❌ Expired: <b>{expired}</b>"
         )
-        edit_message(chat_id, message_id, text, region_menu_keyboard(region))
+        bot.edit_message_text(text, chat_id, message_id, parse_mode='HTML',
+                              reply_markup=region_menu(region))
 
     elif data == "clean_menu":
-        edit_message(chat_id, message_id, "🧹 Region select karein:", clean_menu_keyboard())
+        bot.edit_message_text("🧹 Region select karein:", chat_id, message_id,
+                              reply_markup=clean_menu())
 
     elif data.startswith("clean_"):
         region = data.split("_")[1]
         removed, left = clean_expired(region)
-        send_message(chat_id,
+        bot.send_message(chat_id,
             f"✅ <b>{region} Cleaned</b>\n\nRemoved: <b>{removed}</b>\nRemaining: <b>{left}</b>",
-            region_menu_keyboard(region)
+            parse_mode='HTML', reply_markup=region_menu(region)
         )
 
     elif data == "main_menu":
-        edit_message(chat_id, message_id,
+        bot.edit_message_text(
             "🤖 <b>FF Token Manager Bot</b>\n\nRegion select karein:",
-            main_menu_keyboard()
+            chat_id, message_id, parse_mode='HTML',
+            reply_markup=main_menu()
         )
 
 
+@bot.message_handler(content_types=['document'])
 def handle_document(message):
-    chat_id = message["chat"]["id"]
-    document = message["document"]
-
-    if str(chat_id) != str(ADMIN_CHAT_ID):
+    chat_id = message.chat.id
+    if chat_id != ADMIN_ID:
         return
 
     session = user_sessions.get(chat_id, {})
@@ -580,94 +564,73 @@ def handle_document(message):
     action = session.get("action")
 
     if not region or not action:
-        send_message(chat_id, "❌ Pehle region select karein aur ADD/UPDATE button dabayein")
+        bot.send_message(chat_id, "❌ Pehle region select karein aur ADD/UPDATE button dabayein")
         return
 
-    if document.get("file_size", 0) > 5 * 1024 * 1024:
-        send_message(chat_id, "❌ File bahut badi hai (max 5MB)")
+    document = message.document
+    if document.file_size > 5 * 1024 * 1024:
+        bot.send_message(chat_id, "❌ File bahut badi hai (max 5MB)")
         return
 
-    send_message(chat_id, "📥 File process ho rahi hai...")
-    content = get_file(document["file_id"])
+    bot.send_message(chat_id, "📥 File process ho rahi hai...")
 
-    if not content:
-        send_message(chat_id, "❌ File download fail")
+    try:
+        file_info = bot.get_file(document.file_id)
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
+        r = requests.get(file_url, timeout=30)
+        content = r.text
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ File download fail: {e}")
         return
 
     tokens = parse_token_file(content)
-
     if not tokens:
-        send_message(chat_id, "❌ File mein valid token nahi mila")
+        bot.send_message(chat_id, "❌ File mein valid token nahi mila")
         return
 
     if action == "waiting_file_add":
         result = add_tokens(region, tokens)
-        send_message(chat_id,
+        bot.send_message(chat_id,
             f"✅ <b>ADD Complete ({region})</b>\n\n"
-            f"📄 File: <code>{document.get('file_name', 'unknown')}</code>\n\n"
+            f"📄 File: <code>{document.file_name}</code>\n\n"
             f"✅ Added: <b>{result['added']}</b>\n"
             f"⏭️ Duplicate (skip): <b>{result['duplicate']}</b>\n"
             f"❌ Invalid/Expired: <b>{result['invalid']}</b>\n\n"
             f"📊 Before: <b>{result['before']}</b>\n"
             f"📊 After: <b>{result['after']}</b>",
-            region_menu_keyboard(region)
+            parse_mode='HTML', reply_markup=region_menu(region)
         )
 
     elif action == "waiting_file_update":
         result = update_tokens(region, tokens)
-        send_message(chat_id,
+        bot.send_message(chat_id,
             f"🔄 <b>UPDATE Complete ({region})</b>\n\n"
-            f"📄 File: <code>{document.get('file_name', 'unknown')}</code>\n\n"
+            f"📄 File: <code>{document.file_name}</code>\n\n"
             f"🗑️ Removed (old): <b>{result['removed']}</b>\n"
             f"✅ Added (new): <b>{result['added']}</b>\n"
             f"⏭️ Duplicate (skip): <b>{result['duplicate']}</b>\n"
             f"❌ Invalid/Expired: <b>{result['invalid']}</b>\n\n"
             f"📊 Before: <b>{result['before']}</b>\n"
             f"📊 After: <b>{result['after']}</b>",
-            region_menu_keyboard(region)
+            parse_mode='HTML', reply_markup=region_menu(region)
         )
 
     user_sessions[chat_id] = {"region": region}
 
 
-@app.route('/telegram/webhook', methods=['POST'])
-def telegram_webhook():
-    update = request.get_json()
-    if not update:
-        return "OK", 200
-    try:
-        if "callback_query" in update:
-            handle_callback(update["callback_query"])
-        elif "message" in update:
-            msg = update["message"]
-            chat_id = msg["chat"]["id"]
-            text = msg.get("text", "").strip()
-            if text == "/start":
-                handle_start(chat_id)
-            elif text == "/status":
-                report = get_status()
-                txt = "📊 <b>Status</b>\n\n"
-                for r, s in report.items():
-                    txt += f"<b>{r}</b>: {s['total']} total | ✅ {s['valid']} | ❌ {s['expired']}\n"
-                send_message(chat_id, txt)
-            elif "document" in msg:
-                handle_document(msg)
-    except Exception as e:
-        print(f"Webhook error: {e}")
-    return "OK", 200
+# ==================== RUN BOTH ====================
+
+def run_flask():
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
 
-@app.route('/telegram/setup', methods=['GET'])
-def telegram_setup():
-    webhook_url = request.args.get("url")
-    if not webhook_url:
-        return {"error": "url chahiye"}, 400
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
-    r = requests.post(url, data={"url": f"{webhook_url}/telegram/webhook"})
-    return r.json()
+if __name__ == "__main__":
+    # Flask alag thread mein chalao
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print("✅ Flask API chalu: http://0.0.0.0:5000")
 
-
-# ==================== RUN ====================
-
-if __name__ == '__main__':
-    app.run(debug=True, use_reloader=False)
+    # Telegram bot main thread mein chalao
+    print("🤖 Telegram Bot chalu...")
+    print("   Telegram par /start bhejo")
+    bot.infinity_polling()
